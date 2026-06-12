@@ -386,7 +386,7 @@ build_claude_env() {
         echo "Error: bwclaude (foundry mode) requires an API key." >&2
         echo "Export one of:" >&2
         echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
-        echo "  AIFAPIM_API_KEY=<key>             # NSLS-II hermes/AIFAPIM key (preferred)" >&2
+        echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key (preferred)" >&2
         exit 1
     fi
 
@@ -407,7 +407,7 @@ build_claude_env() {
     else
         echo "Error: bwclaude requires AIFAPIM_HOST (or ANTHROPIC_FOUNDRY_BASE_URL) to be set." >&2
         echo "Export one of:" >&2
-        echo "  AIFAPIM_HOST=hermes.nsls2.bnl.gov        # NSLS-II Hermes gateway hostname" >&2
+        echo "  AIFAPIM_HOST=<gateway-hostname>          # NSLS-II AIFAPIM gateway hostname" >&2
         echo "  ANTHROPIC_FOUNDRY_BASE_URL=https://...   # full Foundry base URL override" >&2
         exit 1
     fi
