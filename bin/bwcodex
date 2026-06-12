@@ -38,7 +38,8 @@
 #   - /etc/codex/requirements.toml: admin-enforced restrictions (if
 #       present); bind-mounted read-only.  Users cannot loosen these.
 #     - AGENTS.md: bind-mounted read-only (if it exists)
-#     - skills/: bind-mounted read-only (if it exists)
+#     - skills/, prompts/: bind-mounted read-write, always created on host
+#         (user-authored definitions; persist across sessions)
 #     - packages/: bind-mounted read-only (if it exists, installer cache)
 #     - auth.json: bind-mounted read-write only if it already exists on host;
 #         --init-auth creates a {} stub for first-time ChatGPT-login setup
@@ -260,9 +261,19 @@ resolve_codex_paths() {
     CODEX_AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
     CODEX_SESSIONS_DIR="${CODEX_HOME_DIR}/sessions"
     CODEX_LOG_DIR="${CODEX_HOME_DIR}/log"
-    CODEX_SKILLS_DIR="${CODEX_HOME_DIR}/skills"
     CODEX_HISTORY_FILE="${CODEX_HOME_DIR}/history.jsonl"
     CODEX_PACKAGES_DIR="${CODEX_HOME_DIR}/packages"
+
+    # Authoring directories under ~/.codex/ that hold user-created
+    # markdown definitions.  Mounted read-write (see
+    # build_codex_authoring_mounts) so they can be created and edited
+    # from inside the sandbox and persist on the host.  Each kind's
+    # primary (Codex-native) location is force-created so authoring works
+    # out of the box.
+    #   - skills/  : SKILL.md skill definitions
+    #   - prompts/ : custom prompt markdown templates (Codex slash prompts)
+    CODEX_SKILLS_PRIMARY="${CODEX_HOME_DIR}/skills"
+    CODEX_PROMPTS_PRIMARY="${CODEX_HOME_DIR}/prompts"
 
     # Validate the user-controllable root directory once here so that all
     # sub-path mounts derived from it are implicitly covered.
@@ -275,6 +286,11 @@ ensure_host_dirs() {
              "${CODEX_SESSIONS_DIR}" \
              "${CODEX_LOG_DIR}"
     touch "${CODEX_HISTORY_FILE}"
+
+    # Create user-writable authoring directories so a read-write bind
+    # always has a real target on the host (a tmpfs would silently
+    # discard a user's first skill/prompt).
+    mkdir -p "${CODEX_SKILLS_PRIMARY}" "${CODEX_PROMPTS_PRIMARY}"
 }
 
 # Fail fast if no config.toml exists.  Codex requires a config.toml to
@@ -367,9 +383,10 @@ build_codex_home_mount() {
         BWRAP_ARGS+=(--ro-bind "${CODEX_AGENTS_FILE}" "${CODEX_AGENTS_FILE}")
     fi
 
-    if [[ -d "${CODEX_SKILLS_DIR}" ]]; then
-        BWRAP_ARGS+=(--ro-bind "${CODEX_SKILLS_DIR}" "${CODEX_SKILLS_DIR}")
-    fi
+    # skills/ and other authoring directories are mounted read-write by
+    # build_codex_authoring_mounts (called from main after this function)
+    # so users can author skills/prompts from inside the sandbox and have
+    # them persist on the host.
 
     if [[ -d "${CODEX_PACKAGES_DIR}" ]]; then
         BWRAP_ARGS+=(--ro-bind "${CODEX_PACKAGES_DIR}" "${CODEX_PACKAGES_DIR}")
@@ -384,6 +401,16 @@ build_codex_home_mount() {
     if [[ -f "${CODEX_AUTH_FILE}" ]]; then
         BWRAP_ARGS+=(--bind "${CODEX_AUTH_FILE}" "${CODEX_AUTH_FILE}")
     fi
+}
+
+# ── Codex authoring dirs (read-write, persistent) ───────────────
+# Mount skills/ and prompts/ read-write so users can author reusable
+# definitions from inside the sandbox and have them persist on the host.
+# Must run AFTER build_codex_home_mount (which creates the writable
+# ${CODEX_HOME_DIR} tmpfs) so these binds land on top of it.
+build_codex_authoring_mounts() {
+    build_authoring_kind "codex skills dir"  "${CODEX_SKILLS_PRIMARY}"
+    build_authoring_kind "codex prompts dir" "${CODEX_PROMPTS_PRIMARY}"
 }
 
 # ── Codex env vars ───────────────────────────────────────────────
@@ -470,6 +497,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_codex_home_mount
+    build_codex_authoring_mounts
     build_git_mounts
     build_pixi_mounts
     build_ccache_mounts
