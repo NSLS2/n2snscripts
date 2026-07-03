@@ -15,6 +15,8 @@
 #     - statsig/: bind-mounted read-write (persistent)
 #     - file-history/: bind-mounted read-write (per-file edit history for undo/restore)
 #     - sessions/: bind-mounted read-write (session metadata for --continue)
+#     - skills/, agents/, commands/: bind-mounted read-write, always created
+#         on host (user-authored definitions; persist across sessions)
 #     - history.jsonl: bind-mounted read-write (prompt history across sessions)
 #     - .last-cleanup: bind-mounted read-write (throttles Claude's cleanup runs)
 #     - settings.json: bind-mounted read-write (if it exists; --init-auth creates a stub)
@@ -227,6 +229,21 @@ resolve_claude_paths() {
 
     CLAUDE_CREDENTIALS_FILE="${CLAUDE_HOME_DIR}/.credentials.json"
 
+    # Authoring directories under ~/.claude/ that hold user-created
+    # markdown definitions.  Mounted read-write (see
+    # build_claude_authoring_mounts) so they can be created and edited
+    # from inside the sandbox and persist on the host.
+    #
+    # Each kind's primary (Claude-native) location is force-created so
+    # authoring works out of the box.  Claude has a single global search
+    # location per kind, so there are no alternates.
+    #   - skills/   : SKILL.md skill definitions
+    #   - agents/   : custom agent markdown profiles
+    #   - commands/ : custom slash-command markdown templates
+    CLAUDE_SKILLS_PRIMARY="${CLAUDE_HOME_DIR}/skills"
+    CLAUDE_AGENTS_PRIMARY="${CLAUDE_HOME_DIR}/agents"
+    CLAUDE_COMMANDS_PRIMARY="${CLAUDE_HOME_DIR}/commands"
+
     # State file at $HOME/.claude.json (not inside .claude/) tracks
     # hasCompletedOnboarding, numStartups, userID, project history.
     CLAUDE_STATE_FILE="${_HOME}/.claude.json"
@@ -250,6 +267,11 @@ ensure_host_dirs() {
         "${CLAUDE_HOME_DIR}/sessions"
     touch "${CLAUDE_HOME_DIR}/history.jsonl" \
           "${CLAUDE_HOME_DIR}/.last-cleanup"
+
+    # Create user-writable authoring directories so a read-write bind
+    # always has a real target on the host (a tmpfs would silently
+    # discard a user's first skill/agent/command).
+    mkdir -p "${CLAUDE_SKILLS_PRIMARY}" "${CLAUDE_AGENTS_PRIMARY}" "${CLAUDE_COMMANDS_PRIMARY}"
 }
 
 # ── Claude home (ephemeral tmpfs + selective persistence) ────────
@@ -337,6 +359,18 @@ build_claude_cache_mount() {
     BWRAP_ARGS+=(--bind "${CLAUDE_CACHE_DIR}" "${CLAUDE_CACHE_DIR}")
 }
 
+# ── Claude authoring dirs (read-write, persistent) ──────────────
+# Mount skills/, agents/, commands/ (and any present fallback dirs)
+# read-write so users can author reusable definitions from inside the
+# sandbox and have them persist on the host.  Must run AFTER
+# build_claude_home_mount (which creates the writable ${CLAUDE_HOME_DIR}
+# tmpfs) so these binds land on top of it.
+build_claude_authoring_mounts() {
+    build_authoring_kind "claude skills dir"   "${CLAUDE_SKILLS_PRIMARY}"
+    build_authoring_kind "claude agents dir"   "${CLAUDE_AGENTS_PRIMARY}"
+    build_authoring_kind "claude commands dir" "${CLAUDE_COMMANDS_PRIMARY}"
+}
+
 # ── Claude env vars ──────────────────────────────────────────────
 build_claude_env() {
     # Foundry mode is forced on (see CLAUDE_CODE_USE_FOUNDRY below).
@@ -352,7 +386,7 @@ build_claude_env() {
         echo "Error: bwclaude (foundry mode) requires an API key." >&2
         echo "Export one of:" >&2
         echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
-        echo "  AIFAPIM_API_KEY=<key>             # NSLS-II hermes/AIFAPIM key (preferred)" >&2
+        echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key (preferred)" >&2
         exit 1
     fi
 
@@ -373,7 +407,7 @@ build_claude_env() {
     else
         echo "Error: bwclaude requires AIFAPIM_HOST (or ANTHROPIC_FOUNDRY_BASE_URL) to be set." >&2
         echo "Export one of:" >&2
-        echo "  AIFAPIM_HOST=hermes.nsls2.bnl.gov        # NSLS-II Hermes gateway hostname" >&2
+        echo "  AIFAPIM_HOST=<gateway-hostname>          # NSLS-II AIFAPIM gateway hostname" >&2
         echo "  ANTHROPIC_FOUNDRY_BASE_URL=https://...   # full Foundry base URL override" >&2
         exit 1
     fi
@@ -389,6 +423,12 @@ build_claude_env() {
     # Enforce after the loop so host env cannot override these.
     BWRAP_ARGS+=(--setenv CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS 1)
     BWRAP_ARGS+=(--setenv CLAUDE_CODE_USE_FOUNDRY 1)
+
+    # In foundry mode the haiku model used for background tasks defaults to a
+    # date-pinned ID that the foundry proxy may not recognise.  Override with
+    # the un-pinned alias unless the caller has already set a preference.
+    BWRAP_ARGS+=(--setenv ANTHROPIC_DEFAULT_HAIKU_MODEL \
+        "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-claude-haiku-4-5}")
 
     # Debug/diagnostic env vars — passed through if set on the host.
     pass_through_if_set ANTHROPIC_LOG
@@ -448,6 +488,7 @@ main() {
     build_workdir_mount
     build_claude_home_mount
     build_claude_cache_mount
+    build_claude_authoring_mounts
     build_git_mounts
     build_pixi_mounts
     build_ccache_mounts
