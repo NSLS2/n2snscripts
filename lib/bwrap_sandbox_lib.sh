@@ -622,6 +622,108 @@ build_extra_path_mounts() {
     done
 }
 
+# ── Authoring directories (read-write, persistent) ───────────────
+#
+# Tools (opencode, claude, copilot, codex) let users author reusable
+# definitions — skills, agents, commands/prompts — as plain markdown
+# files under their config/home directory.  For these to be created
+# and edited *from inside the sandbox* and survive across sessions,
+# the directories must be bind-mounted read-write from the real host
+# location (a tmpfs would silently discard a user's first skill).
+#
+# A single *kind* of definition (e.g. "skills") may be searched for in
+# several locations by the tool — for opencode, skills are discovered
+# in ~/.config/opencode/skills/, ~/.claude/skills/, and ~/.agents/skills/.
+# Within one kind, exactly the PRIMARY location is force-created so that
+# authoring works out of the box; every other search location for that
+# kind is mounted read-write only if it already exists on the host (we
+# do not manufacture empty alternate trees the tool may not expect).
+#
+# _bind_authoring_dir DIR CREATE CONTEXT
+#   Resolve, sanitize, and read-write bind-mount the authoring directory
+#   DIR (an absolute path).
+#
+#   DIR     : absolute path to the authoring directory.
+#   CREATE  : "create" -> mkdir -p the host dir first so first-time
+#             authoring works out of the box; "if-exists" -> only
+#             mount when the directory already exists on the host.
+#   CONTEXT : label for safety-check error messages.
+#
+#   The target path is canonicalized with readlink -f (resolving any
+#   symlink, e.g. skills/ pointing into a dotfiles repo) and passed
+#   through _check_path_safe before the bind is emitted — identical
+#   treatment to --rw-path.  Intermediate --dir entries are created
+#   for paths under $HOME so the bind mount point exists in the tmpfs.
+#
+#   Idempotent: a path already registered in _MOUNTED_PREFIXES (or a
+#   parent of it) is skipped so we never emit a duplicate bind.
+#
+#   Must be called AFTER build_home_tmpfs (for intermediate --dir
+#   creation) and AFTER the tool's own home/config tmpfs+mounts so the
+#   read-write bind lands on top of the writable parent --dir rather
+#   than being shadowed by a broader read-only bind.
+_bind_authoring_dir() {
+    local dir="$1" create="$2" context="$3"
+
+    if [[ "${create}" == "create" ]]; then
+        mkdir -p "${dir}"
+    elif [[ ! -e "${dir}" ]]; then
+        return 0
+    fi
+
+    # Resolve symlinks so we bind the real target, then sanitize it.
+    local canon
+    canon="$(readlink -f "${dir}" 2> /dev/null || echo "${dir}")"
+    _check_path_safe "${canon}" "${context}"
+
+    # Skip if this path (or a parent tree) is already mounted.  The walk
+    # tests every ancestor including "/" itself.
+    local check="${canon}"
+    while :; do
+        if [[ -n "${_MOUNTED_PREFIXES["${check}"]:-}" ]]; then
+            return 0
+        fi
+        [[ "${check}" == "/" ]] && break
+        check="${check%/*}"
+        [[ -z "${check}" ]] && check="/"
+    done
+
+    # Create intermediate --dir entries for paths under $HOME so the
+    # bind mount point exists inside the tmpfs.  CANON is the bind mount
+    # point, so only its ancestors are pre-created.
+    _emit_home_intermediate_dirs "${canon}"
+
+    BWRAP_ARGS+=(--bind "${canon}" "${canon}")
+    _MOUNTED_PREFIXES["${canon}"]=1
+}
+
+# build_authoring_kind CONTEXT_LABEL PRIMARY [ALT_SEARCH_DIR ...]
+#   Read-write bind-mount every search location for ONE kind of authored
+#   definition (skills, agents, commands, ...) so the user can create and
+#   edit them from inside the sandbox with persistence.
+#
+#   CONTEXT_LABEL  : label for safety-check error messages (e.g.
+#                    "opencode skills dir").
+#   PRIMARY        : the canonical/primary search location for this kind.
+#                    Always created (mkdir -p) and mounted read-write so
+#                    authoring works out of the box on a fresh install.
+#   ALT_SEARCH_DIR : zero or more additional search locations the tool
+#                    consults for this SAME kind.  Each is mounted
+#                    read-write only if it already exists on the host.
+#
+#   All paths are absolute, symlink-resolved, and sanitized by
+#   _bind_authoring_dir.
+build_authoring_kind() {
+    local context_label="$1"
+    local primary="$2"
+    shift 2
+    _bind_authoring_dir "${primary}" "create" "${context_label} (primary)"
+    local _alt
+    for _alt in "$@"; do
+        _bind_authoring_dir "${_alt}" "if-exists" "${context_label} (alternate)"
+    done
+}
+
 # ── Path resolution ──────────────────────────────────────────────
 
 resolve_common_paths() {

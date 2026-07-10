@@ -8,7 +8,19 @@
 #
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write
-#   - OpenCode config: read-only (symlinks resolved)
+#   - OpenCode config: read-only (symlinks resolved), EXCEPT the
+#       authoring directories below, which are read-write and persistent
+#   - OpenCode authoring dirs (read-write, persistent on host):
+#       For each kind the opencode-native primary location is always
+#       created so users can author from inside the sandbox out of the box:
+#         skills   -> ~/.config/opencode/skills/   (primary)
+#         agents   -> ~/.config/opencode/agents/   (primary)
+#         commands -> ~/.config/opencode/commands/ (primary)
+#       Additional search locations for the SAME kind are mounted rw only
+#       if they already exist on the host:
+#         skills   -> ~/.claude/skills/, ~/.agents/skills/
+#         agents   -> ~/.claude/agents/, ~/.agents/agents/
+#         commands -> ~/.claude/commands/
 #   - OpenCode data dir: ephemeral tmpfs with selective persistence
 #       - auth.json: persisted only if it already exists on host;
 #         otherwise created in tmpfs (discarded on exit)
@@ -196,6 +208,30 @@ resolve_opencode_paths() {
     OC_CACHE_DIR="${XDG_CACHE_HOME}/opencode"
     OC_AUTH_FILE="${OC_DATA_DIR}/auth.json"
 
+    # Authoring directories that hold user-created markdown definitions.
+    # These are mounted read-write (see build_opencode_authoring_mounts)
+    # so they can be created and edited from inside the sandbox and
+    # persist on the host.
+    #
+    # opencode searches several locations per kind; the primary
+    # (opencode-native) location is force-created so authoring works out
+    # of the box, while the Claude-/agent-compatible search locations are
+    # mounted read-write only if they already exist on the host.
+    #
+    # The opencode-native primaries (under ${OC_CONFIG_DIR}) are excluded
+    # from the read-only config bind in resolve_config_symlinks so the
+    # read-write bind is not shadowed.
+    OC_SKILLS_PRIMARY="${OC_CONFIG_DIR}/skills"
+    OC_SKILLS_ALT=("${_HOME}/.claude/skills" "${_HOME}/.agents/skills")
+    OC_AGENTS_PRIMARY="${OC_CONFIG_DIR}/agents"
+    OC_AGENTS_ALT=("${_HOME}/.claude/agents" "${_HOME}/.agents/agents")
+    OC_COMMANDS_PRIMARY="${OC_CONFIG_DIR}/commands"
+    OC_COMMANDS_ALT=("${_HOME}/.claude/commands")
+
+    # Basenames under ${OC_CONFIG_DIR} that resolve_config_symlinks must
+    # skip (they are handled read-write below).
+    OC_CONFIG_AUTHORING_SKIP="skills agents commands"
+
     # Validate the user-controllable root directories once here so that all
     # sub-path mounts derived from them are implicitly covered.
     # XDG_CONFIG_HOME, XDG_DATA_HOME, and XDG_CACHE_HOME are already checked
@@ -222,6 +258,14 @@ ensure_host_dirs() {
     touch "${OC_DATA_DIR}/opencode.db" \
           "${OC_DATA_DIR}/opencode.db-shm" \
           "${OC_DATA_DIR}/opencode.db-wal"
+
+    # Authoring directories: create the primary location for each kind on
+    # the host so a read-write bind always has a real target.  Without
+    # this, the parent ~/.config/opencode/ is a tmpfs inside the sandbox
+    # and a user's first skill/agent/command would be silently discarded
+    # on exit.  Alternate search locations are NOT created here — they are
+    # only mounted read-write if they already exist.
+    mkdir -p "${OC_SKILLS_PRIMARY}" "${OC_AGENTS_PRIMARY}" "${OC_COMMANDS_PRIMARY}"
 }
 
 # Resolve opencode config symlinks.
@@ -237,9 +281,17 @@ resolve_config_symlinks() {
     OC_CONFIG_BINDS=()
     [[ -d "${OC_CONFIG_DIR}" ]] || return 0
 
-    local entry local_resolved
+    local entry base local_resolved
     for entry in "${OC_CONFIG_DIR}"/*; do
         [[ -e "${entry}" ]] || continue
+        # Skip authoring directories — they are mounted read-write by
+        # build_opencode_authoring_mounts so users can create/edit
+        # skills, agents, and commands from inside the sandbox.  Binding
+        # them read-only here would shadow that read-write bind.
+        base="${entry##*/}"
+        case " ${OC_CONFIG_AUTHORING_SKIP} " in
+            *" ${base} "*) continue ;;
+        esac
         if [[ -L "${entry}" ]]; then
             local_resolved="$(readlink -f "${entry}")"
         else
@@ -313,6 +365,23 @@ build_opencode_config_mount() {
             "${OC_CONFIG_BINDS[@]}"
         )
     fi
+}
+
+# ── OpenCode authoring dirs (read-write, persistent) ────────────
+# Mount the skills/agents/commands search locations read-write so users
+# can author reusable definitions from inside the sandbox and have them
+# persist on the host.  For each kind, the opencode-native location is
+# created and mounted; the Claude-/agent-compatible search locations are
+# mounted read-write only if they already exist.  Must run AFTER
+# build_opencode_config_mount (which creates the writable ${OC_CONFIG_DIR}
+# --dir) so these binds land on top of it.
+build_opencode_authoring_mounts() {
+    build_authoring_kind "opencode skills dir" \
+        "${OC_SKILLS_PRIMARY}" "${OC_SKILLS_ALT[@]}"
+    build_authoring_kind "opencode agents dir" \
+        "${OC_AGENTS_PRIMARY}" "${OC_AGENTS_ALT[@]}"
+    build_authoring_kind "opencode commands dir" \
+        "${OC_COMMANDS_PRIMARY}" "${OC_COMMANDS_ALT[@]}"
 }
 
 # ── OpenCode data (ephemeral tmpfs + selective persistence) ──────
@@ -413,6 +482,7 @@ main() {
     build_workdir_mount
     build_persistent_dotdir
     build_opencode_config_mount
+    build_opencode_authoring_mounts
     build_opencode_data_mounts
     build_opencode_cache_mount
     build_git_mounts

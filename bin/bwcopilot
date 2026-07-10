@@ -11,8 +11,8 @@
 #   - Copilot home (~/.copilot or $COPILOT_HOME): tmpfs (ephemeral by default)
 #     - session-state/: bind-mounted read-write (persistent)
 #     - logs/: bind-mounted read-write (persistent)
-#     - skills/: bind-mounted read-write (user-created skill definitions)
-#     - agents/: bind-mounted read-write (user-created custom agents)
+#     - skills/, agents/: bind-mounted read-write, always created on host
+#         (user-authored definitions; persist across sessions)
 #     - installed-plugins/: bind-mounted read-only (prevents agent from installing plugins)
 #     - config.json: COPIED into tmpfs (host auth available, changes ephemeral)
 #     - Use --init-auth to make config.json persistent (for personal machines)
@@ -231,6 +231,17 @@ resolve_copilot_paths() {
     COPILOT_SESSION_DIR="${COPILOT_HOME_DIR}/session-state"
     COPILOT_LOGS_DIR="${COPILOT_HOME_DIR}/logs"
 
+    # Authoring directories under ~/.copilot/ that hold user-created
+    # markdown definitions.  Mounted read-write (see
+    # build_copilot_authoring_mounts) so they can be created and edited
+    # from inside the sandbox and persist on the host.  Each kind's
+    # primary (Copilot-native) location is force-created so authoring
+    # works out of the box.
+    #   - skills/  : SKILL.md skill definitions
+    #   - agents/  : custom agent markdown profiles
+    COPILOT_SKILLS_PRIMARY="${COPILOT_HOME_DIR}/skills"
+    COPILOT_AGENTS_PRIMARY="${COPILOT_HOME_DIR}/agents"
+
     # Validate the user-controllable root directories once here so that all
     # sub-path mounts derived from them are implicitly covered.
     _check_dir_safe "${COPILOT_HOME_DIR}"  "COPILOT_HOME"
@@ -242,8 +253,10 @@ ensure_host_dirs() {
     mkdir -p "${COPILOT_HOME_DIR}" "${COPILOT_CACHE_DIR}"
     # Create persistent subdirectories for bind-mounts
     mkdir -p "${COPILOT_SESSION_DIR}" "${COPILOT_LOGS_DIR}"
-    # Create user-writable customization directories
-    mkdir -p "${COPILOT_HOME_DIR}/skills" "${COPILOT_HOME_DIR}/agents"
+    # Create user-writable authoring directories so a read-write bind
+    # always has a real target on the host (a tmpfs would silently
+    # discard a user's first skill/agent).
+    mkdir -p "${COPILOT_SKILLS_PRIMARY}" "${COPILOT_AGENTS_PRIMARY}"
 }
 
 # ── Copilot home (ephemeral tmpfs + selective persistence) ──────
@@ -293,14 +306,10 @@ build_copilot_home_mount() {
         fi
     done
 
-    # Bind-mount user-writable customization directories (read-write)
-    # Skills and agents are user-created files, not installed packages.
-    for _cfg in skills agents; do
-        local _path="${COPILOT_HOME_DIR}/${_cfg}"
-        if [[ -e "${_path}" ]]; then
-            BWRAP_ARGS+=(--bind "${_path}" "${_path}")
-        fi
-    done
+    # User-writable authoring directories (skills/, agents/, ...) are
+    # mounted read-write by build_copilot_authoring_mounts (called from
+    # main after this function) so they are symlink-resolved, sanitized,
+    # and created on the host when missing.
 
     # Handle config.json: copy or bind depending on --init-auth
     if [[ "${INIT_AUTH}" -eq 1 ]]; then
@@ -318,6 +327,16 @@ build_copilot_home_mount() {
         BWRAP_ARGS+=(--file "${_fd}" "${COPILOT_CONFIG_FILE}")
         # Note: fd stays open until bwrap exec's, then it's inherited and used
     fi
+}
+
+# ── Copilot authoring dirs (read-write, persistent) ─────────────
+# Mount skills/ and agents/ read-write so users can author reusable
+# definitions from inside the sandbox and have them persist on the host.
+# Must run AFTER build_copilot_home_mount (which creates the writable
+# ${COPILOT_HOME_DIR} tmpfs) so these binds land on top of it.
+build_copilot_authoring_mounts() {
+    build_authoring_kind "copilot skills dir" "${COPILOT_SKILLS_PRIMARY}"
+    build_authoring_kind "copilot agents dir" "${COPILOT_AGENTS_PRIMARY}"
 }
 
 # ── Copilot cache (read-write) ──────────────────────────────────
@@ -399,6 +418,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_copilot_home_mount
+    build_copilot_authoring_mounts
     build_copilot_cache_mount
     build_gh_auth_mount
     build_git_mounts

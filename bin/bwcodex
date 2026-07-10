@@ -25,20 +25,27 @@
 #     - sessions/: bind-mounted read-write (for `codex resume` / `codex fork`)
 #     - log/: bind-mounted read-write (RUST_LOG / opt-in plaintext logs)
 #     - history.jsonl: bind-mounted read-write (prompt history)
-#     - config.toml: by default, copied to a per-session staging file and
-#         bind-mounted RW so Codex can persist project-trust grants for the
-#         session without touching the host file (the staging copy is removed
-#         on script exit).  With --persist-config, the host config.toml is
-#         bind-mounted RW so writes persist across sessions at the cost of
-#         weaker isolation.  Either the user file or the system file
-#         (/etc/codex/config.toml) is sufficient for fail-fast.
+#     - config.toml: persists to the host by default (like settings.json in
+#         bwclaude).  Codex rewrites config.toml via temp-file + rename, which
+#         fails on a single-file bind mount (EBUSY -> "failed to persist
+#         config"); so the real file is relocated to
+#         ~/.codex/persisted/config.toml (a symlink is left at the original
+#         path, transparent to non-wrapped codex) and only that one
+#         sub-directory is bind-mounted RW.  Codex resolves the symlink and
+#         renames inside it, so writes land on the host without exposing the
+#         rest of ~/.codex.  With --ephemeral-config, the host file's
+#         *contents* are instead injected as a regular tmpfs file (bwrap
+#         --file) and any writes are discarded on exit.  Either the user file
+#         or the system file (/etc/codex/config.toml) is sufficient for
+#         fail-fast.
 #   - /etc/codex/config.toml: system-wide provider/defaults config (if
 #       present); bind-mounted read-only.  Codex layers user config on
 #       top of this file.
 #   - /etc/codex/requirements.toml: admin-enforced restrictions (if
 #       present); bind-mounted read-only.  Users cannot loosen these.
 #     - AGENTS.md: bind-mounted read-only (if it exists)
-#     - skills/: bind-mounted read-only (if it exists)
+#     - skills/, prompts/: bind-mounted read-write, always created on host
+#         (user-authored definitions; persist across sessions)
 #     - packages/: bind-mounted read-only (if it exists, installer cache)
 #     - auth.json: bind-mounted read-write only if it already exists on host;
 #         --init-auth creates a {} stub for first-time ChatGPT-login setup
@@ -76,9 +83,12 @@
 #                   BNL ITD ChatGPT subscription auth path; has no effect for
 #                   Hermes-routed setups.  On shared accounts, do NOT use this
 #                   flag — tokens will be ephemeral by default.
-#   --persist-config Bind ~/.codex/config.toml read-write into the sandbox so
-#                   writes persist across sessions.  Default: config.toml is
-#                   copied to a per-session staging file; host file is unchanged.
+#   --ephemeral-config Do NOT persist config.toml.  By default config.toml
+#                   writes persist to the host (real file relocated to
+#                   ~/.codex/persisted/config.toml; a symlink is left behind,
+#                   and only that sub-dir is bind-mounted RW).  This flag
+#                   injects config.toml as a tmpfs file so writes are discarded
+#                   on exit.  (--persist-config is accepted but deprecated.)
 #   --debug         Enable verbose Codex logging (sets RUST_LOG=debug).
 #   --new-session   Force bwrap --new-session even on kernels with the TIOCSTI cap
 #                   guard.  Detaches the controlling tty for stricter isolation at the
@@ -106,7 +116,9 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 
 INIT_AUTH=0
 DEBUG_MODE=0
-PERSIST_CONFIG=0
+# config.toml persists to the host by default (like settings.json in bwclaude).
+# --ephemeral-config opts out (e.g. on shared accounts) so writes are discarded.
+EPHEMERAL_CONFIG=0
 
 # ═══════════════════════════════════════════════════════════════════
 # Tool-specific functions
@@ -135,8 +147,15 @@ parse_wrapper_args() {
                 INIT_AUTH=1
                 shift
                 ;;
+            --ephemeral-config)
+                EPHEMERAL_CONFIG=1
+                shift
+                ;;
             --persist-config)
-                PERSIST_CONFIG=1
+                # Deprecated: config.toml now persists by default.  Accept the
+                # flag as a no-op so existing invocations keep working.
+                echo "bwcodex: --persist-config is deprecated; config.toml" \
+                     "now persists by default (use --ephemeral-config to opt out)." >&2
                 shift
                 ;;
             --debug)
@@ -208,15 +227,18 @@ Wrapper options (consumed before codex sees the command line):
                   BNL ITD ChatGPT subscription auth path; has no effect for
                   Hermes-routed setups.  On shared accounts, do NOT use this
                   flag — tokens will be ephemeral by default.
-  --persist-config Bind ~/.codex/config.toml read-write into the sandbox so
-                  Codex can persist project trust decisions and other
-                  config.toml mutations across sessions.  WARNING: this
-                  weakens sandbox isolation — a compromised Codex could
-                  modify provider URLs, auth headers, or other config keys.
-                  Concurrent --persist-config sessions may race on writes.
-                  Without this flag (the default), config.toml is copied to
-                  a per-session staging file and any writes are discarded
-                  on exit.
+  --ephemeral-config Do NOT persist config.toml.  By default Codex's
+                  config.toml writes (project-trust grants, etc.) persist to
+                  the host: the real file is relocated to
+                  ~/.codex/persisted/config.toml (a symlink is left at the
+                  original path, transparent to non-wrapped codex) and only
+                  that one sub-directory is bind-mounted read-write — the rest
+                  of ~/.codex stays ephemeral.  With this flag, config.toml is
+                  injected as a regular tmpfs file and any writes are discarded
+                  on exit.  Use on shared accounts, or to avoid recording
+                  trust grants / config edits to the host.
+                  (--persist-config is accepted but deprecated — now the
+                  default.)
   --debug         Enable verbose Codex logging (sets RUST_LOG=debug).
   --new-session   Force bwrap to call setsid(2), detaching the sandbox from the
                   controlling terminal.  This is the default on older kernels
@@ -260,9 +282,30 @@ resolve_codex_paths() {
     CODEX_AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
     CODEX_SESSIONS_DIR="${CODEX_HOME_DIR}/sessions"
     CODEX_LOG_DIR="${CODEX_HOME_DIR}/log"
-    CODEX_SKILLS_DIR="${CODEX_HOME_DIR}/skills"
     CODEX_HISTORY_FILE="${CODEX_HOME_DIR}/history.jsonl"
     CODEX_PACKAGES_DIR="${CODEX_HOME_DIR}/packages"
+
+    # Authoring directories under ~/.codex/ that hold user-created
+    # markdown definitions.  Mounted read-write (see
+    # build_codex_authoring_mounts) so they can be created and edited
+    # from inside the sandbox and persist on the host.  Each kind's
+    # primary (Codex-native) location is force-created so authoring works
+    # out of the box.
+    #   - skills/  : SKILL.md skill definitions
+    #   - prompts/ : custom prompt markdown templates (Codex slash prompts)
+    CODEX_SKILLS_PRIMARY="${CODEX_HOME_DIR}/skills"
+    CODEX_PROMPTS_PRIMARY="${CODEX_HOME_DIR}/prompts"
+
+    # Persistent-config layout (default; disabled by --ephemeral-config): the
+    # real config.toml lives in a dedicated sub-directory that is bind-mounted
+    # read-write, and ${CODEX_CONFIG_FILE}
+    # is a symlink into it.  Codex resolves the symlink and performs its
+    # temp-file + rename inside this directory, so writes persist on the host
+    # without exposing the rest of ~/.codex.  Kept relative ("persisted/...")
+    # for the in-sandbox symlink so it resolves the same way on host and in
+    # the tmpfs.
+    CODEX_CONFIG_PERSIST_DIR="${CODEX_HOME_DIR}/persisted"
+    CODEX_CONFIG_PERSIST_FILE="${CODEX_CONFIG_PERSIST_DIR}/config.toml"
 
     # Validate the user-controllable root directory once here so that all
     # sub-path mounts derived from it are implicitly covered.
@@ -275,6 +318,75 @@ ensure_host_dirs() {
              "${CODEX_SESSIONS_DIR}" \
              "${CODEX_LOG_DIR}"
     touch "${CODEX_HISTORY_FILE}"
+
+    # Create user-writable authoring directories so a read-write bind
+    # always has a real target on the host (a tmpfs would silently
+    # discard a user's first skill/prompt).
+    mkdir -p "${CODEX_SKILLS_PRIMARY}" "${CODEX_PROMPTS_PRIMARY}"
+}
+
+# Prepare the host layout for persistent config (the default; skipped under
+# --ephemeral-config).  Idempotent and reversible: the real config.toml is
+# moved into ${CODEX_CONFIG_PERSIST_DIR} and ${CODEX_CONFIG_FILE} becomes a
+# relative symlink to it.  Plain (non-wrapped) codex follows it transparently.
+ensure_persist_config_layout() {
+    # Case A — config.toml is already a symlink.  Skip ONLY when it targets
+    # persisted/config.toml; any other target is relocated *into* persisted/
+    # so the persistent layout is canonical.
+    if [[ -L "${CODEX_CONFIG_FILE}" ]]; then
+        local _have
+        _have="$(readlink "${CODEX_CONFIG_FILE}")"
+        # Resolve a relative target against config.toml's directory so it can
+        # be compared/preserved as an absolute path.
+        [[ "${_have}" == /* ]] || _have="${CODEX_HOME_DIR}/${_have}"
+
+        mkdir -p "${CODEX_CONFIG_PERSIST_DIR}"
+        if [[ "${_have}" == "${CODEX_CONFIG_PERSIST_FILE}" ]]; then
+            # Canonical already — just ensure the bind target exists.
+            [[ -e "${CODEX_CONFIG_PERSIST_FILE}" ]] || : > "${CODEX_CONFIG_PERSIST_FILE}"
+            return
+        fi
+
+        # Points elsewhere: move the symlink into persisted/ (preserving its
+        # target as an absolute path so the relocation does not change where
+        # it resolves), then repoint config.toml -> persisted/config.toml.
+        if [[ ! -e "${CODEX_CONFIG_PERSIST_FILE}" && ! -L "${CODEX_CONFIG_PERSIST_FILE}" ]]; then
+            ln -sfn "${_have}" "${CODEX_CONFIG_PERSIST_FILE}"
+            echo "bwcodex: relocated config.toml symlink into" \
+                 "${CODEX_CONFIG_PERSIST_DIR} (target ${_have})." >&2
+        else
+            # persisted/config.toml already exists — adopt it rather than
+            # clobber, and just repoint config.toml at it.
+            echo "bwcodex: ${CODEX_CONFIG_PERSIST_FILE} already exists; adopting it" \
+                 "and repointing ${CODEX_CONFIG_FILE} (was -> ${_have})." >&2
+        fi
+        ln -sfn "persisted/config.toml" "${CODEX_CONFIG_FILE}"
+        return
+    fi
+
+    # Case B — config.toml is a real file and persisted/ does not yet exist:
+    # first-time migration.  Move the file in and leave a symlink.
+    if [[ -f "${CODEX_CONFIG_FILE}" && ! -d "${CODEX_CONFIG_PERSIST_DIR}" ]]; then
+        mkdir -p "${CODEX_CONFIG_PERSIST_DIR}"
+        mv "${CODEX_CONFIG_FILE}" "${CODEX_CONFIG_PERSIST_FILE}"
+        ln -sfn "persisted/config.toml" "${CODEX_CONFIG_FILE}"
+        echo "bwcodex: migrated ${CODEX_CONFIG_FILE} ->" \
+             "${CODEX_CONFIG_PERSIST_FILE} (config.toml is now a symlink)." >&2
+        return
+    fi
+
+    # Case C — anything else: ensure the bind source exists, seed a symlink
+    # when there is no user config yet, and leave a stray real file that
+    # coexists with an existing persisted/ untouched (no clobber).
+    mkdir -p "${CODEX_CONFIG_PERSIST_DIR}"
+    [[ -e "${CODEX_CONFIG_PERSIST_FILE}" ]] || : > "${CODEX_CONFIG_PERSIST_FILE}"
+    if [[ ! -e "${CODEX_CONFIG_FILE}" ]]; then
+        ln -sfn "persisted/config.toml" "${CODEX_CONFIG_FILE}"
+    else
+        echo "bwcodex: ${CODEX_CONFIG_FILE} is a regular file but" \
+             "${CODEX_CONFIG_PERSIST_DIR} already exists; leaving it untouched" \
+             "and using ${CODEX_CONFIG_PERSIST_FILE}." >&2
+    fi
 }
 
 # Fail fast if no config.toml exists.  Codex requires a config.toml to
@@ -336,32 +448,47 @@ build_codex_home_mount() {
     fi
 
     # User config.toml mount strategy (see file header):
-    #   - Default: stage a writable copy in /tmp, bind RW into sandbox.
-    #     Codex can persist project trust / other mutations for the session,
-    #     but the host ~/.codex/config.toml is never touched.  The staging
-    #     file is cleaned up on script exit via the EXIT trap.
-    #   - --persist-config: bind host config.toml RW so writes persist.
-    # If the user file does not exist (managed host using only system
-    # config), skip the user mount entirely.
-    if [[ -f "${CODEX_CONFIG_FILE}" ]]; then
-        if [[ "${PERSIST_CONFIG}" -eq 1 ]]; then
-            BWRAP_ARGS+=(--bind "${CODEX_CONFIG_FILE}" "${CODEX_CONFIG_FILE}")
-        else
-            _STAGED_CONFIG="$(mktemp --tmpdir bwcodex-config.XXXXXX.toml)"
-            cp -p "${CODEX_CONFIG_FILE}" "${_STAGED_CONFIG}"
-            chmod u+w "${_STAGED_CONFIG}"
-            trap 'rm -f "${_STAGED_CONFIG}"' EXIT INT TERM
-            BWRAP_ARGS+=(--bind "${_STAGED_CONFIG}" "${CODEX_CONFIG_FILE}")
-        fi
+    #   - Default: bind ~/.codex/persisted/ RW and symlink config.toml into it,
+    #     so Codex's temp-file + rename persists to the host.
+    #   - --ephemeral-config: inject config.toml as a regular tmpfs file via
+    #     bwrap --file; writes are discarded on exit, host file is untouched.
+    if [[ "${EPHEMERAL_CONFIG}" -eq 0 ]]; then
+        # Default: persist config.toml writes (project-trust grants, etc.) to
+        # the host WITHOUT exposing the rest of ~/.codex.  Codex rewrites
+        # config.toml via temp-file + rename (write_atomically), which needs a
+        # real (non-mountpoint) parent directory; a single-file bind mount
+        # cannot be renamed over (EBUSY -> "failed to persist config",
+        # JSON-RPC -32603).  So we bind one dedicated sub-directory RW and make
+        # config.toml a symlink into it.  Codex resolves the symlink
+        # (resolve_symlink_write_paths) and renames inside the bound dir, so
+        # the new config lands on the host.  ensure_persist_config_layout()
+        # has already established the host symlink + persisted/config.toml.
+        BWRAP_ARGS+=(--bind "${CODEX_CONFIG_PERSIST_DIR}" "${CODEX_CONFIG_PERSIST_DIR}")
+        BWRAP_ARGS+=(--symlink "persisted/config.toml" "${CODEX_CONFIG_FILE}")
+        # A file in persisted/ may itself be a symlink pointing OUTSIDE the
+        # bound directory (e.g. config.toml relocated from a dotfiles repo by
+        # ensure_persist_config_layout).  Following it inside the sandbox would
+        # reach a tmpfs path and Codex's writes would be lost, so chase each
+        # symlink and bind its real target's directory RW.
+        build_codex_persist_symlink_targets
+    elif [[ -f "${CODEX_CONFIG_FILE}" ]]; then
+        # --ephemeral-config: inject config.toml as a *regular file* inside the
+        # CODEX_HOME tmpfs via bwrap --file.  bwrap copies the host file's
+        # contents into a plain file (not a mount point), so Codex's temp-file
+        # + rename succeeds.  Writes live only in the tmpfs and are discarded
+        # on exit, leaving the host config.toml untouched.
+        exec {_CFG_FD}< "${CODEX_CONFIG_FILE}"
+        BWRAP_ARGS+=(--file "${_CFG_FD}" "${CODEX_CONFIG_FILE}")
     fi
 
     if [[ -e "${CODEX_AGENTS_FILE}" ]]; then
         BWRAP_ARGS+=(--ro-bind "${CODEX_AGENTS_FILE}" "${CODEX_AGENTS_FILE}")
     fi
 
-    if [[ -d "${CODEX_SKILLS_DIR}" ]]; then
-        BWRAP_ARGS+=(--ro-bind "${CODEX_SKILLS_DIR}" "${CODEX_SKILLS_DIR}")
-    fi
+    # skills/ and other authoring directories are mounted read-write by
+    # build_codex_authoring_mounts (called from main after this function)
+    # so users can author skills/prompts from inside the sandbox and have
+    # them persist on the host.
 
     if [[ -d "${CODEX_PACKAGES_DIR}" ]]; then
         BWRAP_ARGS+=(--ro-bind "${CODEX_PACKAGES_DIR}" "${CODEX_PACKAGES_DIR}")
@@ -376,6 +503,53 @@ build_codex_home_mount() {
     if [[ -f "${CODEX_AUTH_FILE}" ]]; then
         BWRAP_ARGS+=(--bind "${CODEX_AUTH_FILE}" "${CODEX_AUTH_FILE}")
     fi
+}
+
+# ── Persisted-config symlink chaser (read-write) ────────────────
+# persisted/config.toml (and any other file in persisted/) may be a symlink
+# pointing outside the bound persisted/ directory — e.g. a config.toml that
+# ensure_persist_config_layout relocated from a dotfiles repo.  The persisted/
+# directory itself is bind-mounted RW, but the symlink target is not, so inside
+# the sandbox $HOME is tmpfs and following the symlink reaches a non-persistent
+# path: Codex's temp-file + rename would be discarded on exit.
+#
+# Chase each symlink to its real target (readlink -f) and bind the target's
+# *directory* read-write, so Codex's atomic write (temp file + rename, which
+# happens in the resolved file's directory) lands on the host.  Mirrors the
+# readlink -f + _check_path_safe pattern used for ~/.gitconfig and tool
+# binaries; _check_path_safe aborts if a target resolves into a blocked path
+# (~/.ssh, ~/.gnupg, ...).  Dedups via _MOUNTED_PREFIXES so a target dir shared
+# by several entries is bound once.
+build_codex_persist_symlink_targets() {
+    [[ -d "${CODEX_CONFIG_PERSIST_DIR}" ]] || return 0
+
+    local _entry _real _parent
+    for _entry in "${CODEX_CONFIG_PERSIST_DIR}"/*; do
+        [[ -L "${_entry}" ]] || continue
+        _real="$(readlink -f "${_entry}" 2> /dev/null || true)"
+        # Skip dangling symlinks (nothing to bind) and targets that already
+        # resolve back inside persisted/ (covered by the directory bind).
+        [[ -n "${_real}" && -e "${_real}" ]] || continue
+        [[ "${_real}" == "${CODEX_CONFIG_PERSIST_DIR}"/* ]] && continue
+
+        _parent="$(dirname "${_real}")"
+        _check_path_safe "${_parent}" "persisted/ symlink target"
+        if [[ -z "${_MOUNTED_PREFIXES["${_parent}"]:-}" ]]; then
+            _emit_home_intermediate_dirs "${_parent}" inclusive
+            BWRAP_ARGS+=(--bind "${_parent}" "${_parent}")
+            _MOUNTED_PREFIXES["${_parent}"]=1
+        fi
+    done
+}
+
+# ── Codex authoring dirs (read-write, persistent) ───────────────
+# Mount skills/ and prompts/ read-write so users can author reusable
+# definitions from inside the sandbox and have them persist on the host.
+# Must run AFTER build_codex_home_mount (which creates the writable
+# ${CODEX_HOME_DIR} tmpfs) so these binds land on top of it.
+build_codex_authoring_mounts() {
+    build_authoring_kind "codex skills dir"  "${CODEX_SKILLS_PRIMARY}"
+    build_authoring_kind "codex prompts dir" "${CODEX_PROMPTS_PRIMARY}"
 }
 
 # ── Codex env vars ───────────────────────────────────────────────
@@ -450,7 +624,13 @@ main() {
     resolve_codex_paths
     detect_shell
     ensure_host_dirs
+    # Fail-fast on a truly missing config BEFORE the persist layout seeds an
+    # empty one (otherwise the seed would mask the "no provider configured"
+    # error).  A pre-existing user symlink resolves through to its target here.
     check_codex_config
+    if [[ "${EPHEMERAL_CONFIG}" -eq 0 ]]; then
+        ensure_persist_config_layout
+    fi
     parse_all_git_includes
     init_sandbox_path
 
@@ -463,6 +643,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_codex_home_mount
+    build_codex_authoring_mounts
     build_git_mounts
     build_pixi_mounts
     build_ccache_mounts
