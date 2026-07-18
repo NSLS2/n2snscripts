@@ -230,3 +230,8 @@ Requires only `openssl`.
 
 See the per-script doc pages under [`docs/`](docs/) for full usage,
 options, and caveats.
+
+## AI disclosure
+
+This repository's contents are largely AI-generated with human
+review. See [`AI_DISCLOSURE.md`](AI_DISCLOSURE.md) for details.
