@@ -177,7 +177,7 @@ parse_wrapper_args() {
 # not depend on PATH lookup inside the sandbox.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
 resolve_tool_binary() {
-    _TOOL_BIN="$(command -v codex 2> /dev/null || true)"
+    _TOOL_BIN="$(resolve_real_tool_binary codex)"
     if [[ -z "${_TOOL_BIN}" ]]; then
         echo "Error: 'codex' not found in PATH." >&2
         exit 1

@@ -141,7 +141,7 @@ parse_wrapper_args() {
 # archived/deprecated as of Oct 2025.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
 resolve_tool_binary() {
-    _TOOL_BIN="$(command -v copilot 2> /dev/null || true)"
+    _TOOL_BIN="$(resolve_real_tool_binary copilot)"
     if [[ -z "${_TOOL_BIN}" ]]; then
         echo "Error: 'copilot' not found in PATH." >&2
         echo "Install the standalone GitHub Copilot CLI from https://github.com/github/copilot-cli" >&2
