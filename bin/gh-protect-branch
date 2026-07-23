@@ -55,6 +55,10 @@
 #   --exclude-branches <csv>   Comma-separated list of fnmatch branch-name
 #                              patterns to allow creation of.  Each entry is
 #                              matched against refs/heads/<pattern>.
+#                              Patterns are comma-split, so a comma cannot
+#                              appear within a single pattern; each pattern must
+#                              match ^[A-Za-z0-9._/*?-]+$ (letters, digits and
+#                              . _ / * ? -).
 #                              Default: main,preview
 #                              Requires --restrict-branch-creation or
 #                              --only-restrict-creation.
@@ -134,7 +138,7 @@ while [[ "${1:-}" == -* ]]; do
             ;;
         *)
             echo "Error: unknown option: $1" >&2
-            show_help
+            show_help >&2
             exit 1
             ;;
     esac
@@ -164,15 +168,66 @@ if [[ "${EXCLUDE_CSV_SET}" == "true" &&
     exit 1
 fi
 
+# ── Validate user-supplied values (before any repo mutation) ───────────────────
+# These checks run BEFORE any API call so a malformed value cannot abort the run
+# mid-way and leave the repository partially protected.  They also confine the
+# values that later flow into JSON payloads / API URLs to a safe charset,
+# closing the JSON-injection / URL-rewrite classes at the source.
+
+if [[ -n "${APPROVERS_TEAM}" && ! "${APPROVERS_TEAM}" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "Error: --approvers slug must match ^[A-Za-z0-9_-]+\$ (letters, digits, '_', '-')." >&2
+    echo "       Got: '${APPROVERS_TEAM}'" >&2
+    exit 1
+fi
+
+# Validate every --exclude-branches pattern.  Patterns are comma-split, so a
+# comma can never appear within a single pattern (documented in --help).  Each
+# trimmed pattern must be non-empty and match a safe fnmatch charset.
+if [[ "${RESTRICT_CREATION}" == "true" || "${ONLY_RESTRICT_CREATION}" == "true" ]]; then
+    IFS=',' read -ra _exclude_pats <<< "${EXCLUDE_CSV}"
+    for _pat in "${_exclude_pats[@]}"; do
+        # trim leading/trailing whitespace
+        _pat="${_pat#"${_pat%%[![:space:]]*}"}"
+        _pat="${_pat%"${_pat##*[![:space:]]}"}"
+        if [[ -z "${_pat}" ]]; then
+            echo "Error: --exclude-branches contains an empty pattern (check for stray commas)." >&2
+            exit 1
+        fi
+        if [[ ! "${_pat}" =~ ^[A-Za-z0-9._/*?-]+$ ]]; then
+            echo "Error: --exclude-branches pattern '${_pat}' contains invalid characters." >&2
+            echo "       Allowed: letters, digits and . _ / * ? - (commas separate patterns)." >&2
+            exit 1
+        fi
+    done
+    unset _exclude_pats _pat
+fi
+
 # ── Positional arguments ───────────────────────────────────────────────────────
 
 if [[ -z "${1:-}" ]]; then
-    show_help
+    show_help >&2
     exit 1
 fi
 
 REPO="$1"
-BRANCH="${2:-main}"
+shift
+
+# Consume the optional [branch] (only meaningful for full protection).  Any
+# remaining positional argument is unexpected and is a usage error.
+BRANCH="main"
+if [[ "${ONLY_RESTRICT_CREATION}" == "false" && $# -gt 0 ]]; then
+    BRANCH="$1"
+    shift
+fi
+
+if [[ $# -gt 0 ]]; then
+    echo "Error: unexpected extra positional argument(s): $*" >&2
+    if [[ "${ONLY_RESTRICT_CREATION}" == "true" ]]; then
+        echo "       --only-restrict-creation takes only <owner/repo> (no [branch])." >&2
+    fi
+    show_help >&2
+    exit 1
+fi
 
 if [[ ! "${REPO}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
     echo "Error: repository must be in 'owner/repo' format (e.g. NSLS2/n2snscripts)." >&2
@@ -211,22 +266,24 @@ fi
 
 _build_exclude_json() {
     local csv="$1"
-    local result=""
     local p
+    local _pats=()
+    local _refs=()
     IFS=',' read -ra _pats <<< "${csv}"
     for p in "${_pats[@]}"; do
         # trim leading/trailing whitespace
         p="${p#"${p%%[![:space:]]*}"}"
         p="${p%"${p##*[![:space:]]}"}"
         [[ -z "$p" ]] && continue
-        result+="${result:+, }\"refs/heads/${p}\""
+        _refs+=("refs/heads/${p}")
     done
-    if [[ -z "${result}" ]]; then
+    if [[ "${#_refs[@]}" -eq 0 ]]; then
         echo "Error: --exclude-branches produced no usable patterns after trimming." >&2
         echo "       At least one non-empty branch name or pattern is required." >&2
         exit 1
     fi
-    printf '%s' "${result}"
+    # Emit a JSON array of ref strings; jq encodes each value safely.
+    jq -n --args '$ARGS.positional' "${_refs[@]}"
 }
 
 # ── Full branch protection (steps 1–4) ────────────────────────────────────────
@@ -235,45 +292,59 @@ _build_exclude_json() {
 if [[ "${ONLY_RESTRICT_CREATION}" == "false" ]]; then
     echo "Applying branch protection to ${REPO}@${BRANCH}..."
 
-    # Build the rules array.  Signed commits are conditional.
+    # Build the conditional signed-commits rule as a (possibly empty) JSON array
+    # that is appended to the base rules; keeps the emitted shape identical to
+    # the previous printf assembly.
     if [[ "${SIGN_COMMITS}" == "true" ]]; then
-        SIGN_RULE=',
-    { "type": "required_signatures" }'
+        SIGN_RULES='[{ "type": "required_signatures" }]'
     else
-        SIGN_RULE=''
+        SIGN_RULES='[]'
     fi
 
     # Compose the ruleset payload (used for both create and update).
-    RULESET_PAYLOAD=$(printf '{
-  "name": "%s",
-  "target": "branch",
-  "enforcement": "active",
-  "conditions": {
-    "ref_name": {
-      "include": ["~ALL"],
-      "exclude": []
-    }
-  },
-  "rules": [
-    { "type": "deletion" },
-    { "type": "non_fast_forward" },
-    {
-      "type": "pull_request",
-      "parameters": {
-        "required_approving_review_count": 1,
-        "dismiss_stale_reviews_on_push": true,
-        "require_last_push_approval": true,
-        "require_code_owner_review": true,
-        "required_review_thread_resolution": true
-      }
-    }%s
-  ]
-}' "${FULL_RULESET_NAME}" "${SIGN_RULE}")
+    RULESET_PAYLOAD=$(jq -n \
+        --arg name "${FULL_RULESET_NAME}" \
+        --argjson sign "${SIGN_RULES}" \
+        '{
+          name: $name,
+          target: "branch",
+          enforcement: "active",
+          conditions: {
+            ref_name: {
+              include: ["~ALL"],
+              exclude: []
+            }
+          },
+          rules: ([
+            { type: "deletion" },
+            { type: "non_fast_forward" },
+            {
+              type: "pull_request",
+              parameters: {
+                required_approving_review_count: 1,
+                dismiss_stale_reviews_on_push: true,
+                require_last_push_approval: true,
+                require_code_owner_review: true,
+                required_review_thread_resolution: true
+              }
+            }
+          ] + $sign)
+        }')
 
     # 1) Repository ruleset (all branches via ~ALL) — idempotent.
     #    Check for an existing ruleset with our name; PUT if found, POST if not.
-    RULESET_ID=$(gh api "repos/${REPO}/rulesets" \
-        --jq ".[] | select(.name==\"${FULL_RULESET_NAME}\") | .id" 2> /dev/null || true)
+    #    --paginate walks every page (the default 30/page can hide a match);
+    #    first(...) collapses any duplicate-name rulesets to a single id.  A real
+    #    API error is distinguished from an empty result so a transient failure
+    #    is not misread as "not found" (which would POST a duplicate).
+    if ! RULESET_ID=$(gh api --paginate "repos/${REPO}/rulesets" \
+        --jq "first(.[] | select(.name==\"${FULL_RULESET_NAME}\") | .id)"); then
+        echo "Error: failed to query existing rulesets on ${REPO}." >&2
+        echo "       Aborting to avoid creating a duplicate ruleset." >&2
+        exit 1
+    fi
+    # Guard against a newline-joined id if multiple pages each emit a match.
+    RULESET_ID="${RULESET_ID%%$'\n'*}"
 
     if [[ -n "${RULESET_ID}" ]]; then
         printf '%s' "${RULESET_PAYLOAD}" |
@@ -293,25 +364,27 @@ if [[ "${ONLY_RESTRICT_CREATION}" == "false" ]]; then
     #    restrictions.  The Ruleset covers the substantive rules for all
     #    branches; the classic rule adds admin enforcement on the named branch
     #    and (when --approvers is set) restricts who can dismiss stale reviews.
-    if [[ -n "${APPROVERS_TEAM}" ]]; then
-        DISMISSAL_JSON='"dismissal_restrictions": { "teams": ["'"${APPROVERS_TEAM}"'"] },'
-    else
-        DISMISSAL_JSON=''
-    fi
-
-    printf '{
-  "required_status_checks": null,
-  "enforce_admins": true,
-  "required_pull_request_reviews": {
-    %s
-    "required_approving_review_count": 1,
-    "dismiss_stale_reviews": true,
-    "require_last_push_approval": true,
-    "require_code_owner_reviews": true
-  },
-  "restrictions": null,
-  "required_conversation_resolution": true
-}' "${DISMISSAL_JSON}" |
+    # jq -n builds the payload with APPROVERS_TEAM safely encoded.  When no team
+    # is set, the dismissal_restrictions key is omitted entirely (identical to
+    # the previous empty-string interpolation).
+    jq -n --arg team "${APPROVERS_TEAM}" '
+        {
+          required_status_checks: null,
+          enforce_admins: true,
+          required_pull_request_reviews: (
+            (if $team == "" then {}
+             else { dismissal_restrictions: { teams: [$team] } }
+             end)
+            + {
+                required_approving_review_count: 1,
+                dismiss_stale_reviews: true,
+                require_last_push_approval: true,
+                require_code_owner_reviews: true
+              }
+          ),
+          restrictions: null,
+          required_conversation_resolution: true
+        }' |
         gh api -X PUT "repos/${REPO}/branches/${BRANCH}/protection" \
             -H "Accept: application/vnd.github+json" \
             --input - > /dev/null
@@ -359,24 +432,32 @@ fi
 if [[ "${RESTRICT_CREATION}" == "true" || "${ONLY_RESTRICT_CREATION}" == "true" ]]; then
     EXCLUDE_JSON=$(_build_exclude_json "${EXCLUDE_CSV}")
 
-    CREATION_PAYLOAD=$(printf '{
-  "name": "%s",
-  "target": "branch",
-  "enforcement": "active",
-  "conditions": {
-    "ref_name": {
-      "include": ["~ALL"],
-      "exclude": [%s]
-    }
-  },
-  "rules": [
-    { "type": "creation" }
-  ]
-}' "${CREATION_RULESET_NAME}" "${EXCLUDE_JSON}")
+    CREATION_PAYLOAD=$(jq -n \
+        --arg name "${CREATION_RULESET_NAME}" \
+        --argjson exclude "${EXCLUDE_JSON}" \
+        '{
+          name: $name,
+          target: "branch",
+          enforcement: "active",
+          conditions: {
+            ref_name: {
+              include: ["~ALL"],
+              exclude: $exclude
+            }
+          },
+          rules: [
+            { type: "creation" }
+          ]
+        }')
 
-    CREATION_RULESET_ID=$(gh api "repos/${REPO}/rulesets" \
-        --jq ".[] | select(.name==\"${CREATION_RULESET_NAME}\") | .id" \
-        2> /dev/null || true)
+    #    --paginate + first(...) + explicit error handling, as above.
+    if ! CREATION_RULESET_ID=$(gh api --paginate "repos/${REPO}/rulesets" \
+        --jq "first(.[] | select(.name==\"${CREATION_RULESET_NAME}\") | .id)"); then
+        echo "Error: failed to query existing rulesets on ${REPO}." >&2
+        echo "       Aborting to avoid creating a duplicate ruleset." >&2
+        exit 1
+    fi
+    CREATION_RULESET_ID="${CREATION_RULESET_ID%%$'\n'*}"
 
     if [[ -n "${CREATION_RULESET_ID}" ]]; then
         printf '%s' "${CREATION_PAYLOAD}" |
