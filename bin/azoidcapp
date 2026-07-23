@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import subprocess
 import sys
 import time
@@ -124,26 +126,6 @@ def _run(args: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def check_az_login() -> None:
-    """Verify that 'az' is on PATH and a session is active."""
-    try:
-        subprocess.run(
-            ["az", "account", "show"],
-            check=True,
-            capture_output=True,
-        )
-    except FileNotFoundError:
-        die(
-            "'az' CLI not found on PATH. Install the Azure CLI: https://aka.ms/azure-cli",
-            code=2,
-        )
-    except subprocess.CalledProcessError:
-        die(
-            "No active az session. Run 'az login' first.",
-            code=2,
-        )
-
-
 def get_graph_token(tenant: str | None) -> str:
     """Obtain a Microsoft Graph bearer token via the az CLI."""
     cmd = [
@@ -170,16 +152,29 @@ def get_graph_token(tenant: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _odata_str(value: str) -> str:
+    """
+    Escape a string for safe interpolation into an OData filter literal.
+
+    OData escapes a single quote by doubling it. Callers still URL-encode
+    the assembled filter expression (see _filter_path); this handles the
+    OData syntax layer so an apostrophe in a value cannot break the filter
+    or alter its semantics.
+    """
+    return value.replace("'", "''")
+
+
 def _filter_path(resource: str, filter_expr: str, select: str | None = None) -> str:
     """
     Build a Graph list path with a properly encoded $filter (and $select).
 
-    Encoding the filter value prevents urllib from rejecting URLs that
+    Encoding the query values prevents urllib from rejecting URLs that
     contain spaces or single-quotes (e.g. OData 'eq' expressions).
     """
-    qs = f"$filter={urllib.parse.quote(filter_expr)}"
+    params = {"$filter": filter_expr}
     if select:
-        qs += f"&$select={urllib.parse.quote(select)}"
+        params["$select"] = select
+    qs = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
     return f"/{resource}?{qs}"
 
 
@@ -196,20 +191,34 @@ def _parse_error(exc: urllib.error.HTTPError) -> tuple[int, str]:
     return exc.code, detail or f"HTTP {exc.code}"
 
 
+# Non-HTTPError exceptions from a Graph call that still mean the call
+# failed (network unreachable, timeout, or an unparsable response body).
+# NOTE: HTTPError is a subclass of URLError, so any except clause using
+# this tuple MUST catch urllib.error.HTTPError first.
+_GRAPH_CALL_ERRORS = (
+    urllib.error.URLError,
+    TimeoutError,
+    socket.timeout,
+    json.JSONDecodeError,
+)
+
+# Network timeout (seconds) for a single Graph REST call.
+_GRAPH_TIMEOUT = 30
+
+
 def _graph_request(
     method: str,
     path: str,
     token: str,
     body: dict[str, Any] | None = None,
-    *,
-    expect_no_content: bool = False,
 ) -> dict[str, Any] | None:
     """
     Make a single Microsoft Graph REST call.
 
     Returns the parsed JSON body on success, or None when the server
-    returns 204 No Content (or expect_no_content is True).
-    Raises urllib.error.HTTPError on HTTP failure.
+    returns an empty body (e.g. 204 No Content).
+    Raises urllib.error.HTTPError on HTTP failure; URLError/TimeoutError/
+    json.JSONDecodeError on network or response-decoding failure.
     """
     url = f"{GRAPH_BASE}{path}"
     data = json.dumps(body).encode() if body is not None else None
@@ -219,9 +228,9 @@ def _graph_request(
         "Accept": "application/json",
     }
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=_GRAPH_TIMEOUT) as resp:
         raw = resp.read()
-        if expect_no_content or not raw:
+        if not raw:
             return None
         return json.loads(raw)
 
@@ -232,16 +241,37 @@ def graph(
     token: str,
     body: dict[str, Any] | None = None,
     *,
-    expect_no_content: bool = False,
     description: str = "",
 ) -> dict[str, Any] | None:
-    """Graph call; dies with code 4 on HTTP failure."""
+    """Graph call; dies with code 4 on HTTP, network, or decode failure."""
     label = description or f"{method} {path}"
     try:
-        return _graph_request(method, path, token, body, expect_no_content=expect_no_content)
+        return _graph_request(method, path, token, body)
     except urllib.error.HTTPError as exc:
         code, detail = _parse_error(exc)
         die(f"{label} failed ({code}): {detail}", code=4)
+    except _GRAPH_CALL_ERRORS as exc:
+        die(f"{label} failed: {exc}", code=4)
+
+
+def graph_json(
+    method: str,
+    path: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+    *,
+    description: str = "",
+) -> dict[str, Any]:
+    """
+    Graph call that requires a JSON object response.
+
+    Dies with code 4 on failure or when the server returns an empty body.
+    """
+    label = description or f"{method} {path}"
+    resp = graph(method, path, token, body, description=description)
+    if resp is None:
+        die(f"{label} failed: expected a response body but got none", code=4)
+    return resp
 
 
 def _is_already_exists_error(http_code: int, message: str) -> bool:
@@ -256,18 +286,47 @@ def _is_already_exists_error(http_code: int, message: str) -> bool:
         return True
     if http_code == 400:
         msg_lower = message.lower()
-        return any(
-            phrase in msg_lower
-            for phrase in (
-                # "already exist" (no trailing 's') matches both:
-                #   "One or more added object references already exist
-                #    for the following modified properties: 'owners'."
-                #   "Permission being assigned already exists."
-                "already exist",
-                "object references already exist",
-            )
-        )
+        # "already exist" (no trailing 's') matches both:
+        #   "One or more added object references already exist for the
+        #    following modified properties: 'owners'."
+        #   "Permission being assigned already exists."
+        return "already exist" in msg_lower
     return False
+
+
+def _is_sp_propagation_error(http_code: int, message: str) -> bool:
+    """
+    Return True when a 400 is a transient service-principal replication lag.
+
+    After a service principal is created, Microsoft Graph can take up to
+    ~60 s to make it visible to the admin-consent / grant endpoints, which
+    fail with a 400 whose message mentions the SP not existing yet. Only
+    those 400s are worth retrying; permanent 400s (bad payloads) are not.
+    """
+    if http_code != 400:
+        return False
+    msg_lower = message.lower()
+    return any(
+        phrase in msg_lower
+        for phrase in (
+            "does not exist",
+            "was not found",
+            "cannot find",
+            "service principal",
+            "replicat",  # "replication", "not yet replicated"
+        )
+    )
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError, default: float) -> float:
+    """Parse a Retry-After response header (delta-seconds); fall back to default."""
+    value = exc.headers.get("Retry-After") if exc.headers else None
+    if value:
+        try:
+            return max(0.0, float(value.strip()))
+        except (TypeError, ValueError):
+            pass
+    return default
 
 
 def graph_or_exists(
@@ -276,24 +335,25 @@ def graph_or_exists(
     token: str,
     body: dict[str, Any] | None = None,
     *,
-    expect_no_content: bool = False,
     description: str = "",
 ) -> tuple[dict[str, Any] | None, bool]:
     """
     Graph call that treats 'already exists' responses as success.
 
     Returns (response_body_or_None, already_existed).
-    Dies with code 4 on any other HTTP failure.
+    Dies with code 4 on any other failure.
     """
     label = description or f"{method} {path}"
     try:
-        resp = _graph_request(method, path, token, body, expect_no_content=expect_no_content)
+        resp = _graph_request(method, path, token, body)
         return resp, False
     except urllib.error.HTTPError as exc:
         code, detail = _parse_error(exc)
         if _is_already_exists_error(code, detail):
             return None, True
         die(f"{label} failed ({code}): {detail}", code=4)
+    except _GRAPH_CALL_ERRORS as exc:
+        die(f"{label} failed: {exc}", code=4)
 
 
 def graph_with_retry(
@@ -302,26 +362,29 @@ def graph_with_retry(
     token: str,
     body: dict[str, Any] | None = None,
     *,
-    expect_no_content: bool = False,
     description: str = "",
     retries: int = 6,
     backoff: float = 10.0,
     swallow_exists: bool = False,
 ) -> tuple[dict[str, Any] | None, bool]:
     """
-    Graph call with exponential backoff on transient errors, optionally
-    treating 'already exists' as success.
+    Graph call with linear backoff on transient errors, optionally treating
+    'already exists' as success.
 
     After creating a service principal, Microsoft Graph can take up to
     ~60 s to make the new SP visible to all endpoints (admin-consent,
-    role assignment, etc.).  Retrying with a linear backoff handles this.
+    role assignment, etc.). Retrying with a linear backoff (backoff * attempt)
+    handles this. Retries on 404/429/5xx, and on a 400 only when its message
+    indicates SP-replication lag; honours a Retry-After response header.
 
     Returns (response_body_or_None, already_existed).
     """
     label = description or f"{method} {path}"
+    # Status codes that are always worth retrying (transient/throttling).
+    retry_codes = (404, 429, 500, 502, 503, 504)
     for attempt in range(1, retries + 1):
         try:
-            resp = _graph_request(method, path, token, body, expect_no_content=expect_no_content)
+            resp = _graph_request(method, path, token, body)
             return resp, False
         except urllib.error.HTTPError as exc:
             code, detail = _parse_error(exc)
@@ -329,15 +392,36 @@ def graph_with_retry(
             if swallow_exists and _is_already_exists_error(code, detail):
                 return None, True
 
-            if code in (400, 404, 503) and attempt < retries:
-                wait = backoff * attempt
+            retryable = code in retry_codes or _is_sp_propagation_error(code, detail)
+            if retryable and attempt < retries:
+                wait = _retry_after_seconds(exc, backoff * attempt)
                 warn(f"{label}: HTTP {code} (attempt {attempt}/{retries}), retrying in {wait:.0f}s\u2026")
                 time.sleep(wait)
                 continue
 
             die(f"{label} failed ({code}): {detail}", code=4)
+        except _GRAPH_CALL_ERRORS as exc:
+            if attempt < retries:
+                wait = backoff * attempt
+                warn(f"{label}: {exc} (attempt {attempt}/{retries}), retrying in {wait:.0f}s\u2026")
+                time.sleep(wait)
+                continue
+            die(f"{label} failed: {exc}", code=4)
 
-    die(f"{label}: all {retries} attempts failed", code=4)
+    # Unreachable: the loop always either returns or dies on the final attempt.
+    raise AssertionError("graph_with_retry exhausted without returning")
+
+
+def _relativize_graph_url(url: str) -> str:
+    """Convert an absolute Graph @odata.nextLink to a GRAPH_BASE-relative path."""
+    if url.startswith(GRAPH_BASE):
+        return url[len(GRAPH_BASE) :]
+    parsed = urllib.parse.urlsplit(url)
+    base_path = urllib.parse.urlsplit(GRAPH_BASE).path  # e.g. "/v1.0"
+    path = parsed.path
+    if base_path and path.startswith(base_path):
+        path = path[len(base_path) :]
+    return urllib.parse.urlunsplit(("", "", path, parsed.query, ""))
 
 
 def graph_list(
@@ -350,11 +434,19 @@ def graph_list(
     """
     Return all items from a Graph list endpoint matching an OData filter.
 
-    Uses a properly encoded URL to avoid InvalidURL errors on spaces/quotes.
+    Follows @odata.nextLink so every page is accumulated, not just the
+    first. Uses a properly encoded URL to avoid InvalidURL errors on
+    spaces/quotes.
     """
-    path = _filter_path(resource, filter_expr, select)
-    resp = graph("GET", path, token, description=description or f"list {resource}")
-    return resp.get("value", []) if resp else []  # type: ignore[union-attr]
+    path: str | None = _filter_path(resource, filter_expr, select)
+    label = description or f"list {resource}"
+    items: list[dict[str, Any]] = []
+    while path is not None:
+        resp = graph_json("GET", path, token, description=label)
+        items.extend(resp.get("value", []))
+        next_link = resp.get("@odata.nextLink")
+        path = _relativize_graph_url(next_link) if next_link else None
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -423,10 +515,21 @@ def _graph_block_scope_ids(rra: list[dict[str, Any]]) -> set[str]:
     return set()
 
 
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    """Return values with duplicates removed, preserving first-seen order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
 def _merge_redirect_uris(existing: list[str], desired: list[str]) -> tuple[list[str], bool]:
     """Union desired URIs into existing ones (add only). Returns (merged, changed)."""
     existing_set = set(existing)
-    to_add = [u for u in desired if u not in existing_set]
+    to_add = _dedupe_preserving_order([u for u in desired if u not in existing_set])
     if not to_add:
         return existing, False
     return existing + to_add, True
@@ -437,8 +540,20 @@ def _merge_redirect_uris(existing: list[str], desired: list[str]) -> tuple[list[
 # ---------------------------------------------------------------------------
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser whose usage errors exit 1, not argparse's default 2.
+
+    Exit code 2 is reserved by this tool's contract for 'az missing / not
+    logged in'; a command-line usage error is exit 1.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        self.print_usage(sys.stderr)
+        die(message, code=1)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         prog=PROG,
         description=(
             "Create or reconcile an Entra ID OIDC web application and "
@@ -484,7 +599,11 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Emit a JSON result instead of a human-readable summary",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    # Dedupe repeated -r values once so neither the create path (400 on
+    # duplicate redirectUris) nor the merge path can double them up.
+    args.redirect_uris = _dedupe_preserving_order(args.redirect_uris)
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -493,8 +612,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def _setup_colour() -> dict[str, str]:
-    import os
-
     if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
         return {
             "reset": "\033[0m",
@@ -509,8 +626,8 @@ def _setup_colour() -> dict[str, str]:
 
 def _status_tag(status: str, c: dict[str, str]) -> str:
     """Coloured status tag for human output."""
-    if status == "created":
-        return f"{c['green']}created{c['reset']}"
+    if status in ("created", "added"):
+        return f"{c['green']}{status}{c['reset']}"
     if status == "updated":
         return f"{c['yellow']}updated{c['reset']}"
     if status in ("existed", "unchanged"):
@@ -527,7 +644,8 @@ def main() -> None:  # noqa: C901 — long but linear
     args = parse_args()
 
     # -- preflight ----------------------------------------------------------
-    check_az_login()
+    # No separate 'az account show' probe: get_graph_token() already fails
+    # with exit 2 and the same diagnostics if az is missing or logged out.
     token = get_graph_token(args.tenant)
 
     # Tracks whether anything changed this run
@@ -546,9 +664,15 @@ def main() -> None:  # noqa: C901 — long but linear
         code, detail = _parse_error(exc)
         if code == 404:
             die(f"Owner '{args.owner}' not found in directory.", code=3)
-        die(f"Owner lookup failed ({code}): {detail}", code=3)
+        # A real Graph failure (401/403/5xx) is a failed call, not a
+        # genuinely-absent owner: exit 4, not 3.
+        die(f"Owner lookup failed ({code}): {detail}", code=4)
+    except _GRAPH_CALL_ERRORS as exc:
+        die(f"Owner lookup failed: {exc}", code=4)
 
-    owner_id: str = owner_obj["id"]  # type: ignore[index]
+    if owner_obj is None:
+        die("Owner lookup returned an empty response.", code=4)
+    owner_id: str = owner_obj["id"]
     info(f"owner object ID: {owner_id}")
 
     # -- step 1: app registration (find-or-create + reconcile) -------------
@@ -557,7 +681,7 @@ def main() -> None:  # noqa: C901 — long but linear
 
     apps = graph_list(
         "applications",
-        f"displayName eq '{args.name}'",
+        f"displayName eq '{_odata_str(args.name)}'",
         token,
         select="id,appId,web,requiredResourceAccess,displayName",
         description="Look up application by displayName",
@@ -579,16 +703,17 @@ def main() -> None:  # noqa: C901 — long but linear
             "web": {"redirectUris": args.redirect_uris},
             "requiredResourceAccess": desired_rra,
         }
-        app = graph(
+        app = graph_json(
             "POST",
             "/applications",
             token,
             app_body,
             description="Create application",
         )
-        app_id: str = app["appId"]  # type: ignore[index]
-        app_obj_id: str = app["id"]  # type: ignore[index]
+        app_id: str = app["appId"]
+        app_obj_id: str = app["id"]
         statuses["app"] = "created"
+        merged_uris = list(args.redirect_uris)
         any_changed = True
         info(f"appId:     {app_id}")
         info(f"object ID: {app_obj_id}")
@@ -619,7 +744,6 @@ def main() -> None:  # noqa: C901 — long but linear
                 f"/applications/{app_obj_id}",
                 token,
                 patch,
-                expect_no_content=True,
                 description="Reconcile application",
             )
             statuses["app"] = "updated"
@@ -631,63 +755,65 @@ def main() -> None:  # noqa: C901 — long but linear
         # Confirm every desired scope ID is present in requiredResourceAccess.
         # This catches drift between independent runs (e.g. grant set in step 5
         # before the manifest was updated) and corrects it with one extra PATCH.
-        desired_scope_ids = set(DELEGATED_SCOPES.values())
-        live_app = graph(
-            "GET",
-            f"/applications/{app_obj_id}?$select=requiredResourceAccess",
-            token,
-            description="Read back requiredResourceAccess",
-        )
-        live_rra: list[dict[str, Any]] = (live_app or {}).get("requiredResourceAccess", [])
-        live_scope_ids = _graph_block_scope_ids(live_rra)
-        still_missing = desired_scope_ids - live_scope_ids
-
-        if still_missing:
-            missing_names = [name for name, sid in DELEGATED_SCOPES.items() if sid in still_missing]
-            info(
-                f"read-back: {len(still_missing)} scope(s) missing from "
-                f"requiredResourceAccess after PATCH "
-                f"({', '.join(missing_names)}) — applying corrective PATCH"
-            )
-            corrective_rra, _ = _merge_resource_access(live_rra, desired_rra)
-            graph(
-                "PATCH",
-                f"/applications/{app_obj_id}",
-                token,
-                {"requiredResourceAccess": corrective_rra},
-                expect_no_content=True,
-                description="Corrective requiredResourceAccess PATCH",
-            )
-            # Final verification — error loudly if still broken
-            live_app2 = graph(
+        # Only needed when we actually touched requiredResourceAccess; if the
+        # merge found nothing missing, the list query already proved it present.
+        if rra_changed:
+            desired_scope_ids = set(DELEGATED_SCOPES.values())
+            live_app = graph_json(
                 "GET",
                 f"/applications/{app_obj_id}?$select=requiredResourceAccess",
                 token,
-                description="Re-read requiredResourceAccess after corrective PATCH",
+                description="Read back requiredResourceAccess",
             )
-            live_rra2: list[dict[str, Any]] = (live_app2 or {}).get("requiredResourceAccess", [])
-            still_missing2 = desired_scope_ids - _graph_block_scope_ids(live_rra2)
-            if still_missing2:
-                missing_names2 = [name for name, sid in DELEGATED_SCOPES.items() if sid in still_missing2]
-                die(
-                    "requiredResourceAccess still missing scope(s) after "
-                    f"corrective PATCH: {', '.join(missing_names2)}. "
-                    "Check app manifest in the portal.",
-                    code=4,
-                )
-            statuses["app"] = "updated"
-            any_changed = True
-            info("read-back: corrective PATCH confirmed — all scopes now configured")
-        else:
-            info("read-back: all desired scopes present in requiredResourceAccess")
+            live_rra: list[dict[str, Any]] = live_app.get("requiredResourceAccess", [])
+            live_scope_ids = _graph_block_scope_ids(live_rra)
+            still_missing = desired_scope_ids - live_scope_ids
 
-        info(f"app: {statuses['app']}")
+            if still_missing:
+                missing_names = [name for name, sid in DELEGATED_SCOPES.items() if sid in still_missing]
+                info(
+                    f"read-back: {len(still_missing)} scope(s) missing from "
+                    f"requiredResourceAccess after PATCH "
+                    f"({', '.join(missing_names)}) — applying corrective PATCH"
+                )
+                corrective_rra, _ = _merge_resource_access(live_rra, desired_rra)
+                graph(
+                    "PATCH",
+                    f"/applications/{app_obj_id}",
+                    token,
+                    {"requiredResourceAccess": corrective_rra},
+                    description="Corrective requiredResourceAccess PATCH",
+                )
+                # Final verification — error loudly if still broken
+                live_app2 = graph_json(
+                    "GET",
+                    f"/applications/{app_obj_id}?$select=requiredResourceAccess",
+                    token,
+                    description="Re-read requiredResourceAccess after corrective PATCH",
+                )
+                live_rra2: list[dict[str, Any]] = live_app2.get("requiredResourceAccess", [])
+                still_missing2 = desired_scope_ids - _graph_block_scope_ids(live_rra2)
+                if still_missing2:
+                    missing_names2 = [name for name, sid in DELEGATED_SCOPES.items() if sid in still_missing2]
+                    die(
+                        "requiredResourceAccess still missing scope(s) after "
+                        f"corrective PATCH: {', '.join(missing_names2)}. "
+                        "Check app manifest in the portal.",
+                        code=4,
+                    )
+                statuses["app"] = "updated"
+                any_changed = True
+                info("read-back: corrective PATCH confirmed — all scopes now configured")
+            else:
+                info("read-back: all desired scopes present in requiredResourceAccess")
+
+    info(f"app: {statuses['app']}")
 
     # -- step 2: service principal (find-or-create) ------------------------
     step("Ensuring service principal\u2026")
     sps = graph_list(
         "servicePrincipals",
-        f"appId eq '{app_id}'",
+        f"appId eq '{_odata_str(app_id)}'",
         token,
         select="id",
         description="Look up service principal by appId",
@@ -698,16 +824,34 @@ def main() -> None:  # noqa: C901 — long but linear
         statuses["sp"] = "existed"
         info(f"found existing SP — object ID: {sp_obj_id}")
     else:
-        sp = graph(
+        # graph_or_exists() tolerates a create-vs-get race: if a concurrent
+        # run created the SP first, the 'already exists' response is treated
+        # as success and we re-fetch its object ID below.
+        sp, sp_existed = graph_or_exists(
             "POST",
             "/servicePrincipals",
             token,
             {"appId": app_id},
             description="Create service principal",
         )
-        sp_obj_id = sp["id"]  # type: ignore[index]
-        statuses["sp"] = "created"
-        any_changed = True
+        if sp is not None and "id" in sp:
+            sp_obj_id = sp["id"]
+            statuses["sp"] = "existed" if sp_existed else "created"
+        else:
+            # Lost the race (empty/absent body): look the SP up by appId.
+            existing_sps = graph_list(
+                "servicePrincipals",
+                f"appId eq '{_odata_str(app_id)}'",
+                token,
+                select="id",
+                description="Re-look up service principal after race",
+            )
+            if not existing_sps:
+                die("Service principal creation reported success but none was found.", code=4)
+            sp_obj_id = existing_sps[0]["id"]
+            statuses["sp"] = "existed"
+        if statuses["sp"] == "created":
+            any_changed = True
         info(f"SP object ID: {sp_obj_id}")
 
     # -- step 3: owners (app + SP) — swallow "already exists" --------------
@@ -719,7 +863,6 @@ def main() -> None:  # noqa: C901 — long but linear
         f"/applications/{app_obj_id}/owners/$ref",
         token,
         owner_ref,
-        expect_no_content=True,
         description="Add application owner",
     )
     statuses["app_owner"] = "existed" if app_owner_existed else "added"
@@ -733,7 +876,6 @@ def main() -> None:  # noqa: C901 — long but linear
         f"/servicePrincipals/{sp_obj_id}/owners/$ref",
         token,
         owner_ref,
-        expect_no_content=True,
         description="Add service principal owner",
     )
     statuses["sp_owner"] = "existed" if sp_owner_existed else "added"
@@ -745,7 +887,7 @@ def main() -> None:  # noqa: C901 — long but linear
     step("Looking up Microsoft Graph service principal in tenant\u2026")
     graph_sps = graph_list(
         "servicePrincipals",
-        f"appId eq '{GRAPH_APP_ID}'",
+        f"appId eq '{_odata_str(GRAPH_APP_ID)}'",
         token,
         select="id",
         description="Get Graph service principal",
@@ -762,15 +904,23 @@ def main() -> None:  # noqa: C901 — long but linear
     scope_string = " ".join(DELEGATED_SCOPES.keys())
     step(f"Ensuring delegated scope grant ({scope_string})\u2026")
 
+    # Filter on consentType eq 'AllPrincipals' so a per-user ('Principal')
+    # grant is never mistaken for the tenant-wide admin-consent grant.
     grants = graph_list(
         "oauth2PermissionGrants",
-        f"clientId eq '{sp_obj_id}' and resourceId eq '{graph_sp_id}'",
+        (
+            f"clientId eq '{_odata_str(sp_obj_id)}' "
+            f"and resourceId eq '{_odata_str(graph_sp_id)}' "
+            "and consentType eq 'AllPrincipals'"
+        ),
         token,
-        select="id,scope",
+        select="id,scope,consentType",
         description="Look up delegated permission grant",
     )
 
     if not grants:
+        # swallow_exists tolerates the 'already exists' 400 that Graph returns
+        # when a grant was created concurrently (or by an earlier partial run).
         graph_with_retry(
             "POST",
             "/oauth2PermissionGrants",
@@ -782,9 +932,13 @@ def main() -> None:  # noqa: C901 — long but linear
                 "scope": scope_string,
             },
             description="Grant delegated scopes",
+            swallow_exists=True,
         )
         statuses["delegated_grant"] = "created"
         any_changed = True
+        # We just created the AllPrincipals grant with the full desired scope
+        # set (or swallow_exists confirmed one already exists).
+        admin_consent_granted = True
     else:
         grant = grants[0]
         if len(grants) > 1:
@@ -797,6 +951,7 @@ def main() -> None:  # noqa: C901 — long but linear
 
         if not missing:
             statuses["delegated_grant"] = "unchanged"
+            final_scopes = existing_scopes
         else:
             merged_scopes = " ".join(sorted(existing_scopes | desired_scopes))
             graph(
@@ -804,11 +959,15 @@ def main() -> None:  # noqa: C901 — long but linear
                 f"/oauth2PermissionGrants/{grant['id']}",
                 token,
                 {"scope": merged_scopes},
-                expect_no_content=True,
                 description="Add missing delegated scopes",
             )
             statuses["delegated_grant"] = "updated"
             any_changed = True
+            final_scopes = existing_scopes | desired_scopes
+
+        # This grant is AllPrincipals (filtered in the lookup); admin consent
+        # is granted iff every desired scope is present in its reconciled set.
+        admin_consent_granted = desired_scopes.issubset(final_scopes)
 
     info(f"delegated grant: {statuses['delegated_grant']}")
 
@@ -822,11 +981,11 @@ def main() -> None:  # noqa: C901 — long but linear
             "upn": args.owner,
             "objectId": owner_id,
         },
-        "redirectUris": args.redirect_uris,
+        "redirectUris": merged_uris,
         "permissions": {
             "delegatedScopes": list(DELEGATED_SCOPES.keys()),
         },
-        "adminConsentGranted": True,
+        "adminConsentGranted": admin_consent_granted,
         "changed": any_changed,
         "statuses": statuses,
     }
