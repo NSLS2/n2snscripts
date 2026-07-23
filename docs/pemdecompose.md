@@ -32,7 +32,7 @@ pemdecompose --help
 | Code | Meaning |
 | --- | --- |
 | `0` | Success |
-| `1` | Usage error |
+| `1` | Usage error (bad option, no input file, or an unreadable input file) |
 | `2` | No certificates found in at least one input file |
 | `3` | `openssl` parse error on at least one certificate |
 | `4` | `--verify` failed for at least one chain link |
