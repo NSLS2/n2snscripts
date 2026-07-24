@@ -54,5 +54,6 @@ name is rejected with return code `2`.
 | `0` (with warning) | File is missing — no decrypt attempted |
 | `2` | A required variable is still empty after decrypt |
 | `3` | `gpg` failed (bad passphrase, malformed file, etc.) |
+| `4` | `eval` of decrypted content failed (syntax error or failing command) |
 
 See the library header comment for the full contract.

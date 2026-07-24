@@ -13,6 +13,8 @@
 #         2 - decrypt succeeded but a required variable is still unset
 #             or empty (also returned when gpg_file argument is missing)
 #         3 - gpg decrypt failed
+#         4 - eval of decrypted content failed (syntax error or failing
+#             command)
 #
 # Usage (in a caller script):
 #   # Source the library by its installed path; substitute the correct
@@ -71,8 +73,15 @@ decrypt_env_file() {
         printf 'decrypt_env_file: gpg --decrypt %s failed (exit %d).\n' "$__gpgpw_file" "$__gpgpw_rc" >&2
         return 3
     fi
+    # Capture the status directly: inside `if ! eval ...`, $? would be the
+    # negated pipeline's status (always 0), not eval's.
     eval "$__gpgpw_decrypted"
+    __gpgpw_rc=$?
     unset __gpgpw_decrypted
+    if ((__gpgpw_rc != 0)); then
+        printf 'decrypt_env_file: eval of decrypted content from %s failed (exit %d).\n' "$__gpgpw_file" "$__gpgpw_rc" >&2
+        return 4
+    fi
 
     local __gpgpw_var __gpgpw_value
     # Guard the expansion so an empty required-vars array does not trip
