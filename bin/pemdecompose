@@ -20,11 +20,11 @@
 #   -h, --help     Show this help and exit
 #       --verify   Verify each cert is issued by the next cert in the
 #                  file (signature + issuer/subject DN match).
-#   -q, --quiet    Suppress the per-file banner and inter-file blank
-#                  line when multiple files are given.
-#       --no-color Disable ANSI colour. Colour is also disabled
-#                  automatically when stdout is not a TTY or when the
-#                  NO_COLOR environment variable is set.
+#   -q, --quiet      Suppress the per-file banner and inter-file blank
+#                    line when multiple files are given.
+#       --no-color,  Disable ANSI colour. Colour is also disabled
+#       --no-colour  automatically when stdout is not a TTY or when the
+#                    NO_COLOR environment variable is set.
 #
 # Exit codes:
 #   0  success
@@ -32,6 +32,7 @@
 #   2  no certificates found in at least one input file
 #   3  openssl parse error on at least one input file
 #   4  --verify failed for at least one chain link
+#   5  operational error (e.g. cannot create the temporary directory)
 
 set -euo pipefail
 
@@ -135,7 +136,10 @@ trap 'cleanup; trap - HUP EXIT; kill -HUP $$' HUP
 
 ensure_tmpdir() {
     if [[ -z "$TMPDIR_" ]]; then
-        TMPDIR_=$(mktemp -d -t pemdecompose.XXXXXX)
+        if ! TMPDIR_=$(mktemp -d -t pemdecompose.XXXXXX); then
+            warn "failed to create temporary directory"
+            return 1
+        fi
     fi
 }
 
@@ -157,23 +161,27 @@ split_certs() {
     ' "$file"
 }
 
-# Print the subject and issuer DNs from a single openssl invocation.
-# openssl emits one "subject=..." line and one "issuer=..." line; the
-# caller strips the prefixes. Returns nonzero if openssl can't parse the
-# block (pipefail propagates openssl's status past the reading pipe).
-cert_subject_issuer() {
-    openssl x509 -noout -subject -issuer -nameopt RFC2253 2> /dev/null
-}
-
-# Print the top-level Signature Algorithm name (e.g. ecdsa-with-SHA384,
-# sha256WithRSAEncryption, ED25519). Returns nonzero if openssl can't
-# parse the block.
-cert_sigalg() {
-    openssl x509 -noout -text 2> /dev/null |
-          awk '/Signature Algorithm:/ {
-                  sub(/^.*Signature Algorithm:[[:space:]]*/, "")
-                  print; exit
-              }'
+# Print the subject DN, issuer DN, and signature algorithm from a single
+# openssl invocation. Output format: three lines "subject=...", "issuer=...",
+# "sigalg=...". Returns nonzero if openssl can't parse the block.
+cert_info() {
+    local output
+    if ! output=$(openssl x509 -noout -subject -issuer -text -nameopt RFC2253 2> /dev/null); then
+        return 1
+    fi
+    local subject="" issuer="" sigalg=""
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            subject=*) subject="${line#subject=}" ;;
+            issuer=*) issuer="${line#issuer=}" ;;
+            *Signature\ Algorithm:*)
+                sigalg="${line##*Signature Algorithm:}"
+                sigalg="${sigalg#"${sigalg%%[![:space:]]*}"}"
+                ;;
+        esac
+    done <<< "$output"
+    printf 'subject=%s\nissuer=%s\nsigalg=%s\n' "$subject" "$issuer" "$sigalg"
 }
 
 # --- per-file processing ------------------------------------------------
@@ -205,14 +213,14 @@ process_file() {
         return 2
     fi
 
-    # Emit subject + issuer + sigalg per cert. Parse the subject and issuer
-    # once and cache them so the --verify loop can reuse them.
+    # Emit subject + issuer + sigalg per cert. Parse all three fields from
+    # one openssl invocation and cache subject/issuer for the --verify loop.
     local -a subjects=() issuers=()
     local i
     for ((i = 0; i < count; i++)); do
         local idx=$((i + 1))
-        local si sub="" iss="" sigalg line
-        if ! si=$(printf '%s' "${blocks[$i]}" | cert_subject_issuer); then
+        local info sub="" iss="" sigalg="" line
+        if ! info=$(printf '%s' "${blocks[$i]}" | cert_info); then
             warn "openssl failed to parse certificate #$idx in $file"
             return 3
         fi
@@ -220,12 +228,9 @@ process_file() {
             case "$line" in
                 subject=*) sub="${line#subject=}" ;;
                 issuer=*) iss="${line#issuer=}" ;;
+                sigalg=*) sigalg="${line#sigalg=}" ;;
             esac
-        done <<< "$si"
-        if ! sigalg=$(printf '%s' "${blocks[$i]}" | cert_sigalg); then
-            warn "openssl failed to parse certificate #$idx in $file"
-            return 3
-        fi
+        done <<< "$info"
         [[ -z "$sigalg" ]] && sigalg="<unknown>"
         subjects[i]="$sub"
         issuers[i]="$iss"
@@ -247,7 +252,12 @@ process_file() {
             return 0
         fi
 
-        ensure_tmpdir
+        # Map a tmpdir-creation failure to the documented operational-error
+        # code rather than 1 (which the exit-code table reserves for usage
+        # errors).
+        if ! ensure_tmpdir; then
+            return 5
+        fi
         local link_ok=1
 
         # Write each block to a temp file once.

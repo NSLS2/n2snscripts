@@ -24,7 +24,7 @@ pemdecompose --help
 | --- | --- |
 | `--verify` | Verify each cert is issued by the next cert in the file (signature + issuer/subject DN match) |
 | `-q`, `--quiet` | Suppress the per-file banner and inter-file blank line when multiple files are given |
-| `--no-color` | Disable ANSI colour output (also disabled automatically when stdout is not a TTY or `NO_COLOR` is set) |
+| `--no-color`, `--no-colour` | Disable ANSI colour output (also disabled automatically when stdout is not a TTY or `NO_COLOR` is set) |
 | `-h`, `--help` | Show help and exit |
 
 ## Exit codes
@@ -36,6 +36,7 @@ pemdecompose --help
 | `2` | No certificates found in at least one input file |
 | `3` | `openssl` parse error on at least one certificate |
 | `4` | `--verify` failed for at least one chain link |
+| `5` | Operational error (e.g. cannot create the temporary directory) |
 
 ## Examples
 
