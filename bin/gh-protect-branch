@@ -263,6 +263,8 @@ fi
 # ── Build the creation-restriction ruleset exclude JSON ───────────────────────
 # Each CSV entry is trimmed and prefixed with refs/heads/ so bare names like
 # "main" match correctly.  fnmatch patterns (e.g. release/**) are preserved.
+# The pre-flight validation loop (lines 186-203) already guaranteed every pattern
+# is non-empty and matches the safe charset; this just builds the JSON array.
 
 _build_exclude_json() {
     local csv="$1"
@@ -274,17 +276,35 @@ _build_exclude_json() {
         # trim leading/trailing whitespace
         p="${p#"${p%%[![:space:]]*}"}"
         p="${p%"${p##*[![:space:]]}"}"
-        [[ -z "$p" ]] && continue
         _refs+=("refs/heads/${p}")
     done
-    if [[ "${#_refs[@]}" -eq 0 ]]; then
-        echo "Error: --exclude-branches produced no usable patterns after trimming." >&2
-        echo "       At least one non-empty branch name or pattern is required." >&2
-        exit 1
-    fi
     # Emit a JSON array of ref strings; jq encodes each value safely.
     jq -n --args '$ARGS.positional' "${_refs[@]}"
 }
+
+# ── Fetch repository rulesets once (used by both full protection and creation restriction)
+# When both rulesets are needed in one invocation (ONLY_RESTRICT_CREATION=false +
+# RESTRICT_CREATION=true), this fetch runs once and both IDs are extracted from
+# the same response.  When only one ruleset is needed, the fetch still happens
+# lazily/correctly in its own section below.
+# includes_parents=false excludes org-inherited rulesets so an org ruleset with
+# the same name cannot be mistaken for a repo one (which would 404 on PUT).
+# The query string is embedded in the URL so --paginate's link-header following
+# preserves it across pages.
+RULESETS_JSON=""
+RULESETS_FETCHED=0
+if [[ "${ONLY_RESTRICT_CREATION}" == "false" && "${RESTRICT_CREATION}" == "true" ]]; then
+    # Both rulesets needed — fetch once.  Track the fetch with a flag rather
+    # than testing RULESETS_JSON for emptiness: a repo with no rulesets at all
+    # (the common first run) legitimately yields an empty stream.
+    if ! RULESETS_JSON=$(gh api --paginate "repos/${REPO}/rulesets?includes_parents=false" \
+        --jq '.[]'); then
+        echo "Error: failed to query existing rulesets on ${REPO}." >&2
+        echo "       Aborting to avoid creating duplicate rulesets." >&2
+        exit 1
+    fi
+    RULESETS_FETCHED=1
+fi
 
 # ── Full branch protection (steps 1–4) ────────────────────────────────────────
 # Skipped when --only-restrict-creation is set.
@@ -337,11 +357,22 @@ if [[ "${ONLY_RESTRICT_CREATION}" == "false" ]]; then
     #    first(...) collapses any duplicate-name rulesets to a single id.  A real
     #    API error is distinguished from an empty result so a transient failure
     #    is not misread as "not found" (which would POST a duplicate).
-    if ! RULESET_ID=$(gh api --paginate "repos/${REPO}/rulesets" \
-        --jq "first(.[] | select(.name==\"${FULL_RULESET_NAME}\") | .id)"); then
-        echo "Error: failed to query existing rulesets on ${REPO}." >&2
-        echo "       Aborting to avoid creating a duplicate ruleset." >&2
-        exit 1
+    if [[ "${RULESETS_FETCHED}" -eq 1 ]]; then
+        # Reuse the already-fetched rulesets list (both rulesets needed).
+        # -s slurps the newline-separated object stream into one array
+        # (interpolating it into an --argjson literal would be invalid JSON
+        # as soon as there is more than one ruleset).
+        RULESET_ID=$(jq -rs --arg name "${FULL_RULESET_NAME}" \
+            'first(.[] | select(.name==$name) | .id) // ""' \
+            <<< "${RULESETS_JSON}")
+    else
+        # Only full protection needed — fetch rulesets now.
+        if ! RULESET_ID=$(gh api --paginate "repos/${REPO}/rulesets?includes_parents=false" \
+            --jq "first(.[] | select(.name==\"${FULL_RULESET_NAME}\") | .id)"); then
+            echo "Error: failed to query existing rulesets on ${REPO}." >&2
+            echo "       Aborting to avoid creating a duplicate ruleset." >&2
+            exit 1
+        fi
     fi
     # Guard against a newline-joined id if multiple pages each emit a match.
     RULESET_ID="${RULESET_ID%%$'\n'*}"
@@ -451,11 +482,21 @@ if [[ "${RESTRICT_CREATION}" == "true" || "${ONLY_RESTRICT_CREATION}" == "true" 
         }')
 
     #    --paginate + first(...) + explicit error handling, as above.
-    if ! CREATION_RULESET_ID=$(gh api --paginate "repos/${REPO}/rulesets" \
-        --jq "first(.[] | select(.name==\"${CREATION_RULESET_NAME}\") | .id)"); then
-        echo "Error: failed to query existing rulesets on ${REPO}." >&2
-        echo "       Aborting to avoid creating a duplicate ruleset." >&2
-        exit 1
+    if [[ "${RULESETS_FETCHED}" -eq 1 ]]; then
+        # Reuse the already-fetched rulesets list (both rulesets needed);
+        # -s slurps the object stream into one array (see the full-protection
+        # lookup above).
+        CREATION_RULESET_ID=$(jq -rs --arg name "${CREATION_RULESET_NAME}" \
+            'first(.[] | select(.name==$name) | .id) // ""' \
+            <<< "${RULESETS_JSON}")
+    else
+        # Only creation restriction needed (--only-restrict-creation) — fetch now.
+        if ! CREATION_RULESET_ID=$(gh api --paginate "repos/${REPO}/rulesets?includes_parents=false" \
+            --jq "first(.[] | select(.name==\"${CREATION_RULESET_NAME}\") | .id)"); then
+            echo "Error: failed to query existing rulesets on ${REPO}." >&2
+            echo "       Aborting to avoid creating a duplicate ruleset." >&2
+            exit 1
+        fi
     fi
     CREATION_RULESET_ID="${CREATION_RULESET_ID%%$'\n'*}"
 

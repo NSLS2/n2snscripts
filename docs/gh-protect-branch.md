@@ -87,7 +87,7 @@ gh-protect-branch --help
 gh-protect-branch NSLS2/n2snscripts
 
 # Standard protection on a non-default branch
-gh-protect-branch NSLS2/n2sndocs main
+gh-protect-branch NSLS2/n2sndocs develop
 
 # With approver team restriction (team validated before applying)
 gh-protect-branch --approvers n2sn-admins NSLS2/n2snscripts
