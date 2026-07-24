@@ -1366,9 +1366,23 @@ init_sandbox_path() {
 }
 
 # Append dynamically-discovered bin directories to SANDBOX_PATH.
+# Deduplicates: the same dir can be recorded more than once (e.g. an npm bin
+# dir added both as a tool's on-PATH dir and as the npm prefix's bin/), and a
+# dir already present in the base SANDBOX_PATH need not be appended again.
 finalize_sandbox_path() {
     local _extra_dir
+    declare -A _path_seen=()
+    # Seed with the base PATH entries so we don't re-append them.
+    local _base_dir
+    local -a _base_dirs=()
+    IFS=':' read -ra _base_dirs <<< "${SANDBOX_PATH}"
+    for _base_dir in "${_base_dirs[@]}"; do
+        [[ -n "${_base_dir}" ]] && _path_seen["${_base_dir}"]=1
+    done
     for _extra_dir in "${_EXTRA_PATH_DIRS[@]+"${_EXTRA_PATH_DIRS[@]}"}"; do
+        [[ -z "${_extra_dir}" ]] && continue
+        [[ -n "${_path_seen["${_extra_dir}"]:-}" ]] && continue
+        _path_seen["${_extra_dir}"]=1
         SANDBOX_PATH="${SANDBOX_PATH}:${_extra_dir}"
     done
 }
@@ -1486,38 +1500,51 @@ build_binary_masks() {
         # Namespace / sandbox escape
         nsenter unshare chroot
     )
-    # On merged-/usr systems /bin, /sbin, /usr/bin, /usr/sbin all point to the
-    # same directory.  Multiple prefixes therefore resolve to the same realpath,
-    # which would emit duplicate --ro-bind /dev/null <path> flags.  Track which
-    # real paths have already been masked and skip repeats.
-    declare -A _MASKED_REAL_SEEN=()
-    local _bin _prefix _candidate _real
-    for _bin in "${_MASKED_BINS[@]}"; do
-        # Search well-known prefixes covering RHEL, Debian, and Arch layouts.
-        for _prefix in /usr/bin /usr/sbin /usr/lib/openssh /usr/libexec/openssh \
-                       /bin /sbin; do
-            _candidate="${_prefix}/${_bin}"
-            # -e follows symlinks: true only if the full chain resolves to a
-            # real file.  Broken alternatives entries (dangling symlinks) are
-            # skipped, which is correct — there is no binary to mask.
-            [[ -e "${_candidate}" ]] || continue
+    # Canonicalize + dedupe the search prefixes once.  On merged-/usr systems
+    # /bin, /sbin, /usr/bin, /usr/sbin resolve to the same directory; collapsing
+    # them here avoids re-checking (and re-resolving) the same candidate under
+    # several aliases.  Search prefixes cover RHEL, Debian, and Arch layouts.
+    declare -A _prefix_seen=()
+    local -a _canon_prefixes=()
+    local _p _pc
+    for _p in /usr/bin /usr/sbin /usr/lib/openssh /usr/libexec/openssh /bin /sbin; do
+        [[ -d "${_p}" ]] || continue
+        _pc="$(readlink -f "${_p}" 2> /dev/null || printf '%s' "${_p}")"
+        [[ -n "${_prefix_seen["${_pc}"]:-}" ]] && continue
+        _prefix_seen["${_pc}"]=1
+        _canon_prefixes+=("${_pc}")
+    done
+    [[ ${#_canon_prefixes[@]} -gt 0 ]] || return 0
 
-            # On RHEL/Debian the binary is often a symlink:
-            #   /usr/bin/nc -> /etc/alternatives/nc -> /usr/bin/ncat
-            # bwrap processes --ro-bind arguments in order.  At the point this
-            # bind is applied, /etc/alternatives has not yet been mounted in the
-            # sandbox, so bwrap cannot resolve the intermediate symlink and
-            # reports "Can't create file at /usr/bin/nc".
-            #
-            # Fix: resolve to the canonical (symlink-free) path on the host and
-            # use *that* as the bwrap destination.  The real file is always
-            # directly accessible under /usr once --ro-bind /usr /usr is applied.
-            _real="$(realpath "${_candidate}")"
-            [[ -n "${_MASKED_REAL_SEEN[${_real}]:-}" ]] && continue
-            _MASKED_REAL_SEEN["${_real}"]=1
-            BWRAP_ARGS+=(--ro-bind /dev/null "${_real}")
+    # Collect every existing candidate binary across the unique prefixes.
+    # -e follows symlinks: true only if the full chain resolves to a real file,
+    # so dangling alternatives entries are skipped (correct — nothing to mask).
+    local -a _candidates=()
+    local _bin _candidate
+    for _bin in "${_MASKED_BINS[@]}"; do
+        for _pc in "${_canon_prefixes[@]}"; do
+            _candidate="${_pc}/${_bin}"
+            [[ -e "${_candidate}" ]] && _candidates+=("${_candidate}")
         done
     done
+    [[ ${#_candidates[@]} -gt 0 ]] || return 0
+
+    # On RHEL/Debian the binary is often a symlink:
+    #   /usr/bin/nc -> /etc/alternatives/nc -> /usr/bin/ncat
+    # bwrap processes --ro-bind arguments in order; at the point the bind is
+    # applied /etc/alternatives is not yet mounted, so bwrap cannot resolve the
+    # intermediate symlink ("Can't create file at /usr/bin/nc").  Resolve every
+    # candidate to its canonical, symlink-free path (always reachable under /usr
+    # once --ro-bind /usr /usr is applied) and mask *that*.  A single readlink
+    # -f fork resolves all candidates at once (was one realpath fork each).
+    declare -A _masked_real_seen=()
+    local _real
+    while IFS= read -r _real; do
+        [[ -n "${_real}" ]] || continue
+        [[ -n "${_masked_real_seen["${_real}"]:-}" ]] && continue
+        _masked_real_seen["${_real}"]=1
+        BWRAP_ARGS+=(--ro-bind /dev/null "${_real}")
+    done < <(readlink -f "${_candidates[@]}")
 }
 
 build_proc_dev_tmp() {
@@ -2075,6 +2102,7 @@ build_dynamic_tool_mounts() {
             /usr /bin /sbin /lib /lib64 \
             /proc /dev /tmp \
             "${PIXI_HOME_DIR}" \
+            "${_HOME}/bin" \
             /nsls2/software/bin; do
         [[ -e "${_preloaded}" ]] && _MOUNTED_PREFIXES["${_preloaded}"]=1
     done
