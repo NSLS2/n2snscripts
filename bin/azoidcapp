@@ -310,6 +310,7 @@ def _is_sp_propagation_error(http_code: int, message: str) -> bool:
         phrase in msg_lower
         for phrase in (
             "does not exist",
+            "does not reference a valid application",  # appId propagation lag
             "was not found",
             "cannot find",
             "service principal",
@@ -327,33 +328,6 @@ def _retry_after_seconds(exc: urllib.error.HTTPError, default: float) -> float:
         except (TypeError, ValueError):
             pass
     return default
-
-
-def graph_or_exists(
-    method: str,
-    path: str,
-    token: str,
-    body: dict[str, Any] | None = None,
-    *,
-    description: str = "",
-) -> tuple[dict[str, Any] | None, bool]:
-    """
-    Graph call that treats 'already exists' responses as success.
-
-    Returns (response_body_or_None, already_existed).
-    Dies with code 4 on any other failure.
-    """
-    label = description or f"{method} {path}"
-    try:
-        resp = _graph_request(method, path, token, body)
-        return resp, False
-    except urllib.error.HTTPError as exc:
-        code, detail = _parse_error(exc)
-        if _is_already_exists_error(code, detail):
-            return None, True
-        die(f"{label} failed ({code}): {detail}", code=4)
-    except _GRAPH_CALL_ERRORS as exc:
-        die(f"{label} failed: {exc}", code=4)
 
 
 def graph_with_retry(
@@ -657,7 +631,7 @@ def main() -> None:  # noqa: C901 — long but linear
     try:
         owner_obj = _graph_request(
             "GET",
-            f"/users/{urllib.parse.quote(args.owner)}",
+            f"/users/{urllib.parse.quote(args.owner, safe='')}",
             token,
         )
     except urllib.error.HTTPError as exc:
@@ -824,15 +798,17 @@ def main() -> None:  # noqa: C901 — long but linear
         statuses["sp"] = "existed"
         info(f"found existing SP — object ID: {sp_obj_id}")
     else:
-        # graph_or_exists() tolerates a create-vs-get race: if a concurrent
-        # run created the SP first, the 'already exists' response is treated
-        # as success and we re-fetch its object ID below.
-        sp, sp_existed = graph_or_exists(
+        # graph_with_retry() tolerates both transient propagation errors (the
+        # appId may not be visible yet) and a create-vs-get race (concurrent
+        # run created the SP first). When swallow_exists fires, we re-fetch
+        # the object ID below.
+        sp, sp_existed = graph_with_retry(
             "POST",
             "/servicePrincipals",
             token,
             {"appId": app_id},
             description="Create service principal",
+            swallow_exists=True,
         )
         if sp is not None and "id" in sp:
             sp_obj_id = sp["id"]
@@ -858,12 +834,13 @@ def main() -> None:  # noqa: C901 — long but linear
     owner_ref = {"@odata.id": f"{GRAPH_BASE}/directoryObjects/{owner_id}"}
 
     step("Ensuring owner on application\u2026")
-    _, app_owner_existed = graph_or_exists(
+    _, app_owner_existed = graph_with_retry(
         "POST",
         f"/applications/{app_obj_id}/owners/$ref",
         token,
         owner_ref,
         description="Add application owner",
+        swallow_exists=True,
     )
     statuses["app_owner"] = "existed" if app_owner_existed else "added"
     if not app_owner_existed:
@@ -871,12 +848,13 @@ def main() -> None:  # noqa: C901 — long but linear
     info(f"app owner: {statuses['app_owner']}")
 
     step("Ensuring owner on service principal\u2026")
-    _, sp_owner_existed = graph_or_exists(
+    _, sp_owner_existed = graph_with_retry(
         "POST",
         f"/servicePrincipals/{sp_obj_id}/owners/$ref",
         token,
         owner_ref,
         description="Add service principal owner",
+        swallow_exists=True,
     )
     statuses["sp_owner"] = "existed" if sp_owner_existed else "added"
     if not sp_owner_existed:
@@ -921,7 +899,9 @@ def main() -> None:  # noqa: C901 — long but linear
     if not grants:
         # swallow_exists tolerates the 'already exists' 400 that Graph returns
         # when a grant was created concurrently (or by an earlier partial run).
-        graph_with_retry(
+        # When the swallow fires, Graph documents replication lag for this list
+        # endpoint, so we retry the lookup until the grant appears.
+        grant_resp, grant_existed = graph_with_retry(
             "POST",
             "/oauth2PermissionGrants",
             token,
@@ -934,11 +914,67 @@ def main() -> None:  # noqa: C901 — long but linear
             description="Grant delegated scopes",
             swallow_exists=True,
         )
-        statuses["delegated_grant"] = "created"
-        any_changed = True
-        # We just created the AllPrincipals grant with the full desired scope
-        # set (or swallow_exists confirmed one already exists).
-        admin_consent_granted = True
+
+        if grant_resp is not None and not grant_existed:
+            # Fresh creation: the response body holds the new grant with full scopes.
+            statuses["delegated_grant"] = "created"
+            any_changed = True
+            admin_consent_granted = True
+        else:
+            # The swallow fired (grant_existed=True): re-list with retry to find
+            # the grant, then reconcile scopes just like the existing-grant branch.
+            info("grant already existed (replication lag or concurrent create) — re-listing with retry…")
+            grant = None
+            for retry_attempt in range(1, 7):
+                refetch_grants = graph_list(
+                    "oauth2PermissionGrants",
+                    (
+                        f"clientId eq '{_odata_str(sp_obj_id)}' "
+                        f"and resourceId eq '{_odata_str(graph_sp_id)}' "
+                        "and consentType eq 'AllPrincipals'"
+                    ),
+                    token,
+                    select="id,scope,consentType",
+                    description=f"Re-list delegated permission grant (attempt {retry_attempt}/6)",
+                )
+                if refetch_grants:
+                    grant = refetch_grants[0]
+                    break
+                if retry_attempt < 6:
+                    wait = 10.0 * retry_attempt
+                    warn(f"grant not yet visible (attempt {retry_attempt}/6), retrying in {wait:.0f}s…")
+                    time.sleep(wait)
+
+            if grant is None:
+                die(
+                    "Grant POST returned 'already exists' but the grant never "
+                    "appeared after 6 retries (replication timeout).",
+                    code=4,
+                )
+
+            # Reconcile scopes (same logic as the existing-grant branch below).
+            existing_scopes = set((grant.get("scope") or "").split())
+            desired_scopes = set(DELEGATED_SCOPES.keys())
+            missing = desired_scopes - existing_scopes
+
+            if not missing:
+                statuses["delegated_grant"] = "existed"
+                admin_consent_granted = True
+            else:
+                merged_scopes = " ".join(sorted(existing_scopes | desired_scopes))
+                graph(
+                    "PATCH",
+                    f"/oauth2PermissionGrants/{grant['id']}",
+                    token,
+                    {"scope": merged_scopes},
+                    description="Add missing delegated scopes",
+                )
+                statuses["delegated_grant"] = "updated"
+                any_changed = True
+                # Admin consent is granted only if the PATCH succeeded and all
+                # desired scopes are now present. The PATCH dies on failure
+                # (graph() has no swallow), so reaching here means success.
+                admin_consent_granted = True
     else:
         grant = grants[0]
         if len(grants) > 1:
@@ -951,7 +987,8 @@ def main() -> None:  # noqa: C901 — long but linear
 
         if not missing:
             statuses["delegated_grant"] = "unchanged"
-            final_scopes = existing_scopes
+            # All desired scopes already present; admin consent is granted.
+            admin_consent_granted = True
         else:
             merged_scopes = " ".join(sorted(existing_scopes | desired_scopes))
             graph(
@@ -963,11 +1000,9 @@ def main() -> None:  # noqa: C901 — long but linear
             )
             statuses["delegated_grant"] = "updated"
             any_changed = True
-            final_scopes = existing_scopes | desired_scopes
-
-        # This grant is AllPrincipals (filtered in the lookup); admin consent
-        # is granted iff every desired scope is present in its reconciled set.
-        admin_consent_granted = desired_scopes.issubset(final_scopes)
+            # The PATCH succeeded (graph() dies on failure), so all desired
+            # scopes are now present and admin consent is granted.
+            admin_consent_granted = True
 
     info(f"delegated grant: {statuses['delegated_grant']}")
 
