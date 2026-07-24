@@ -36,9 +36,7 @@ jobs:
           pixi-version: v0.71.3
           cache: false
           frozen: true
-
-      - name: Install dev environment
-        run: pixi install -e dev
+          environments: dev
 
       - name: Determine changed-file ref range
         id: refs
@@ -52,13 +50,56 @@ jobs:
             echo "from_ref=origin/${BASE_REF}" >> "$GITHUB_OUTPUT"
             echo "to_ref=${SHA}"               >> "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "push" ]]; then
-            echo "from_ref=${BEFORE}"          >> "$GITHUB_OUTPUT"
-            echo "to_ref=${SHA}"               >> "$GITHUB_OUTPUT"
+            # On branch creation, $BEFORE is 40 zeros; after force-push, the old SHA
+            # may be unfetchable. Both break pre-commit --from-ref, so fall back to --all-files.
+            if [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE" 2>/dev/null; then
+              echo "from_ref=" >> "$GITHUB_OUTPUT"
+              echo "to_ref="   >> "$GITHUB_OUTPUT"
+            else
+              echo "from_ref=${BEFORE}" >> "$GITHUB_OUTPUT"
+              echo "to_ref=${SHA}"      >> "$GITHUB_OUTPUT"
+            fi
           else
             # workflow_dispatch: lint everything
             echo "from_ref=" >> "$GITHUB_OUTPUT"
             echo "to_ref="   >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Collect tool versions
+        id: versions
+        run: |
+          # Extract versions from pixi dev environment
+          RUFF_VER=$(pixi list -e dev --json | jq -r '.[] | select(.name=="ruff") | .version')
+          MYPY_VER=$(pixi list -e dev --json | jq -r '.[] | select(.name=="mypy") | .version')
+          CODESPELL_VER=$(pixi list -e dev --json | jq -r '.[] | select(.name=="codespell") | .version')
+          YAMLLINT_VER=$(pixi list -e dev --json | jq -r '.[] | select(.name=="yamllint") | .version')
+          ZIZMOR_VER=$(pixi list -e dev --json | jq -r '.[] | select(.name=="zizmor") | .version')
+
+          # Extract versions from .pre-commit-config.yaml rev: tags
+          # (strip wrapper-specific build suffixes where applicable)
+          PRECOMMIT_HOOKS_VER=$(grep -A1 'repo: https://github.com/pre-commit/pre-commit-hooks' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}')
+          MARKDOWNLINT_VER=$(grep -A1 'repo: https://github.com/igorshubovych/markdownlint-cli' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}')
+          ACTIONLINT_VER=$(grep -A1 'repo: https://github.com/rhysd/actionlint' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}')
+          # shfmt: pre-commit-shfmt adds -N build numbers (v3.12.0-2 -> v3.12.0)
+          SHFMT_VER=$(grep -A1 'repo: https://github.com/scop/pre-commit-shfmt' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}' | sed 's/-[0-9]\+$//')
+          # shellcheck-py: Python wrapper adds .N to upstream shellcheck version (v0.11.0.1 -> v0.11.0)
+          SHELLCHECK_VER=$(grep -A1 'repo: https://github.com/shellcheck-py/shellcheck-py' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}' | sed 's/\.[0-9]\+$//')
+          GITLEAKS_VER=$(grep -A1 'repo: https://github.com/gitleaks/gitleaks' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}')
+
+          # Write to GITHUB_OUTPUT
+          {
+            echo "ruff=$RUFF_VER"
+            echo "mypy=$MYPY_VER"
+            echo "codespell=$CODESPELL_VER"
+            echo "yamllint=$YAMLLINT_VER"
+            echo "zizmor=$ZIZMOR_VER"
+            echo "precommit_hooks=$PRECOMMIT_HOOKS_VER"
+            echo "markdownlint=$MARKDOWNLINT_VER"
+            echo "actionlint=$ACTIONLINT_VER"
+            echo "shfmt=$SHFMT_VER"
+            echo "shellcheck=$SHELLCHECK_VER"
+            echo "gitleaks=$GITLEAKS_VER"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run pre-commit (changed files)
         id: pre_commit
@@ -88,6 +129,17 @@ jobs:
           PRE_COMMIT_OUTCOME: ${{ steps.pre_commit.outcome }}
           FROM_REF: ${{ steps.refs.outputs.from_ref }}
           TO_REF: ${{ steps.refs.outputs.to_ref }}
+          RUFF_VER: ${{ steps.versions.outputs.ruff }}
+          MYPY_VER: ${{ steps.versions.outputs.mypy }}
+          CODESPELL_VER: ${{ steps.versions.outputs.codespell }}
+          YAMLLINT_VER: ${{ steps.versions.outputs.yamllint }}
+          ZIZMOR_VER: ${{ steps.versions.outputs.zizmor }}
+          PRECOMMIT_HOOKS_VER: ${{ steps.versions.outputs.precommit_hooks }}
+          MARKDOWNLINT_VER: ${{ steps.versions.outputs.markdownlint }}
+          ACTIONLINT_VER: ${{ steps.versions.outputs.actionlint }}
+          SHFMT_VER: ${{ steps.versions.outputs.shfmt }}
+          SHELLCHECK_VER: ${{ steps.versions.outputs.shellcheck }}
+          GITLEAKS_VER: ${{ steps.versions.outputs.gitleaks }}
         run: |
           if [[ "$PRE_COMMIT_OUTCOME" == "success" ]]; then
             BADGE="All linting hooks passed"
@@ -112,17 +164,17 @@ jobs:
             echo ""
             echo "| Hook | Tool | Version |"
             echo "| ---- | ---- | ------- |"
-            echo "| trailing-whitespace / end-of-file-fixer / check-* | pre-commit-hooks | v5.0.0 |"
-            echo "| ruff check + ruff format | ruff | 0.15.8 |"
-            echo "| mypy | mypy | 2.1.0 |"
-            echo "| codespell | codespell | 2.4.2 |"
-            echo "| markdownlint | markdownlint-cli | v0.48.0 |"
-            echo "| yamllint | yamllint | 1.38.0 |"
-            echo "| actionlint | actionlint | v1.7.12 |"
-            echo "| zizmor | zizmor | 1.23.1 |"
-            echo "| shfmt | shfmt | v3.12.0 |"
-            echo "| shellcheck | shellcheck | v0.11.0 |"
-            echo "| gitleaks | gitleaks | v8.30.1 |"
+            echo "| trailing-whitespace / end-of-file-fixer / check-* | pre-commit-hooks | ${PRECOMMIT_HOOKS_VER} |"
+            echo "| ruff check + ruff format | ruff | ${RUFF_VER} |"
+            echo "| mypy | mypy | ${MYPY_VER} |"
+            echo "| codespell | codespell | ${CODESPELL_VER} |"
+            echo "| markdownlint | markdownlint-cli | ${MARKDOWNLINT_VER} |"
+            echo "| yamllint | yamllint | ${YAMLLINT_VER} |"
+            echo "| actionlint | actionlint | ${ACTIONLINT_VER} |"
+            echo "| zizmor | zizmor | ${ZIZMOR_VER} |"
+            echo "| shfmt | shfmt | ${SHFMT_VER} |"
+            echo "| shellcheck | shellcheck | ${SHELLCHECK_VER} |"
+            echo "| gitleaks | gitleaks | ${GITLEAKS_VER} |"
             echo ""
             if [[ -s /tmp/pre-commit-output.txt ]]; then
               echo "### Output"
