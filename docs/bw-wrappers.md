@@ -50,6 +50,31 @@ personal accounts).
 | --- | --- |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
+## `bwomp`
+
+Launches Oh My Pi (`omp`) inside a bubblewrap sandbox.
+
+```text
+bwomp [bwomp-options] [omp arguments...]
+```
+
+Persists OMP config, prompt history, model cache DB, sessions,
+terminal-sessions, top-level runtime/cache directories, worktrees, and
+project `.omp/` state. `agent.db` contains auth tables and is therefore
+auth-sensitive: it is copied into tmpfs by default so existing credentials
+can be used for the session without persisting updates. Use `--init-auth`
+only on personal accounts to bind-mount `agent.db` read-write and persist
+OMP auth changes across sessions.
+
+Profiles follow OMP's normal layout: `--profile NAME` or `OMP_PROFILE=NAME`
+uses `~/.omp/profiles/NAME/agent`. `PI_CODING_AGENT_DIR` is honored when no
+profile is selected. Extra OMP workspaces are not auto-mounted; use wrapper
+`--ro-path` or `--rw-path` so the same blocked-path checks apply.
+
+| Option | Description |
+| --- | --- |
+| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+
 ## `bwclaude`
 
 Launches the [Claude CLI](https://docs.claude.com/en/docs/claude-code/overview) inside a bubblewrap sandbox.
