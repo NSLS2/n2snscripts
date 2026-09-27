@@ -300,7 +300,7 @@ check_codex_config() {
 # Resolve the fixed administrator-managed alias before binding it at the
 # location Codex discovers.  This is deliberately not a --ro-path mount.
 build_managed_skills() {
-    [[ -e /etc/codex/skills ]] || return 0
+    [[ -d /etc/codex/skills && -r /etc/codex/skills ]] || return 0
     BWRAP_ARGS+=(--dir /etc/codex)
     build_managed_ro_bind /etc/codex/skills /etc/codex/skills
 }
