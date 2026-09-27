@@ -260,7 +260,7 @@ resolve_config_symlinks() {
     done
 }
 
-# ── Managed opencode config (read-only, highest priority) ────────
+# ── Managed OpenCode config and skills (read-only, highest priority) ─
 # If a managed config exists at /etc/opencode/ on the host (deployed
 # by ansible), bind-mount it RO into the sandbox.  This is the Linux
 # managed-settings path and takes precedence over all other config
@@ -291,6 +291,15 @@ build_managed_config() {
         printf 'bwopencode: warning: no /etc/opencode/opencode.json{,c} found on host.\n' >&2
         printf '            Falling back to user config at ~/.config/opencode/.\n' >&2
     fi
+}
+
+# The host-managed skills alias may point into /opt/nsls2/skills.  Bind
+# its resolved source at OpenCode's documented managed-skills location so the
+# alias target and every supporting file remain available inside the sandbox.
+build_managed_skills() {
+    [[ -d /etc/opencode/skills && -r /etc/opencode/skills ]] || return 0
+    BWRAP_ARGS+=(--dir /etc/opencode)
+    build_managed_ro_bind /etc/opencode/skills /etc/opencode/skills
 }
 
 # ── Persistent .opencode/ directory ──────────────────────────────
@@ -439,6 +448,7 @@ main() {
     build_sys_mounts
     build_etc_mounts
     build_managed_config
+    build_managed_skills
     build_home_tmpfs
     build_workdir_mount
     build_persistent_dotdir

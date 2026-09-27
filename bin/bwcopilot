@@ -330,6 +330,30 @@ build_copilot_home_mount() {
     fi
 }
 
+# Mount an existing host settings file read-only after all user-supplied
+# mounts.  Resolve the source for validation and reading, but retain the
+# logical destination because Copilot always discovers settings there; this
+# also makes a dotfiles symlink available at COPILOT_HOME/settings.json.
+build_copilot_settings_mount() {
+    local _settings_file="${COPILOT_HOME_DIR}/settings.json"
+    local _settings_source
+
+    # -f follows valid symlinks while rejecting dangling links and directories.
+    [[ -f "${_settings_file}" ]] || return 0
+    _settings_source="$(readlink -f "${_settings_file}")" || return 0
+    [[ -f "${_settings_source}" ]] || return 0
+
+    # The source may be outside COPILOT_HOME through a user-controlled
+    # symlink, so check the resolved file rather than using the managed-path
+    # helper intended only for fixed administrator-provided locations.
+    _check_path_safe "${_settings_source}" "COPILOT settings.json (resolved)"
+
+    # COPILOT_HOME_DIR already exists as the tmpfs mount point, so no --dir is
+    # needed for this file bind.  This also works when source and destination
+    # are the same path.
+    BWRAP_ARGS+=(--ro-bind "${_settings_source}" "${_settings_file}")
+}
+
 # ── Copilot cache (read-write) ──────────────────────────────────
 build_copilot_cache_mount() {
     BWRAP_ARGS+=(--bind "${COPILOT_CACHE_DIR}" "${COPILOT_CACHE_DIR}")
@@ -436,6 +460,15 @@ main() {
     build_nsls2_mount
     build_dynamic_tool_mounts
     build_extra_path_mounts
+    # Add settings after extra mounts so a user-supplied rw bind cannot shadow
+    # the read-only logical settings path.
+    build_copilot_settings_mount
+    # Deployment-managed skills are optional and never replace user-created
+    # skills under COPILOT_HOME.  Bind the deployment alias read-only after
+    # user extra mounts so this narrow final mount cannot be shadowed writable.
+    if [[ -d /opt/nsls2/skills/skills && -r /opt/nsls2/skills/skills ]]; then
+        build_managed_ro_bind /opt/nsls2/skills/skills /opt/nsls2/skills/skills
+    fi
 
     # Environment variables
     build_env_vars

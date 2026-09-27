@@ -339,6 +339,27 @@ build_claude_cache_mount() {
     BWRAP_ARGS+=(--bind "${CLAUDE_CACHE_DIR}" "${CLAUDE_CACHE_DIR}")
 }
 
+# ── Managed Claude skills and settings (read-only) ────────────────
+# Claude's Linux managed-settings discovery uses /etc/claude-code.  Expose
+# only its managed settings file and managed skills alias, never all of /etc
+# or /etc/claude-code.  The alias is resolved before binding so its deployed
+# target remains reachable in the sandbox.
+build_managed_claude_paths() {
+    if [[ -e /etc/claude-code/managed-settings.json ]]; then
+        BWRAP_ARGS+=(--dir /etc/claude-code)
+        build_managed_ro_bind \
+            /etc/claude-code/managed-settings.json \
+            /etc/claude-code/managed-settings.json
+    fi
+
+    if [[ -d /etc/claude-code/.claude/skills && -r /etc/claude-code/.claude/skills ]]; then
+        BWRAP_ARGS+=(--dir /etc/claude-code --dir /etc/claude-code/.claude)
+        build_managed_ro_bind \
+            /etc/claude-code/.claude/skills \
+            /etc/claude-code/.claude/skills
+    fi
+}
+
 # ── Claude env vars ──────────────────────────────────────────────
 build_claude_env() {
     # NOTE: bwclaude is hard-wired for the NSLS-II AIFAPIM/foundry gateway.
@@ -474,6 +495,7 @@ main() {
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
+    build_managed_claude_paths
     build_home_tmpfs
     build_workdir_mount
     build_claude_home_mount

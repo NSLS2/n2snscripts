@@ -19,6 +19,31 @@ option list; the tables below summarise the common surface.
   - 0.5.0+ enables `--clearenv`
   - 0.6.3+ enables bind-over-ro-bind binary masking
 
+## Managed system paths
+
+When present, the wrappers expose administrator-managed paths as optional,
+read-only mounts. They do not expose the rest of the corresponding `/etc`
+configuration directories.
+
+- OpenCode: `/etc/opencode/skills`
+- Codex: `/etc/codex/skills`
+- Claude: `/etc/claude-code/.claude/skills` and
+  `/etc/claude-code/managed-settings.json`
+- Copilot: its deployment-defined shared-skill directory, when configured by
+  the wrapper
+
+## Shared agent skills
+
+Shared agent skills are a deployment-managed skill collection. The deployment
+defines the source repository or checkout and manages read-only aliases at the
+paths above. When those aliases are present, `bwopencode`, `bwcodex`, and
+`bwclaude` mount them read-only into their sandboxes. A wrapper configured for
+Copilot likewise mounts its deployment-defined shared-skill directory
+read-only.
+
+Contribute or update skills through the deployment's documented contribution
+workflow; do not edit its deployed checkout or managed aliases directly.
+
 ## Common options
 
 Every `bw*` wrapper accepts these options:
@@ -30,6 +55,8 @@ Every `bw*` wrapper accepts these options:
 | `--exec CMD` | Run `CMD` inside the sandbox instead of the tool |
 | `--init-auth` | Persist auth credentials to the host (first-time setup) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
+| `--ro-path PATH` | Read-only mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
+| `--rw-path PATH` | Read-write mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 
 Tool-specific options are listed in each wrapper's section below.
 
@@ -102,6 +129,22 @@ Additional options:
 
 On shared accounts, auth tokens are ephemeral. On a personal machine,
 run `bwcopilot --init-auth` once to persist tokens.
+
+### Shared skills
+
+When configured by the wrapper, `bwcopilot` automatically exposes the
+deployment-managed shared-skill directory read-only. Configure Copilot CLI's
+documented `skillDirectories` in `$COPILOT_HOME/settings.json` (default:
+`~/.copilot/settings.json`) to name that same directory.
+
+When `$COPILOT_HOME/settings.json` exists as a regular file, `bwcopilot`
+automatically mounts it read-only. This also supports a valid symlink: the
+wrapper resolves its source and mounts that source at the logical
+`$COPILOT_HOME/settings.json` destination. Dangling symlinks and directories
+are skipped.
+
+The read-only mount prevents Copilot's `/settings` slash command from
+persisting changes in the sandbox. Edit settings on the host between sessions.
 
 ## `bwcodex`
 

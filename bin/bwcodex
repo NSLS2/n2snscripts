@@ -306,6 +306,15 @@ check_codex_config() {
     fi
 }
 
+# ── Managed Codex skills (read-only) ──────────────────────────────
+# Resolve the fixed administrator-managed alias before binding it at the
+# location Codex discovers.  This is deliberately not a --ro-path mount.
+build_managed_skills() {
+    [[ -d /etc/codex/skills && -r /etc/codex/skills ]] || return 0
+    BWRAP_ARGS+=(--dir /etc/codex)
+    build_managed_ro_bind /etc/codex/skills /etc/codex/skills
+}
+
 # ── Codex home (ephemeral tmpfs + selective persistence) ─────────
 # Mount the home dir as ephemeral tmpfs, then selectively bind-mount
 # the files and directories that must persist across sessions.
@@ -487,6 +496,7 @@ main() {
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
+    build_managed_skills
     build_home_tmpfs
     build_workdir_mount
     build_codex_home_mount

@@ -926,6 +926,20 @@ build_etc_mounts() {
     )
 }
 
+# ── Managed system paths (read-only) ──────────────────────────────
+# Bind a fixed, administrator-provided path only when it exists.  Resolve
+# aliases before binding: the source can be an /etc symlink into the managed
+# skills deployment, while the destination must remain the location the CLI
+# discovers.  Callers provide literal paths; do not use this for user input.
+build_managed_ro_bind() {
+    local source="$1" target="$2" resolved
+    [[ -e "${source}" ]] || return 0
+
+    resolved="$(readlink -f "${source}")"
+    [[ -e "${resolved}" ]] || return 0
+    BWRAP_ARGS+=(--ro-bind "${resolved}" "${target}")
+}
+
 # ── Home directory (empty tmpfs, then selective mounts) ──────────
 build_home_tmpfs() {
     BWRAP_ARGS+=(
