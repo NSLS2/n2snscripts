@@ -439,7 +439,9 @@ main() {
     # Deployment-managed skills are optional and never replace user-created
     # skills under COPILOT_HOME.  Bind the deployment alias read-only after
     # user extra mounts so this narrow final mount cannot be shadowed writable.
-    build_managed_ro_bind /opt/nsls2/skills/skills /opt/nsls2/skills/skills
+    if [[ -d /opt/nsls2/skills/skills && -r /opt/nsls2/skills/skills ]]; then
+        build_managed_ro_bind /opt/nsls2/skills/skills /opt/nsls2/skills/skills
+    fi
 
     # Environment variables
     build_env_vars

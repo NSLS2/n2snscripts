@@ -342,7 +342,7 @@ build_managed_claude_paths() {
             /etc/claude-code/managed-settings.json
     fi
 
-    if [[ -e /etc/claude-code/.claude/skills ]]; then
+    if [[ -d /etc/claude-code/.claude/skills && -r /etc/claude-code/.claude/skills ]]; then
         BWRAP_ARGS+=(--dir /etc/claude-code --dir /etc/claude-code/.claude)
         build_managed_ro_bind \
             /etc/claude-code/.claude/skills \
