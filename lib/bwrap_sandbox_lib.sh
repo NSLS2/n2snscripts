@@ -161,6 +161,71 @@ detect_shell() {
     SANDBOX_SHELL="$(command -v bash 2> /dev/null || echo /bin/sh)"
 }
 
+# bwrap_find_tool TOOL
+#   Locate TOOL using PATH with exact, non-empty entries from
+#   N2SNSCRIPTS_TOOL_EXCLUDE_PATH removed.  This affects lookup only.
+bwrap_find_tool() {
+    if [[ -z "${N2SNSCRIPTS_TOOL_EXCLUDE_PATH:-}" ]]; then
+        command -v -- "$1"
+        return
+    fi
+
+    local _excluded_dir _path_dir _remaining_path="${PATH-}" _remaining_exclusions
+    local _filtered_path _has_separator _has_exclusion_separator _is_excluded _retained_count=0
+    local -a _excluded_dirs=() _filtered_dirs=()
+    local IFS=:
+
+    # Split manually rather than with read: read stops at the first newline,
+    # while exclusion entries may themselves contain newlines.
+    _remaining_exclusions="${N2SNSCRIPTS_TOOL_EXCLUDE_PATH}"
+    while :; do
+        if [[ "${_remaining_exclusions}" == *:* ]]; then
+            _has_exclusion_separator=1
+            _excluded_dir="${_remaining_exclusions%%:*}"
+            _remaining_exclusions="${_remaining_exclusions#*:}"
+        else
+            _has_exclusion_separator=0
+            _excluded_dir="${_remaining_exclusions}"
+        fi
+        [[ -n "${_excluded_dir}" ]] && _excluded_dirs+=("${_excluded_dir}")
+        [[ "${_has_exclusion_separator}" -eq 1 ]] || break
+    done
+
+    while :; do
+        if [[ "${_remaining_path}" == *:* ]]; then
+            _has_separator=1
+            _path_dir="${_remaining_path%%:*}"
+            _remaining_path="${_remaining_path#*:}"
+        else
+            _has_separator=0
+            _path_dir="${_remaining_path}"
+        fi
+
+        _is_excluded=0
+        for _excluded_dir in "${_excluded_dirs[@]}"; do
+            if [[ -n "${_excluded_dir}" && "${_path_dir}" == "${_excluded_dir}" ]]; then
+                _is_excluded=1
+                break
+            fi
+        done
+        if [[ "${_is_excluded}" -eq 0 ]]; then
+            _filtered_dirs+=("${_path_dir}")
+            ((_retained_count += 1))
+        fi
+
+        [[ "${_has_separator}" -eq 1 ]] || break
+    done
+
+    # An empty retained entry is meaningful (it searches the current
+    # directory), but an entirely filtered PATH must not become PATH="".
+    # command -v with that value would incorrectly search the current dir.
+    [[ "${_retained_count}" -gt 0 ]] || return 1
+
+    _filtered_path="${_filtered_dirs[*]}"
+    local PATH="${_filtered_path}"
+    command -v -- "$1"
+}
+
 # ── Dynamic mount helpers ────────────────────────────────────────
 # _MOUNTED_PREFIXES: tracks directory trees already covered by a bwrap
 # bind so we never emit duplicate (or redundant sub-path) mounts.
