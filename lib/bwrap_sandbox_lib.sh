@@ -180,6 +180,62 @@ _get_npm_prefix() {
     printf '%s' "${_NPM_PREFIX}"
 }
 
+# resolve_real_tool_binary TOOL_NAME
+#   Return the path to the real (non-wrapper) binary for TOOL_NAME.
+#
+#   Problem: on managed hosts the dotfiles wrapper (e.g. ~/.local/bin/opencode)
+#   precedes /usr/local/bin on PATH.  `command -v opencode` therefore resolves
+#   to the wrapper, not the npm-installed binary.  resolve_and_mount_tool then
+#   adds the wrapper's directory to SANDBOX_PATH and bind-mounts it into the
+#   --clearenv sandbox.  Inside the sandbox the wrapper is visible on PATH, but
+#   the env vars it needs (N2SNSCRIPTS_LIB, AZURE_*) are stripped, so it fails
+#   with "cannot locate gpg-passwd.sh" — the double-invocation bug.
+#
+#   Fix: if `command -v TOOL_NAME` resolves to a dotfiles wrapper symlink
+#   (detected by checking whether `readlink -f candidate` contains
+#   "/config/scripts/"), skip it and return the npm-installed binary from
+#   <npm_prefix>/bin/TOOL_NAME instead.  If the npm binary is also absent,
+#   that means the real tool is not installed — exit with an error rather
+#   than silently returning the wrapper (which would recreate the bug).
+#
+#   If the candidate is NOT a dotfiles wrapper (system package, already the
+#   correct npm binary, etc.) it is returned as-is so non-npm tools are
+#   unaffected.
+#
+#   Outputs the resolved path on stdout.  Callers assign with $(...).
+resolve_real_tool_binary() {
+    local tool_name="$1"
+    local candidate real_candidate npm_prefix npm_bin
+
+    candidate="$(command -v "${tool_name}" 2> /dev/null || true)"
+    if [[ -z "${candidate}" ]]; then
+        # Tool not on PATH at all — callers handle the empty-string case.
+        printf '%s' "${candidate}"
+        return 0
+    fi
+
+    # Detect dotfiles wrapper: the symlink target contains /config/scripts/
+    # (the dotfiles convention for per-tool wrapper scripts).
+    real_candidate="$(readlink -f "${candidate}" 2> /dev/null || printf '%s' "${candidate}")"
+    if [[ "${real_candidate}" == */config/scripts/* ]]; then
+        # candidate is a dotfiles wrapper — resolve to the real npm binary.
+        npm_prefix="$(_get_npm_prefix)"
+        npm_bin="${npm_prefix:+${npm_prefix}/bin/${tool_name}}"
+        if [[ -n "${npm_bin}" && -x "${npm_bin}" ]]; then
+            printf '%s' "${npm_bin}"
+            return 0
+        fi
+        # The real binary is not installed.  Returning the wrapper would
+        # recreate the double-invocation bug; error out instead.
+        printf 'resolve_real_tool_binary: %s resolves to a dotfiles wrapper but %s is not installed or not executable.\n' \
+            "${candidate}" "${tool_name}" >&2
+        return 1
+    fi
+
+    # Not a dotfiles wrapper — return the candidate unchanged.
+    printf '%s' "${candidate}"
+}
+
 # _emit_home_intermediate_dirs DIR [MODE]
 #   Emit `--dir` BWRAP_ARGS for the ancestor components of DIR that live
 #   under $HOME, so the eventual bind mount point exists inside the tmpfs
