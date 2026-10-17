@@ -1398,13 +1398,39 @@ print_dry_run() {
 # Override on the host side if needed:  BWRAP_TTY_DRAIN_SECS=0.5 bwopencode
 : "${BWRAP_TTY_DRAIN_SECS:=0.3}"
 
+# Hard upper bound on the drain, expressed as a number of read windows of
+# BWRAP_TTY_DRAIN_SECS each (default 10 x 0.3 s = 3 s wall-clock), so that
+# a terminal which never goes quiet cannot hold the wrapper hostage.
+: "${BWRAP_TTY_DRAIN_MAX_WINDOWS:=10}"
+
+# _tty_is_foreground
+#   True iff this shell's process group is the foreground process group of
+#   its controlling terminal.  A tty on stdin/stdout is not sufficient: a
+#   backgrounded invocation (e.g. "bwopencode --exec true &") still has the
+#   tty open but would be stopped by SIGTTOU/SIGTTIN the moment it touched
+#   it.  Reads /proc/<pid>/stat (pgrp is field 5, tpgid is field 8, counted
+#   after the parenthesised comm) and falls back to ps(1).
+_tty_is_foreground() {
+    local _stat _f
+    if [[ -r "/proc/$$/stat" ]]; then
+        _stat="$(< "/proc/$$/stat")"
+        read -r -a _f <<< "${_stat##*) }"
+        # _f[0]=state _f[1]=ppid _f[2]=pgrp _f[3]=session _f[4]=tty_nr _f[5]=tpgid
+        [[ -n "${_f[5]:-}" && "${_f[2]}" == "${_f[5]}" ]]
+        return
+    fi
+    read -r -a _f <<< "$(ps -o pgid=,tpgid= -p "$$" 2> /dev/null || true)"
+    [[ -n "${_f[1]:-}" && "${_f[0]}" == "${_f[1]}" ]]
+}
+
 # _restore_terminal
 #   Reset terminal input modes a TUI may have left in flight and discard
 #   any input that arrives within BWRAP_TTY_DRAIN_SECS.  No-op unless
-#   both stdin and stdout are a terminal.  Never fails (callers run
-#   under set -e).
+#   both stdin and stdout are a terminal AND we own its foreground.  Never
+#   fails (callers run under set -e).
 _restore_terminal() {
     [[ -t 0 && -t 1 ]] || return 0
+    _tty_is_foreground || return 0
 
     # Belt and braces: mouse tracking (1000/1002/1003) and SGR encoding
     # (1006) off, focus-event reporting (1004) off, bracketed paste
@@ -1424,13 +1450,20 @@ _restore_terminal() {
     fi
 
     # Suppress echo while draining so the stray bytes never reach the
-    # screen, then read-and-discard until the line has been quiet for
-    # BWRAP_TTY_DRAIN_SECS.  The iteration cap bounds the worst case
-    # (e.g. a terminal that keeps streaming mouse reports) to a few
-    # seconds rather than hanging the wrapper.
+    # screen, then read-and-discard in windows of BWRAP_TTY_DRAIN_SECS.
+    # Each read returns either when 4096 chars have arrived or when the
+    # window expires (bash keeps the partial input in _buf on timeout), so
+    # one iteration never takes longer than one window.  We stop at the
+    # first window that delivered nothing — the line has been quiet long
+    # enough — or after BWRAP_TTY_DRAIN_MAX_WINDOWS windows, whichever
+    # comes first.  Total wall-clock is therefore bounded by
+    # MAX_WINDOWS x DRAIN_SECS no matter how the bytes trickle in.
     stty -echo 2> /dev/null || true
-    local _n=0
-    while [[ ${_n} -lt 4096 ]] && IFS= read -r -s -t "${BWRAP_TTY_DRAIN_SECS}" -n 1 _; do
+    local _buf _n=0
+    while [[ ${_n} -lt ${BWRAP_TTY_DRAIN_MAX_WINDOWS} ]]; do
+        _buf=""
+        IFS= read -r -s -t "${BWRAP_TTY_DRAIN_SECS}" -N 4096 _buf || true
+        [[ -n "${_buf}" ]] || break
         _n=$((_n + 1))
     done
 
@@ -1451,17 +1484,32 @@ _restore_terminal() {
 #
 # bwrap is run as a foreground child rather than exec'd so that
 # _restore_terminal can run after the tool exits (see above).  The tool's
-# exit status is propagated unchanged.  SIGINT is trapped to a no-op
-# while waiting so that a Ctrl-C that terminates the child does not also
-# terminate the wrapper before the terminal has been restored; children
-# still receive SIGINT normally (trapped, not ignored, signals are reset
-# to their default disposition on exec).
+# exit status is propagated unchanged.
+#
+# Signal handling while the wrapper is resident:
+#   - SIGINT is trapped to a no-op from before the child starts until
+#     after _restore_terminal returns, so a Ctrl-C that terminates the
+#     child (or lands during the drain window) does not also terminate
+#     the wrapper with echo disabled.  Children still receive SIGINT
+#     normally: trapped (not ignored) signals are reset to their default
+#     disposition on exec.
+#   - SIGTERM is reset to its default before the child starts.  bash
+#     defers trap execution while waiting on a foreground command, so a
+#     wrapper-level TERM trap (bwcodex installs one for staged-config
+#     cleanup) would otherwise swallow a SIGTERM to the wrapper for the
+#     whole session and --die-with-parent would never fire.  With the
+#     default disposition the wrapper dies, bwrap's parent-death signal
+#     tears down the sandbox, and the wrapper's EXIT trap (if any) still
+#     runs on every normal exit — which, under the old exec, it never did.
+#   - SIGTERM is trapped to a no-op only for the brief _restore_terminal
+#     window, for the same reason as SIGINT.
 launch_sandbox() {
     local _BWRAP_BIN _ENV_BIN _rc=0
     _BWRAP_BIN="$(command -v bwrap)"
     _ENV_BIN="$(resolve_env_bin)"
 
     trap ':' INT
+    trap - TERM
     "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
         USER="${USER}" \
@@ -1471,8 +1519,9 @@ launch_sandbox() {
         LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
         "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"} ||
            _rc=$?
-    trap - INT
 
+    trap ':' TERM
     _restore_terminal
+    trap - INT TERM
     exit "${_rc}"
 }

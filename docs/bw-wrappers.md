@@ -67,8 +67,12 @@ the session. When the tool exits, the wrapper resets terminal modes a TUI
 may have left in flight (mouse tracking, focus events, bracketed paste,
 kitty keyboard flags, cursor visibility) and silently discards any input
 that arrives within `BWRAP_TTY_DRAIN_SECS` seconds (default `0.3`) before
-returning control to the shell. The tool's exit status is propagated
-unchanged.
+returning control to the shell. The drain is capped at
+`BWRAP_TTY_DRAIN_MAX_WINDOWS` windows (default `10`, i.e. 3 s wall-clock)
+so a terminal that never goes quiet cannot stall the wrapper. Cleanup is
+skipped entirely when the wrapper is not the terminal's foreground process
+group (for example when backgrounded with `&`). The tool's exit status is
+propagated unchanged.
 
 This prevents stray mouse reports such as `^[[<35;110;10M` from landing on
 the shell prompt. GTK4 terminals (Ptyxis, GNOME Terminal, Black Box) emit
