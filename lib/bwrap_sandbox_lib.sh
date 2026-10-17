@@ -12,7 +12,8 @@
 #     working directory, git config, pixi, ccache, npm, user bin, NSLS-II,
 #     dynamic tool mounts, user-supplied extra paths (--ro-path / --rw-path)
 #   - Environment variable framework (clean env + passthrough)
-#   - Launch logic (dry-run printing and bwrap exec)
+#   - Launch logic (dry-run printing, running bwrap as a foreground child,
+#     and post-exit terminal restoration / input drain)
 #
 # Tool-specific wrapper scripts source this file and provide:
 #   - Argument parsing (parse_wrapper_args) — must handle --ro-path/--rw-path
@@ -1332,8 +1333,10 @@ print_dry_run() {
     _ENV_BIN="$(resolve_env_bin)"
 
     # Mirror the exact invocation used by launch_sandbox:
-    #   exec <env_bin> -i <vars> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
-    printf "exec %s -i \\\\\n" "${_ENV_BIN}"
+    #   <env_bin> -i <vars> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
+    # (launch_sandbox runs this as a foreground child, not via exec, so
+    # that the terminal can be restored afterwards — see _restore_terminal.)
+    printf "%s -i \\\\\n" "${_ENV_BIN}"
     printf "  HOME=%q \\\\\n"    "${_HOME}"
     printf "  USER=%q \\\\\n"    "${USER}"
     printf "  LOGNAME=%q \\\\\n" "${USER}"
@@ -1366,23 +1369,110 @@ print_dry_run() {
     exit 0
 }
 
+# ═══════════════════════════════════════════════════════════════════
+# Terminal restoration after the sandboxed tool exits
+# ═══════════════════════════════════════════════════════════════════
+#
+# TUI tools (opencode, claude, codex, copilot) switch the terminal into
+# the alternate screen and enable mouse-motion reporting (DECSET 1003).
+# On exit they undo both, but the two sequences are ordered "leave alt
+# screen" then "mouse off".  GTK4 terminals (Ptyxis, GNOME Terminal,
+# Black Box, ...) synthesise a pointer-motion event whenever the window
+# layout changes — leaving the alt screen is such a change — and VTE
+# turns that synthetic event into an SGR mouse report (e.g.
+# "ESC[<35;110;10M") because mouse-off has not been processed yet.  Over
+# SSH that report arrives after the tool has already exited and is read
+# by the login shell instead, leaving garbage such as "51;97;30M" on the
+# prompt line.
+#
+# When launch_sandbox exec'd bwrap directly there was nothing left to
+# absorb that stray input.  The wrapper therefore now stays resident as
+# the parent of bwrap and, once the tool exits, resets the relevant
+# terminal modes and drains any pending input before returning to the
+# shell.  Side effects: one extra bash process per session, and
+# --die-with-parent is anchored to the wrapper rather than the login
+# shell (equivalent, since the wrapper lives exactly as long as bwrap).
+
+# Seconds of input silence required before the drain loop gives up.
+# Must comfortably exceed the terminal round-trip time (SSH hops).
+# Override on the host side if needed:  BWRAP_TTY_DRAIN_SECS=0.5 bwopencode
+: "${BWRAP_TTY_DRAIN_SECS:=0.3}"
+
+# _restore_terminal
+#   Reset terminal input modes a TUI may have left in flight and discard
+#   any input that arrives within BWRAP_TTY_DRAIN_SECS.  No-op unless
+#   both stdin and stdout are a terminal.  Never fails (callers run
+#   under set -e).
+_restore_terminal() {
+    [[ -t 0 && -t 1 ]] || return 0
+
+    # Belt and braces: mouse tracking (1000/1002/1003) and SGR encoding
+    # (1006) off, focus-event reporting (1004) off, bracketed paste
+    # (2004) off, pop the kitty keyboard-protocol flags (CSI < u), and
+    # show the cursor.  All are harmless no-ops when already in the
+    # default state, so this is safe after --exec commands too.
+    printf '\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1004l\033[?2004l\033[<u\033[?25h'
+
+    local _saved_stty=""
+    _saved_stty="$(stty -g 2> /dev/null || true)"
+
+    # If the tool died without restoring canonical mode (crash, SIGKILL),
+    # the saved state is itself broken — fall back to sane defaults.
+    if [[ -n "${_saved_stty}" ]] && stty -a 2> /dev/null | grep -q -- '-icanon'; then
+        stty sane 2> /dev/null || true
+        _saved_stty="$(stty -g 2> /dev/null || true)"
+    fi
+
+    # Suppress echo while draining so the stray bytes never reach the
+    # screen, then read-and-discard until the line has been quiet for
+    # BWRAP_TTY_DRAIN_SECS.  The iteration cap bounds the worst case
+    # (e.g. a terminal that keeps streaming mouse reports) to a few
+    # seconds rather than hanging the wrapper.
+    stty -echo 2> /dev/null || true
+    local _n=0
+    while [[ ${_n} -lt 4096 ]] && IFS= read -r -s -t "${BWRAP_TTY_DRAIN_SECS}" -n 1 _; do
+        _n=$((_n + 1))
+    done
+
+    if [[ -n "${_saved_stty}" ]]; then
+        stty "${_saved_stty}" 2> /dev/null || true
+    else
+        stty echo 2> /dev/null || true
+    fi
+    return 0
+}
+
 # Launch bwrap itself with a scrubbed environment so /proc/1/environ
 # does not leak host variables (SSH_AUTH_SOCK, DBUS_SESSION_BUS_ADDRESS, etc.).
 #
 # `env` is resolved via resolve_env_bin (prefers /usr/bin/env) rather than
 # via PATH lookup at exec time — this prevents a user shell script named
 # "env" earlier on PATH from hijacking the launch.  See resolve_env_bin.
+#
+# bwrap is run as a foreground child rather than exec'd so that
+# _restore_terminal can run after the tool exits (see above).  The tool's
+# exit status is propagated unchanged.  SIGINT is trapped to a no-op
+# while waiting so that a Ctrl-C that terminates the child does not also
+# terminate the wrapper before the terminal has been restored; children
+# still receive SIGINT normally (trapped, not ignored, signals are reset
+# to their default disposition on exec).
 launch_sandbox() {
-    local _BWRAP_BIN _ENV_BIN
+    local _BWRAP_BIN _ENV_BIN _rc=0
     _BWRAP_BIN="$(command -v bwrap)"
     _ENV_BIN="$(resolve_env_bin)"
 
-    exec "${_ENV_BIN}" -i \
+    trap ':' INT
+    "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
         USER="${USER}" \
         LOGNAME="${USER}" \
         PATH="/usr/bin:/bin" \
         LANG="${LANG:-C.UTF-8}" \
         LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
-        "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
+        "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"} ||
+           _rc=$?
+    trap - INT
+
+    _restore_terminal
+    exit "${_rc}"
 }
