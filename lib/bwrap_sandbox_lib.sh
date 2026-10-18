@@ -105,6 +105,10 @@ GIT_INCLUDE_PREDIRS=()
 # a tmpfs, so build_git_mounts recreates them with --symlink; the kernel then
 # resolves ".." against the symlink target exactly as it does on the host.
 GIT_INCLUDE_LINKS=()
+# GIT_INCLUDE_RAW: at the same index, the include path exactly as git computes
+# it (not normalised); used to find where git looks for the file when a
+# symlinked directory could not be recreated (see _bwrap_include_lexical_path).
+GIT_INCLUDE_RAW=()
 
 # Results of _bwrap_canonicalize_safe / _bwrap_include_visible_path /
 # _bwrap_path_blocked (globals, because _check_path_safe calls exit and must
@@ -113,12 +117,18 @@ _BWRAP_CANON=""
 _BWRAP_INC_VISIBLE=""
 _BWRAP_INC_PREDIRS=""
 _BWRAP_INC_LINKS=""
+_BWRAP_INC_LEXICAL=""
+_BWRAP_INC_LEXDIRS=""
+_BWRAP_LEX_DEST=""
 _BWRAP_BLOCKED_KIND=""
 _BWRAP_BLOCKED_PREFIX=""
 
 # Symlinks already handled by _bwrap_git_recreate_link: path -> 0 (present or
 # recreated in the sandbox) / 1 (could not be recreated).
 declare -A _GIT_LINK_STATUS=()
+# Subset of the failed symlinks above: LINK -> 1 when LINK exists in the
+# sandbox as a plain directory (see _bwrap_git_recreate_link).
+declare -A _GIT_LINK_CONFLICT=()
 
 # Set to 1 by build_git_mounts when at least one file of
 # ${XDG_CONFIG_HOME}/git was mounted (launchers may point symlinks at the
@@ -746,6 +756,7 @@ parse_git_includes() {
             GIT_INCLUDE_VISIBLE+=("${visible}")
             GIT_INCLUDE_PREDIRS+=("${predirs}")
             GIT_INCLUDE_LINKS+=("${links}")
+            GIT_INCLUDE_RAW+=("${path_val}")
         fi
     done < "${config_file}"
 }
@@ -1020,6 +1031,36 @@ _bwrap_include_visible_path() {
         esac
     done
     _BWRAP_INC_VISIBLE="${phys%/}${tail}"
+}
+
+# _bwrap_include_lexical_path RAW
+#   Work out where git looks for an include in a sandbox where every symlinked
+#   directory of RAW exists as a plain directory (so ".." is collapsed
+#   lexically).  Sets:
+#     _BWRAP_INC_LEXICAL  RAW normalised lexically
+#     _BWRAP_INC_LEXDIRS  newline-separated directories the kernel walks
+#                         before the last ".."
+_bwrap_include_lexical_path() {
+    local raw="$1" part cur="" i last_dotdot=-1
+    local -a parts=()
+    local IFS=/
+    _BWRAP_INC_LEXDIRS=""
+    read -r -a parts <<< "${raw}"
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        [[ "${parts[i]}" == ".." ]] && last_dotdot=${i}
+    done
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        part="${parts[i]}"
+        case "${part}" in
+            '' | .) ;;
+            ..) cur="${cur%/*}" ;;
+            *)
+                cur+="/${part}"
+                [[ "${i}" -lt "${last_dotdot}" ]] && _BWRAP_INC_LEXDIRS+="${cur}"$'\n'
+                ;;
+        esac
+    done
+    _BWRAP_INC_LEXICAL="${cur:-/}"
 }
 
 # validate_extra_path RAW_PATH MODE
@@ -1484,12 +1525,16 @@ build_workdir_mount() {
 
 # _bwrap_already_mounted PATH
 #   Return 0 when PATH lies inside a tree that is present in the sandbox with
-#   its host content (symlinks included): the standard system trees, the
-#   working directory, and the pixi / ccache / npm / ~/bin / registered
-#   mounts.  Anything else under the tmpfs $HOME is NOT present.
+#   its host content (symlinks included): the standard system trees, the /etc
+#   DIRECTORY trees build_etc_mounts binds (never /etc itself: only selected
+#   entries of it are bound, so e.g. /etc/xdg is NOT present), the working
+#   directory, and the pixi / ccache / npm / ~/bin / registered mounts.
+#   Anything else under the tmpfs $HOME is NOT present.
 _bwrap_already_mounted() {
     local path="$1" _m
-    for _m in /usr /bin /sbin /lib /lib64 /etc /nsls2/software/bin \
+    for _m in /usr /bin /sbin /lib /lib64 \
+            /etc/ssl /etc/pki /etc/crypto-policies /etc/ca-certificates \
+            /etc/alternatives /etc/ld.so.conf.d /nsls2/software/bin \
             "${_BIND_DIR}" "${PIXI_HOME_DIR}" "${CCACHE_CONFIG_DIR}" \
             "${CCACHE_CACHE_DIR}" "${NPM_CACHE_DIR}" "${_HOME}/bin"; do
         [[ -n "${_m}" ]] || continue
@@ -1503,14 +1548,35 @@ _bwrap_already_mounted() {
     return 1
 }
 
+# _bwrap_dest_in_args PATH
+#   Return 0 when some element of BWRAP_ARGS equals PATH or lies below it
+#   (--dir / --tmpfs / --bind / --ro-bind / --symlink destination, or a child
+#   of PATH): PATH already exists in the sandbox as a directory (or other
+#   object) or has been populated, so a --symlink at PATH would make bwrap
+#   fail at startup.
+_bwrap_dest_in_args() {
+    local path="$1" _a
+    for _a in "${BWRAP_ARGS[@]+"${BWRAP_ARGS[@]}"}"; do
+        [[ "${_a}" == "${path}" || "${_a}" == "${path}"/* ]] && return 0
+    done
+    return 1
+}
+
 # _bwrap_git_recreate_link LINK
 #   Make the symlinked directory LINK exist in the sandbox.  The sandbox
 #   $HOME is a tmpfs, so a symlink under $HOME is lost; without it the kernel
 #   resolves ".." in a git include path differently than on the host.  Emits
 #   --symlink <real target> LINK (after the --dir ancestors) once per LINK.
 #   Return 0 when LINK is present (already mounted, or recreated), 1 when it
-#   cannot be: outside $HOME and not inside a mounted tree, dangling, or LINK
-#   or its target inside a blocked location (warned about; never linked).
+#   cannot be: outside $HOME and not inside a mounted tree (symlinks outside
+#   $HOME, e.g. under /etc, are never recreated), dangling, LINK or its target
+#   inside a blocked location, or LINK already present in BWRAP_ARGS (warned
+#   about; never linked).
+#   Ordering rule: bwrap fails at startup when --symlink's destination
+#   exists.  build_home_tmpfs pre-creates ~/.config, ~/.local, ~/.local/share,
+#   ~/.cache and ~/bin as directories and other mounts populate paths below
+#   them before this runs, so a host symlink at such a path is NOT emitted;
+#   the sandbox keeps the plain directory (_GIT_LINK_CONFLICT[LINK]=1).
 _bwrap_git_recreate_link() {
     local link="$1" target
     if [[ -n "${_GIT_LINK_STATUS["${link}"]:-}" ]]; then
@@ -1526,6 +1592,13 @@ _bwrap_git_recreate_link() {
     [[ -n "${target}" && -d "${target}" ]] || return 1
     if _bwrap_path_blocked "${link}" || _bwrap_path_blocked "${target}"; then
         echo "Warning: symlink ${link} resolves into a blocked location (${target}); not recreated." >&2
+        return 1
+    fi
+    if _bwrap_dest_in_args "${link}"; then
+        _GIT_LINK_CONFLICT["${link}"]=1
+        printf 'Warning: %s is a symlink on the host but exists as a plain directory in the sandbox\n' "${link}" >&2
+        printf '         (it is pre-created or already populated); not recreated. Git includes that use ".."\n' >&2
+        printf '         through it may not resolve.\n' >&2
         return 1
     fi
     _emit_home_intermediate_dirs "${link}"
@@ -1586,6 +1659,63 @@ _bwrap_mount_xdg_git_files() {
     _BWRAP_XDG_GIT_HAS_FILES=1
 }
 
+# _bwrap_git_lexical_mount RAW INC_PATH
+#   Fallback for a git include whose symlinked directories exist in the
+#   sandbox as plain directories: mount INC_PATH (read-only) at RAW collapsed
+#   lexically, creating the directories git walks before the last ".." (the
+#   caller's _GIT_INC_DIRS_SEEN / _GIT_INC_BOUND dedupe).  Returns 1 without
+#   emitting the bind when that is not safe: the destination is outside $HOME
+#   or blocked, is already in BWRAP_ARGS (never mounted over an existing
+#   destination such as ~/.gitconfig or an XDG git file), or a walked
+#   component is blocked, outside $HOME and not mounted, or a symlink that is
+#   present in the sandbox as a symlink (not a plain directory).  Sets
+#   _BWRAP_LEX_DEST on success.  Runs in the caller's shell (it appends to
+#   BWRAP_ARGS), so it must not be used in a command substitution.
+_bwrap_git_lexical_mount() {
+    local raw="$1" inc_path="$2" d lex parent
+    local -a dirs=()
+    _BWRAP_LEX_DEST=""
+    [[ -n "${raw}" ]] || return 1
+    _bwrap_include_lexical_path "${raw}"
+    lex="${_BWRAP_INC_LEXICAL}"
+    [[ "${lex}" == "${_HOME}"/* && "${lex}" != "${inc_path}" ]] || return 1
+    _bwrap_path_blocked "${lex}" && return 1
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] || continue
+        if _is_prefix_of "${d}" "${_HOME}"; then
+            continue # $HOME or an ancestor: exists (the tmpfs mount point)
+        elif [[ "${d}" == "${_HOME}"/* ]]; then
+            _bwrap_path_blocked "${d}" && return 1
+            if [[ -L "${d}" && -z "${_GIT_LINK_CONFLICT["${d}"]:-}" ]]; then
+                return 1
+            fi
+            dirs+=("${d}")
+        else
+            _bwrap_already_mounted "${d}" || return 1
+        fi
+    done <<< "${_BWRAP_INC_LEXDIRS}"
+    if [[ -z "${_GIT_INC_BOUND["${lex}"]:-}" ]]; then
+        if _bwrap_dest_in_args "${lex}"; then
+            printf 'Warning: not mounting git include at %s: that path is already in use in the sandbox.\n' "${lex}" >&2
+            return 1
+        fi
+        for d in "${dirs[@]+"${dirs[@]}"}"; do
+            [[ -z "${_GIT_INC_DIRS_SEEN["${d}"]:-}" ]] || continue
+            _GIT_INC_DIRS_SEEN["${d}"]=1
+            BWRAP_ARGS+=(--dir "${d}")
+        done
+        parent="${lex%/*}"
+        if [[ "${parent}" != "${_HOME}" && -z "${_GIT_INC_DIRS_SEEN["${parent}"]:-}" ]]; then
+            _GIT_INC_DIRS_SEEN["${parent}"]=1
+            BWRAP_ARGS+=(--dir "${parent}")
+        fi
+        _GIT_INC_BOUND["${lex}"]=1
+        BWRAP_ARGS+=(--ro-bind-try "${inc_path}" "${lex}")
+    fi
+    _BWRAP_LEX_DEST="${lex}"
+    return 0
+}
+
 build_git_mounts() {
     # Resolve symlinks so we bind the real file (readlink -f is a no-op on
     # regular files).  Check the resolved target before emitting the bind:
@@ -1616,15 +1746,33 @@ build_git_mounts() {
         # Symlinked directories before a ".." in the include path: recreate
         # them so the kernel resolves ".." as on the host.  If one cannot be
         # recreated the include is mounted at its real path only.
-        local _link _links_ok=1
+        local _link _links_ok=1 _conflict_only=1
         while IFS= read -r _link; do
             [[ -n "${_link}" ]] || continue
-            _bwrap_git_recreate_link "${_link}" || _links_ok=0
+            if ! _bwrap_git_recreate_link "${_link}"; then
+                _links_ok=0
+                [[ -n "${_GIT_LINK_CONFLICT["${_link}"]:-}" ]] || _conflict_only=0
+            fi
         done <<< "${GIT_INCLUDE_LINKS[${_i}]:-}"
+        local _lex=""
         if [[ "${_links_ok}" -eq 0 ]]; then
-            printf 'Warning: git include %s needs a symlinked directory that cannot be recreated in\n' "${inc_visible}" >&2
-            printf '         the sandbox; it is mounted at its real path (%s) only, so git may not find it.\n' "${inc_path}" >&2
             inc_visible="${inc_path}"
+            # Every symlink that could not be recreated exists in the sandbox
+            # as a plain directory (conflict with a pre-created directory):
+            # git resolves ".." there lexically, so provide the include at
+            # its lexically collapsed path as well.  Never done when a
+            # symlink failed for another reason (missing, blocked, outside
+            # $HOME): that component does not exist in the sandbox.
+            if [[ "${_conflict_only}" -eq 1 ]]; then
+                _bwrap_git_lexical_mount "${GIT_INCLUDE_RAW[${_i}]:-}" "${inc_path}" && _lex="${_BWRAP_LEX_DEST}"
+            fi
+            if [[ -n "${_lex}" ]]; then
+                printf 'Warning: git include %s: a symlinked directory is a plain directory in the sandbox;\n' "${GIT_INCLUDE_RAW[${_i}]}" >&2
+                printf '         the include is also mounted at %s, where git looks for it there.\n' "${_lex}" >&2
+            else
+                printf 'Warning: git include %s needs a symlinked directory that cannot be recreated in\n' "${GIT_INCLUDE_VISIBLE[${_i}]:-${inc_path}}" >&2
+                printf '         the sandbox; it is mounted at its real path (%s) only, so git may not find it.\n' "${inc_path}" >&2
+            fi
         fi
         # Directories the kernel must traverse to resolve ".." in the include
         # path git opens (they hold no data; they only have to exist).

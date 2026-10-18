@@ -133,7 +133,19 @@ cases.
   `..` resolves as on the host; a symlink whose target is in a blocked location
   is never recreated. If a needed symlink cannot be recreated (outside `$HOME`
   and not in a mounted tree, or dangling or blocked), the include is mounted at
-  its real path only, with a warning.
+  its real path only, with a warning. A host symlink at a path the launcher
+  pre-creates in the sandbox home (`~/.config`, `~/.local`, `~/.local/share`,
+  `~/.cache`, `~/bin`), or at any path already created or populated by an
+  earlier mount, is not recreated either (bwrap cannot create a symlink where a
+  directory exists): the sandbox sees a plain directory there and a warning is
+  printed. Git then resolves `..` through it lexically; when every unrecreated
+  symlink of an include is of this kind, the include is additionally mounted at
+  its lexically collapsed path (for example `~/.config/shared` for
+  `~/.config/git/../shared`), unless that path is already in use (never over
+  `~/.gitconfig` or an XDG git file). Symlinks outside `$HOME` (for example
+  under `/etc`, where only selected entries are bound) are not recreated: the
+  four XDG git files are then mounted at the host path of the symlinked
+  directory.
 - **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
   whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
   `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the
