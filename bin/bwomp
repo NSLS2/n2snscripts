@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+# bwomp — Launch Oh My Pi (omp) inside a bubblewrap (bwrap) sandbox.
+#
+# Requires: bwrap >= 0.4.0 (RHEL 8)
+#   - 0.4.0: base functionality
+#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
+#   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+#
+# The sandbox provides filesystem isolation:
+#   - Current directory: read-write
+#   - OMP home (~/.omp): tmpfs with selective persistence
+#       - agent config, sessions, terminal-sessions, history/model DBs:
+#         persisted
+#       - agent.db: persisted only if it already exists on host AND
+#         --init-auth is supplied; otherwise copied into tmpfs if present
+#         so credentials are usable for the session but discarded on exit
+#       - profiles: state under the active profile follows the same policy
+#       - worktrees (~/.omp/wt): persisted
+#       - run/, logs/, puppeteer/, natives/: persisted if present/created
+#   - Project .omp/: persisted outside the repo under OMP data, keyed by repo
+#   - Git config + includes: read-only
+#   - Pixi cache: read-write
+#   - Pixi config: read-only
+#   - ccache config: read-only
+#   - ccache cache: read-write
+#   - npm config: read-only
+#   - npm cache: read-write
+#   - System and user binaries: read-only
+#   - SSH binaries: masked (ssh, scp, sftp, ssh-agent, etc.)
+#   - Network tools: masked (telnet, nc/ncat, socat, rsync, rsh)
+#   - Kerberos tools: masked (kinit, klist, kdestroy, kswitch)
+#   - Privilege escalation: masked (sudo, su, pkexec)
+#   - Namespace tools: masked (nsenter, unshare, chroot)
+#   - Keyring tools: masked (keyctl)
+#   - SSH/GPG agent env vars: stripped
+#   - ~/.bashrc and other shell rc files: not mounted
+#
+# Usage:
+#   bwomp [bwomp-options] [omp arguments...]
+#   bwomp --help
+#
+# Options:
+#   --help, -h      Show this help (wrapper options + omp's own help).
+#   --dry-run       Print the bwrap command that would be executed without running it.
+#   --exec CMD      Run CMD inside the sandbox instead of omp.
+#                   Useful for running one-off commands, scripts, or diagnostic tools
+#                   inside the fully-configured sandbox environment.
+#   --init-auth     Persist OMP's agent.db credential store to the host for the
+#                   selected profile.  On shared accounts, do NOT use this flag —
+#                   agent.db is copied into tmpfs by default and changes are
+#                   discarded on exit.
+#   --new-session   Force bwrap --new-session even on kernels with the TIOCSTI cap
+#                   guard.  Detaches the controlling tty for stricter isolation at the
+#                   cost of SIGWINCH (terminal resize) propagation.
+#   --ro-path PATH  Mount PATH read-only into the sandbox.  May be repeated to
+#                   accumulate multiple paths.  Dangerous paths are blocked:
+#                   $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws, ~/.kube,
+#                   ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler, ~/.yarnrc,
+#                   ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
+#                   $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
+#                   /etc/sudoers{,.d}.
+#   --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated to
+#                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
+
+set -euo pipefail
+
+# Source the shared sandbox library.
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=../lib/bwrap_sandbox_lib.sh
+source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
+
+# ═══════════════════════════════════════════════════════════════════
+# Tool-specific state
+# ═══════════════════════════════════════════════════════════════════
+
+INIT_AUTH=0
+FORWARD_GH_TOKENS=0
+
+OMP_HOME_DIR=""
+OMP_PROFILE_NAME=""
+OMP_AGENT_DIR=""
+OMP_WORKTREE_DIR=""
+OMP_PROJECT_DOTFILES_DIR=""
+OMP_AGENT_DB_FILE=""
+
+# ═══════════════════════════════════════════════════════════════════
+# Tool-specific functions
+# ═══════════════════════════════════════════════════════════════════
+
+parse_wrapper_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help | -h)
+                SHOW_HELP=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --exec)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --exec requires a command argument." >&2
+                    exit 1
+                fi
+                TEST_CMD="$2"
+                shift 2
+                ;;
+            --init-auth)
+                INIT_AUTH=1
+                shift
+                ;;
+            --github-tokens)
+                FORWARD_GH_TOKENS=1
+                shift
+                ;;
+            --new-session)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh (sandboxed_exec)
+                FORCE_NEW_SESSION=1
+                shift
+                ;;
+            --ro-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --ro-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RO_PATHS+=("$2")
+                shift 2
+                ;;
+            --rw-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --rw-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RW_PATHS+=("$2")
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
+    TOOL_ARGS=("$@")
+}
+
+# Find the absolute path to the omp binary on the host so we do
+# not depend on PATH lookup inside the sandbox.
+# Sets globals: _TOOL_BIN, _TOOL_CMD
+resolve_tool_binary() {
+    _TOOL_BIN="$(command -v omp 2> /dev/null || true)"
+    if [[ -z "${_TOOL_BIN}" ]]; then
+        echo "Error: 'omp' not found in PATH." >&2
+        exit 1
+    fi
+
+    if [[ -n "${TEST_CMD}" ]]; then
+        # Split TEST_CMD into array so multi-word commands work correctly.
+        read -ra _TOOL_CMD <<< "${TEST_CMD}"
+    else
+        _TOOL_CMD=("${_TOOL_BIN}")
+    fi
+}
+
+show_help() {
+    cat << 'HELP_EOF'
+bwomp — Oh My Pi (omp) inside a bubblewrap sandbox
+
+Wrapper options (consumed before omp sees the command line):
+  -h, --help      Show this message followed by omp's own help.
+  --dry-run       Print the bwrap command that would be run, then exit.
+  --exec CMD      Run CMD inside the fully-configured sandbox instead of omp.
+                  Use this to run scripts, diagnostic tools, or any command with
+                  the same filesystem isolation and environment as omp itself.
+                  Example: bwomp --exec bash
+                           bwomp --exec 'env | sort'
+  --init-auth     Persist OMP's agent.db credential store for the selected
+                  profile across sessions.  Skip this on shared accounts:
+                  without it, an existing agent.db is copied into tmpfs so
+                  credentials work for the session but updates are discarded.
+  --new-session   Force bwrap to call setsid(2), detaching the sandbox from the
+                  controlling terminal.  This is the default on older kernels
+                  (< 5.14); on newer kernels we omit it so that SIGWINCH (terminal
+                  resize) propagates from tmux/screen.  Use this flag to opt back
+                  into stricter terminal isolation when SIGWINCH is not important.
+  --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
+                  May be repeated to accumulate multiple extra paths.
+                  Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
+                  ~/.kube, ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler,
+                  ~/.yarnrc, ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
+                  $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
+                  /etc/sudoers{,.d}.
+                  Symlinks are resolved before the safety check is applied.
+  --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
+                  Same blocked-path rules as --ro-path.  May be repeated.
+  --github-tokens Forward any GH_TOKEN_* environment variables into the
+                  sandbox so the agent can authenticate gh(1) CLI.
+                  Off by default.  When set, use per-command token selection:
+                    GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
+                    GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
+
+All other arguments are passed through to omp unchanged.
+
+HELP_EOF
+    # Delegate to omp --help inside the sandbox so the user sees the full
+    # omp option set in the same invocation.  We re-exec this script with
+    # --exec so the sandbox is fully constructed; omp --help is passed
+    # as the sandbox command.
+    exec "$0" --exec "${_TOOL_BIN} --help"
+}
+
+_extract_omp_profile() {
+    OMP_PROFILE_NAME="${OMP_PROFILE:-}"
+
+    local _idx=0 _arg
+    while [[ ${_idx} -lt ${#TOOL_ARGS[@]} ]]; do
+        _arg="${TOOL_ARGS[$_idx]}"
+        case "${_arg}" in
+            --profile=*)
+                OMP_PROFILE_NAME="${_arg#--profile=}"
+                ;;
+            --profile)
+                if [[ $((_idx + 1)) -lt ${#TOOL_ARGS[@]} ]]; then
+                    OMP_PROFILE_NAME="${TOOL_ARGS[$((_idx + 1))]}"
+                fi
+                ;;
+        esac
+        _idx=$((_idx + 1))
+    done
+
+    if [[ "${OMP_PROFILE_NAME}" == */* ]] || [[ "${OMP_PROFILE_NAME}" == *..* ]]; then
+        echo "Error: OMP profile names used with bwomp must not contain '/' or '..'." >&2
+        exit 1
+    fi
+}
+
+resolve_omp_paths() {
+    OMP_HOME_DIR="${OMP_HOME:-${_HOME}/.omp}"
+    _extract_omp_profile
+
+    if [[ -n "${OMP_PROFILE_NAME}" ]]; then
+        OMP_AGENT_DIR="${OMP_HOME_DIR}/profiles/${OMP_PROFILE_NAME}/agent"
+    elif [[ -n "${PI_CODING_AGENT_DIR:-}" ]]; then
+        OMP_AGENT_DIR="${PI_CODING_AGENT_DIR}"
+    else
+        OMP_AGENT_DIR="${OMP_HOME_DIR}/agent"
+    fi
+
+    OMP_WORKTREE_DIR="${OMP_HOME_DIR}/wt"
+    OMP_PROJECT_DOTFILES_DIR="${OMP_HOME_DIR}/project-dotfiles"
+    OMP_AGENT_DB_FILE="${OMP_AGENT_DIR}/agent.db"
+
+    # Validate the user-controllable root directories once here so that all
+    # sub-path mounts derived from them are implicitly covered.
+    _check_dir_safe "${OMP_HOME_DIR}"       "OMP_HOME"
+    _check_dir_safe "${OMP_AGENT_DIR}"      "OMP agent dir"
+    _check_dir_safe "${OMP_WORKTREE_DIR}"   "OMP worktree dir"
+}
+
+# Ensure writable directories and files exist on host.
+ensure_host_dirs() {
+    mkdir -p "${OMP_HOME_DIR}" \
+             "${OMP_AGENT_DIR}/sessions" \
+             "${OMP_AGENT_DIR}/terminal-sessions" \
+             "${OMP_WORKTREE_DIR}" \
+             "${OMP_PROJECT_DOTFILES_DIR}"
+
+    touch "${OMP_AGENT_DIR}/history.db" \
+          "${OMP_AGENT_DIR}/history.db-shm" \
+          "${OMP_AGENT_DIR}/history.db-wal" \
+          "${OMP_AGENT_DIR}/models.db" \
+          "${OMP_AGENT_DIR}/models.db-shm" \
+          "${OMP_AGENT_DIR}/models.db-wal" \
+          "${OMP_AGENT_DIR}/last-changelog-version"
+}
+
+_bind_omp_agent_entry_if_present() {
+    local _entry="$1" _mode="$2"
+    local _host_path="${OMP_AGENT_DIR}/${_entry}"
+    [[ -e "${_host_path}" ]] || return 0
+
+    if [[ "${_mode}" == "ro" ]]; then
+        BWRAP_ARGS+=(--ro-bind "${_host_path}" "${_host_path}")
+    else
+        BWRAP_ARGS+=(--bind "${_host_path}" "${_host_path}")
+    fi
+}
+
+_emit_omp_home_intermediate_dirs() {
+    local dir="$1" mode="${2:-ancestors}"
+    [[ "${dir}" == "${OMP_HOME_DIR}"/* ]] || return 0
+
+    local _rel="${dir#"${OMP_HOME_DIR}"/}"
+    local _accum="${OMP_HOME_DIR}"
+    local _parts _i _last
+    IFS='/' read -ra _parts <<< "${_rel}"
+    if [[ "${mode}" == "inclusive" ]]; then
+        _last=${#_parts[@]}
+    else
+        _last=$((${#_parts[@]} - 1))
+    fi
+    for ((_i = 0; _i < _last; _i++)); do
+        _accum="${_accum}/${_parts[$_i]}"
+        BWRAP_ARGS+=(--dir "${_accum}")
+    done
+}
+
+# ── OMP home (ephemeral tmpfs + selective persistence) ───────────
+# Mount ~/.omp as ephemeral tmpfs, then selectively bind-mount the
+# subtrees and files that are safe/useful to persist across sessions.
+# agent.db is treated as auth-sensitive and persists only with --init-auth.
+build_omp_home_mounts() {
+    _emit_home_intermediate_dirs "${OMP_HOME_DIR}"
+    BWRAP_ARGS+=(--tmpfs "${OMP_HOME_DIR}")
+
+    if _is_prefix_of "${OMP_HOME_DIR}" "${OMP_AGENT_DIR}"; then
+        _emit_omp_home_intermediate_dirs "${OMP_AGENT_DIR}" inclusive
+    else
+        # PI_CODING_AGENT_DIR can point outside OMP_HOME_DIR.  Use tmpfs there
+        # as well so unlisted files remain ephemeral.
+        _emit_home_intermediate_dirs "${OMP_AGENT_DIR}"
+        BWRAP_ARGS+=(--tmpfs "${OMP_AGENT_DIR}")
+    fi
+
+    # Persistent read-write directories.
+    _bind_omp_agent_entry_if_present sessions rw
+    _bind_omp_agent_entry_if_present terminal-sessions rw
+    BWRAP_ARGS+=(--bind "${OMP_WORKTREE_DIR}" "${OMP_WORKTREE_DIR}")
+
+    # Common OMP top-level runtime/cache dirs.  They are not created by
+    # default except run/ and logs/ because those are normal runtime outputs;
+    # if others already exist, preserving them avoids repeated setup downloads.
+    local _top
+    mkdir -p "${OMP_HOME_DIR}/run" "${OMP_HOME_DIR}/logs"
+    for _top in run logs natives puppeteer; do
+        if [[ -d "${OMP_HOME_DIR}/${_top}" ]]; then
+            BWRAP_ARGS+=(--bind "${OMP_HOME_DIR}/${_top}" "${OMP_HOME_DIR}/${_top}")
+        fi
+    done
+    if [[ -f "${OMP_HOME_DIR}/gpu_cache.json" ]]; then
+        BWRAP_ARGS+=(--bind "${OMP_HOME_DIR}/gpu_cache.json" "${OMP_HOME_DIR}/gpu_cache.json")
+    fi
+
+    # User-visible config and non-auth state.
+    _bind_omp_agent_entry_if_present config.yml rw
+    _bind_omp_agent_entry_if_present last-changelog-version rw
+
+    local _db
+    for _db in history.db history.db-shm history.db-wal models.db models.db-shm models.db-wal; do
+        _bind_omp_agent_entry_if_present "${_db}" rw
+    done
+
+    # agent.db may contain broker/API/OAuth credential material.  With
+    # --init-auth, create/persist it; otherwise copy an existing host DB into
+    # tmpfs via --file so reads work but modifications disappear on exit.
+    if [[ "${INIT_AUTH}" -eq 1 ]] && [[ ! -f "${OMP_AGENT_DB_FILE}" ]]; then
+        touch "${OMP_AGENT_DB_FILE}"
+        chmod 600 "${OMP_AGENT_DB_FILE}"
+        echo "Created ${OMP_AGENT_DB_FILE} — OMP auth state will persist after this session." >&2
+    fi
+    if [[ "${INIT_AUTH}" -eq 1 ]] && [[ -f "${OMP_AGENT_DB_FILE}" ]]; then
+        touch "${OMP_AGENT_DB_FILE}-shm" "${OMP_AGENT_DB_FILE}-wal"
+        BWRAP_ARGS+=(--bind "${OMP_AGENT_DB_FILE}" "${OMP_AGENT_DB_FILE}")
+        BWRAP_ARGS+=(--bind "${OMP_AGENT_DB_FILE}-shm" "${OMP_AGENT_DB_FILE}-shm")
+        BWRAP_ARGS+=(--bind "${OMP_AGENT_DB_FILE}-wal" "${OMP_AGENT_DB_FILE}-wal")
+    elif [[ -f "${OMP_AGENT_DB_FILE}" ]]; then
+        local _fd
+        exec {_fd}< "${OMP_AGENT_DB_FILE}"
+        BWRAP_ARGS+=(--file "${_fd}" "${OMP_AGENT_DB_FILE}")
+        if [[ -f "${OMP_AGENT_DB_FILE}-wal" ]]; then
+            local _wal_fd
+            exec {_wal_fd}< "${OMP_AGENT_DB_FILE}-wal"
+            BWRAP_ARGS+=(--file "${_wal_fd}" "${OMP_AGENT_DB_FILE}-wal")
+        fi
+    fi
+}
+
+# ── Persistent .omp/ directory ───────────────────────────────────
+# OMP can unpack project agents into ./.omp/agents.  Store this in a
+# persistent location outside the repo so it survives `git clean -xfd`.
+build_persistent_dotdir() {
+    [[ -n "${_GIT_ROOT}" ]] || return 0
+
+    local _repo_hash
+    _repo_hash="$(printf '%s' "${_GIT_ROOT}" | sha256sum)"
+    _repo_hash="${_repo_hash:0:16}"
+    local _persist_dir="${OMP_PROJECT_DOTFILES_DIR}/${_repo_hash}"
+    mkdir -p "${_persist_dir}"
+
+    BWRAP_ARGS+=(
+        --bind "${_persist_dir}" "${_GIT_ROOT}/.omp"
+    )
+}
+
+# ── OMP env vars ─────────────────────────────────────────────────
+# Pass through AIFAPIM_* for NSLS-II Hermes gateway and OMP/PI configuration
+# env vars.  Do not pass raw provider API-key env vars by default; that would
+# be broader than bwopencode's environment access model.
+build_omp_env() {
+    # AIFAPIM gateway config
+    pass_through_if_set AIFAPIM_HOST
+    if [[ -n "${AIFAPIM_API_KEY:-}" ]]; then
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            BWRAP_ARGS+=(--setenv AIFAPIM_API_KEY REDACTED)
+        else
+            pass_through_if_set AIFAPIM_API_KEY
+        fi
+    fi
+
+    # OMP location/profile overrides
+    pass_through_if_set OMP_HOME
+    pass_through_if_set OMP_PROFILE
+    pass_through_if_set PI_CODING_AGENT_DIR
+    pass_through_if_set PI_PACKAGE_DIR
+    pass_through_if_set PI_SMOL_MODEL
+    pass_through_if_set PI_SLOW_MODEL
+    pass_through_if_set PI_PLAN_MODEL
+    pass_through_if_set PI_NO_PTY
+
+    # GitHub CLI token passthrough (opt-in via --github-tokens)
+    # In --dry-run mode the value is replaced with REDACTED so that tokens
+    # are not printed to the terminal in the bwrap command output.
+    if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
+        local _key _gh_val
+        while IFS= read -r _key; do
+            if [[ "${_key}" == GH_TOKEN_* ]]; then
+                if [[ "${DRY_RUN}" -eq 1 ]]; then
+                    _gh_val="REDACTED"
+                else
+                    _gh_val="${!_key}"
+                fi
+                BWRAP_ARGS+=(--setenv "${_key}" "${_gh_val}")
+            fi
+        done < <(compgen -e)
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════
+
+main() {
+    parse_wrapper_args "$@"
+    resolve_tool_binary
+
+    if [[ "${SHOW_HELP}" -eq 1 ]]; then
+        show_help
+        # show_help does exec, never returns
+    fi
+
+    detect_bwrap_capabilities
+    detect_kernel_capabilities
+    resolve_common_paths
+    resolve_omp_paths
+    detect_shell
+    ensure_host_dirs
+    parse_all_git_includes
+    init_sandbox_path
+
+    # Build bwrap argument list
+    build_base_sandbox
+    build_binary_masks
+    build_proc_dev_tmp
+    build_sys_mounts
+    build_etc_mounts
+    build_home_tmpfs
+    build_workdir_mount
+    build_omp_home_mounts
+    build_persistent_dotdir
+    build_git_mounts
+    build_pixi_mounts
+    build_ccache_mounts
+    build_npm_mounts
+    build_user_bin_mount
+    build_nsls2_mount
+    build_dynamic_tool_mounts
+    build_extra_path_mounts
+
+    # Environment variables
+    build_env_vars
+    build_omp_env
+
+    # Launch
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        print_dry_run
+    else
+        launch_sandbox
+    fi
+}
+
+main "$@"
