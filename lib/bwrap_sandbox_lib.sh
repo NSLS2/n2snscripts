@@ -95,11 +95,18 @@ KERNEL_HAS_TIOCSTI_CAP_GUARD=0
 declare -A _GIT_INCLUDE_SEEN=()
 GIT_INCLUDE_PATHS=()
 GIT_INCLUDE_VISIBLE=()
+# GIT_INCLUDE_PREDIRS: at the same index, a newline-separated list of
+# directories that must exist in the sandbox so git can resolve ".." in the
+# include path it opens (see _bwrap_include_visible_path).
+GIT_INCLUDE_PREDIRS=()
 
 # Result of _bwrap_canonicalize_safe / _bwrap_normalize_path (globals,
 # because _check_path_safe calls exit and must not run in a subshell).
 _BWRAP_CANON=""
 _BWRAP_NORMALIZED=""
+_BWRAP_INC_VISIBLE=""
+_BWRAP_INC_PREDIRS=""
+_BWRAP_INC_MISMATCH=0
 
 # Set to 1 by build_git_mounts when ${XDG_CONFIG_HOME}/git is actually
 # mounted in the sandbox at its host path (launchers may point symlinks at it).
@@ -705,21 +712,30 @@ parse_git_includes() {
             path_val="${config_dir}/${path_val}"
         fi
 
-        # Lexically normalise the path git will open (drop "." / ".." / "//"),
-        # then canonicalize it with realpath.  Canonicalize ALWAYS, not only
-        # when the last component is a symlink: a symlinked parent directory
-        # would otherwise hide the real target from _check_path_safe.
-        local visible resolved
-        _bwrap_normalize_path "${path_val}"
-        visible="${_BWRAP_NORMALIZED}"
+        # Canonicalize ALWAYS (realpath), not only when the last component is
+        # a symlink: a symlinked parent directory would otherwise hide the real
+        # target from _check_path_safe.  The path git itself will open (and
+        # therefore where the sandbox must provide the file) is worked out by
+        # _bwrap_include_visible_path, which does NOT collapse ".." lexically
+        # when that would change what the kernel resolves.
+        local visible resolved predirs
+        _bwrap_include_visible_path "${path_val}"
+        visible="${_BWRAP_INC_VISIBLE}"
+        predirs="${_BWRAP_INC_PREDIRS}"
         resolved="$(readlink -f "${path_val}" 2> /dev/null || true)"
         [[ -n "${resolved}" ]] || resolved="${visible}"
+        if [[ "${_BWRAP_INC_MISMATCH}" -eq 1 ]]; then
+            printf 'Warning: git include %s uses ".." after a symlinked directory; it is mounted\n' "${path_val}" >&2
+            printf '         at its real path (%s) only, so git may not find it in the sandbox.\n' "${resolved}" >&2
+            visible=""
+        fi
 
         # Deduplicate on the (canonical, visible) pair
         if [[ -e "${resolved}" ]] && [[ -z "${_GIT_INCLUDE_SEEN["${resolved}|${visible}"]:-}" ]]; then
             _GIT_INCLUDE_SEEN["${resolved}|${visible}"]=1
             GIT_INCLUDE_PATHS+=("${resolved}")
             GIT_INCLUDE_VISIBLE+=("${visible}")
+            GIT_INCLUDE_PREDIRS+=("${predirs}")
         fi
     done < "${config_file}"
 }
@@ -928,6 +944,55 @@ _bwrap_normalize_path() {
         esac
     done
     _BWRAP_NORMALIZED="/${out[*]}"
+}
+
+# _bwrap_include_visible_path RAW
+#   Work out where the sandbox must provide a git include so that git can open
+#   the path it computed (RAW, unnormalized).  Sets:
+#     _BWRAP_INC_VISIBLE   RAW with only "." and "//" collapsed
+#     _BWRAP_INC_PREDIRS   newline-separated directories that must exist so the
+#                          kernel can resolve each ".." in RAW
+#     _BWRAP_INC_MISMATCH  1 when a symlinked directory occurs before the last
+#                          ".." (the kernel then resolves ".." against the
+#                          symlink's TARGET, not lexically, so the visible
+#                          destination cannot be chosen lexically)
+#   ".." is applied lexically only when no symlinked directory precedes it,
+#   where lexical and physical resolution agree.  Directories walked before a
+#   ".." (for example ~/dotfiles in ~/dotfiles/../x.conf) are returned in
+#   _BWRAP_INC_PREDIRS because the kernel needs them to exist.  In the mismatch
+#   case the physical targets of the symlinked directories are returned too.
+_bwrap_include_visible_path() {
+    local raw="$1" part cur="" i last_dotdot=-1
+    local -a parts=() stack=()
+    local IFS=/
+    _BWRAP_INC_PREDIRS=""
+    _BWRAP_INC_MISMATCH=0
+    read -r -a parts <<< "${raw}"
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        [[ "${parts[i]}" == ".." ]] && last_dotdot=${i}
+    done
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        part="${parts[i]}"
+        case "${part}" in
+            '' | .) ;;
+            ..)
+                [[ ${#stack[@]} -gt 0 ]] && unset 'stack[${#stack[@]}-1]'
+                ;;
+            *)
+                stack+=("${part}")
+                cur="/${stack[*]}"
+                if [[ "${i}" -lt "${last_dotdot}" ]]; then
+                    if [[ -L "${cur}" ]]; then
+                        _BWRAP_INC_MISMATCH=1
+                        _BWRAP_INC_PREDIRS+="$(readlink -f -- "${cur}" 2> /dev/null || true)"$'\n'
+                    else
+                        _BWRAP_INC_PREDIRS+="${cur}"$'\n'
+                    fi
+                fi
+                ;;
+        esac
+    done
+    _BWRAP_INC_VISIBLE="/${stack[*]}"
 }
 
 # validate_extra_path RAW_PATH MODE
@@ -1448,6 +1513,14 @@ build_git_mounts() {
         inc_path="${GIT_INCLUDE_PATHS[${_i}]}"
         inc_visible="${GIT_INCLUDE_VISIBLE[${_i}]:-${inc_path}}"
         _check_path_safe "${inc_path}" "git include path"
+        # Directories the kernel must traverse to resolve ".." in the include
+        # path git opens (they hold no data; they only have to exist).
+        local _predir
+        while IFS= read -r _predir; do
+            [[ -n "${_predir}" && -z "${_GIT_INC_DIRS_SEEN["${_predir}"]:-}" ]] || continue
+            _GIT_INC_DIRS_SEEN["${_predir}"]=1
+            BWRAP_ARGS+=(--dir "${_predir}")
+        done <<< "${GIT_INCLUDE_PREDIRS[${_i}]:-}"
         if [[ -z "${_GIT_INC_BOUND["${inc_path}"]:-}" ]]; then
             _GIT_INC_BOUND["${inc_path}"]=1
             # Ensure parent directory exists as a mount point (deduplicated)

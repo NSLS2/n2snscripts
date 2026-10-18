@@ -118,7 +118,11 @@ cases.
   parent directory (for example `~/.config/opencode2 -> ~/.aws`) cannot hide a
   blocked target; such a setup is refused with an error. A git include reached
   through a symlinked directory is mounted at both its real path and the path
-  git opens.
+  git opens. `..` in an include path is not collapsed lexically, because the
+  kernel applies it to a symlink's target: directories the path walks through
+  before a `..` (for example `~/dotfiles` in `~/dotfiles/../x.conf`) are created
+  in the sandbox, and when a symlinked directory comes before a `..` the include
+  is mounted at its real path only, with a warning.
 - **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
   whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
   `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the

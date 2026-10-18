@@ -567,6 +567,22 @@ build_xdg_mirror_mounts() {
 # can authenticate gh(1) via per-command:
 #   GH_TOKEN="$GH_TOKEN_NSLS2" gh <subcommand>
 #
+# ── OpenCode 2 install directory (read-only) ─────────────────────
+# /usr/local/bin/opencode2 is a wrapper script (deployed by ansible) that runs
+# /opt/nsls2/opencode2/node_modules/@opencode/cli/bin/opencode.exe.  The
+# sandbox mounts /usr but not /opt, so without this mount the wrapper cannot
+# find the binary and exits with "binary not found or not executable".  The
+# path is fixed by the ansible base role.  Mounted read-only; nothing is bound
+# when the directory is absent (for example a plain opencode2 elsewhere on PATH).
+build_opencode2_install_mount() {
+    if [[ -d /opt/nsls2/opencode2 ]]; then
+        BWRAP_ARGS+=(
+            --dir /opt/nsls2
+            --ro-bind /opt/nsls2/opencode2 /opt/nsls2/opencode2
+        )
+    fi
+}
+
 # Must run AFTER build_env_vars: the XDG_* values set here override the
 # host pass-through from build_env_vars (bwrap --setenv: last one wins),
 # so OpenCode 2 uses its own directories even if `opencode2` on PATH is a
@@ -695,6 +711,7 @@ main() {
     build_xdg_mirror_mounts
     build_user_bin_mount
     build_nsls2_mount
+    build_opencode2_install_mount
     build_dynamic_tool_mounts
     build_extra_path_mounts
 
