@@ -145,7 +145,38 @@ cases.
   `~/.gitconfig` or an XDG git file). Symlinks outside `$HOME` (for example
   under `/etc`, where only selected entries are bound) are not recreated: the
   four XDG git files are then mounted at the host path of the symlinked
-  directory.
+  directory. A symlink that is itself the root of a directory mount (for
+  example `~/bin -> ~/dotfiles/bin`, bound as a plain directory at `~/bin`) is
+  not recreated either: the sandbox has a plain directory there, a warning is
+  printed and the lexical fallback above applies. A symlink strictly inside a
+  mounted tree (for example inside the working directory) keeps its host form
+  and needs nothing.
+- **Git includes are followed recursively.** `[include]` / `[includeIf]`
+  `path =` entries of `~/.gitconfig` and `${XDG_CONFIG_HOME}/git/config` are
+  followed through nested includes to a depth of 10 (git's own limit), each
+  file is read once (include loops terminate), and an included file that
+  resolves into a blocked location is neither read nor mounted (the launcher
+  refuses it). Distinct include paths as written each get their own traversal
+  directories (`~/first/../common.conf` and `~/second/../common.conf` both
+  work), even when they name the same file; identical mounts are emitted once.
+- **A directory that contains a blocked location is refused.** The working
+  directory (the git root when inside a repository), `--ro-path` and
+  `--rw-path` are checked on their canonical path: besides `$HOME`, its
+  ancestors and anything inside a blocked tree, a directory that contains a
+  blocked location that exists is refused with `Error: <context> '<dir>'
+  contains the blocked path '<path>'. Refusing to mount.` (for example running
+  from `~/.config` when `~/.config/gh` exists, or from a git root above
+  `~/.ssh`); blocked locations that do not exist are ignored. `bwopencode2`
+  also refuses a directory that equals or contains `~/.config/opencode2/opencode`
+  (for example `~/.config/opencode2`), because `service.json` there is
+  deliberately never mounted and a whole-directory bind would expose it.
+- **Known limitations of the git include handling.** `includeIf` conditions
+  are not evaluated, so every candidate include is mounted; includes configured
+  only through the environment or `git -c include.path=...` are not seen; include
+  chains deeper than 10 are ignored; unusual symlink layouts (for example a
+  symlink at a directory-bind root or under a path the launcher pre-creates)
+  fall back to a warning and a lexical mount, and git may still not find the
+  file.
 - **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
   whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
   `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the

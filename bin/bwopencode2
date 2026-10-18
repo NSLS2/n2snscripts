@@ -335,6 +335,10 @@ resolve_opencode2_paths() {
     OC2_XDG_STATE_HOME="${_HOME}/.local/state/opencode2"
     OC2_XDG_CACHE_HOME="${_HOME}/.cache/opencode2"
     OC2_CONFIG_DIR="${OC2_XDG_CONFIG_HOME}/opencode"
+    # The config directory holds service.json, which is never mounted: refuse
+    # a working directory / --ro-path / --rw-path that would bind it whole.
+    # shellcheck disable=SC2034  # read by _check_dir_contains_blocked in the library
+    EXTRA_BLOCKED_DIRS=("${OC2_CONFIG_DIR}")
     OC2_DATA_DIR="${OC2_XDG_DATA_HOME}/opencode"
     OC2_STATE_DIR="${OC2_XDG_STATE_HOME}/opencode"
     OC2_CACHE_DIR="${OC2_XDG_CACHE_HOME}/opencode"
