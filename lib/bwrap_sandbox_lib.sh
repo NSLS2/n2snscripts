@@ -161,17 +161,32 @@ detect_shell() {
     SANDBOX_SHELL="$(command -v bash 2> /dev/null || echo /bin/sh)"
 }
 
-# bwrap_find_tool TOOL
-#   Locate TOOL using PATH with exact, non-empty entries from
-#   N2SNSCRIPTS_TOOL_EXCLUDE_PATH removed.  This affects lookup only.
-bwrap_find_tool() {
-    if [[ -z "${N2SNSCRIPTS_TOOL_EXCLUDE_PATH:-}" ]]; then
-        command -v -- "$1"
-        return
+# bwrap_check_account
+#   Refuse to run for root and shared/service accounts.  The check itself is
+#   /opt/nsls2/libexec/agent-account-check, deployed by ansible: it prints a
+#   boxed refusal to stderr and exits non-zero for those accounts, and exits
+#   0 silently otherwise.  Every launcher calls this first in main().
+#   The path is deliberately hard-coded (not overridable from the environment,
+#   which would let a user point it at /bin/true).  When the script is not
+#   installed this is a no-op: hosts without the ansible deploy are still
+#   protected by the filesystem ACLs on the agent installs.
+bwrap_check_account() {
+    local _checker="/opt/nsls2/libexec/agent-account-check"
+    if [[ -f "${_checker}" && -x "${_checker}" ]]; then
+        "${_checker}" || exit $?
     fi
+}
 
+# _bwrap_filter_path
+#   Set _BWRAP_FILTERED_PATH to PATH with exact, non-empty entries from
+#   N2SNSCRIPTS_TOOL_EXCLUDE_PATH removed.  Returns 1 when every PATH entry
+#   was excluded (PATH="" would make command -v search the current dir).
+#   A no-op for callers when N2SNSCRIPTS_TOOL_EXCLUDE_PATH is unset: they
+#   should skip this function in that case.
+_BWRAP_FILTERED_PATH=""
+_bwrap_filter_path() {
     local _excluded_dir _path_dir _remaining_path="${PATH-}" _remaining_exclusions
-    local _filtered_path _has_separator _has_exclusion_separator _is_excluded _retained_count=0
+    local _has_separator _has_exclusion_separator _is_excluded _retained_count=0
     local -a _excluded_dirs=() _filtered_dirs=()
     local IFS=:
 
@@ -218,12 +233,56 @@ bwrap_find_tool() {
 
     # An empty retained entry is meaningful (it searches the current
     # directory), but an entirely filtered PATH must not become PATH="".
-    # command -v with that value would incorrectly search the current dir.
     [[ "${_retained_count}" -gt 0 ]] || return 1
 
-    _filtered_path="${_filtered_dirs[*]}"
-    local PATH="${_filtered_path}"
+    _BWRAP_FILTERED_PATH="${_filtered_dirs[*]}"
+}
+
+# bwrap_find_tool TOOL
+#   Locate TOOL using PATH with exact, non-empty entries from
+#   N2SNSCRIPTS_TOOL_EXCLUDE_PATH removed.  This affects lookup only.
+bwrap_find_tool() {
+    if [[ -z "${N2SNSCRIPTS_TOOL_EXCLUDE_PATH:-}" ]]; then
+        command -v -- "$1"
+        return
+    fi
+
+    _bwrap_filter_path || return 1
+    local PATH="${_BWRAP_FILTERED_PATH}"
     command -v -- "$1"
+}
+
+# bwrap_tool_is_denied NAME
+#   Return 0 when some directory in the (exclusion-filtered) PATH holds an
+#   entry called NAME that exists as a path or as a symlink but is NOT
+#   executable by the current user.  This is what a user sees when the agent
+#   install directory is ACL-denied: e.g. /usr/local/bin/copilot is a symlink
+#   whose target directory the user cannot traverse (-e false, -L true).
+#   Used by the launchers to print a clear "no access" message instead of a
+#   misleading "not found".
+bwrap_tool_is_denied() {
+    local _name="$1" _search_path="${PATH-}" _dir _candidate _has_separator
+    if [[ -n "${N2SNSCRIPTS_TOOL_EXCLUDE_PATH:-}" ]]; then
+        _bwrap_filter_path || return 1
+        _search_path="${_BWRAP_FILTERED_PATH}"
+    fi
+
+    while :; do
+        if [[ "${_search_path}" == *:* ]]; then
+            _has_separator=1
+            _dir="${_search_path%%:*}"
+            _search_path="${_search_path#*:}"
+        else
+            _has_separator=0
+            _dir="${_search_path}"
+        fi
+        _candidate="${_dir:-.}/${_name}"
+        if [[ -e "${_candidate}" || -L "${_candidate}" ]] && [[ ! -x "${_candidate}" ]]; then
+            return 0
+        fi
+        [[ "${_has_separator}" -eq 1 ]] || break
+    done
+    return 1
 }
 
 # ── Dynamic mount helpers ────────────────────────────────────────
@@ -1064,7 +1123,28 @@ build_git_mounts() {
     if [[ -d "${XDG_CONFIG_HOME}/git" ]]; then
         # XDG_CONFIG_HOME is already validated by resolve_common_paths;
         # no additional check needed here.
-        BWRAP_ARGS+=(--ro-bind "${XDG_CONFIG_HOME}/git" "${XDG_CONFIG_HOME}/git")
+        #
+        # The XDG git directory may hold "credentials": the default file of
+        # git's "store" credential helper (plaintext passwords/tokens).  The
+        # directory is bound read-only for config/ignore/attributes, so the
+        # credentials file must be masked with /dev/null on top of it.  A
+        # bind over a read-only bind needs bwrap >= 0.6.3
+        # (HAS_BIND_OVER_RO, same requirement as build_binary_masks).  On
+        # older bwrap we fail closed: do not mount the directory at all when
+        # a credentials file is present, and warn.
+        local _git_creds="${XDG_CONFIG_HOME}/git/credentials"
+        if [[ ! -e "${_git_creds}" && ! -L "${_git_creds}" ]]; then
+            BWRAP_ARGS+=(--ro-bind "${XDG_CONFIG_HOME}/git" "${XDG_CONFIG_HOME}/git")
+        elif [[ "${HAS_BIND_OVER_RO}" -eq 1 ]]; then
+            BWRAP_ARGS+=(
+                --ro-bind "${XDG_CONFIG_HOME}/git" "${XDG_CONFIG_HOME}/git"
+                --ro-bind /dev/null "${_git_creds}"
+            )
+        else
+            echo "Warning: ${XDG_CONFIG_HOME}/git/credentials exists and this bwrap" \
+                "is too old (< 0.6.3) to mask it; NOT mounting ${XDG_CONFIG_HOME}/git" \
+                "into the sandbox (git config there will be unavailable)." >&2
+        fi
     fi
 
     # Git include files (read-only).
@@ -1326,6 +1406,18 @@ _bwrap_flag_arity() {
     esac
 }
 
+# _is_secret_env_name NAME
+#   Return 0 if NAME looks like it holds a secret (case-insensitive match on
+#   KEY, TOKEN, PASSWORD, SECRET or CREDENTIAL).  Used only by print_dry_run
+#   to redact printed --setenv values; the real launch path never calls it.
+_is_secret_env_name() {
+    local _upper="${1^^}"
+    case "${_upper}" in
+        *KEY* | *TOKEN* | *PASSWORD* | *SECRET* | *CREDENTIAL*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 print_dry_run() {
     local _BWRAP_BIN _ENV_BIN
     _BWRAP_BIN="$(command -v bwrap)"
@@ -1352,7 +1444,14 @@ print_dry_run() {
         printf "    %s" "${arg}"
         i=$((i + 1))
         for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
-            printf " '%s'" "${BWRAP_ARGS[$i]}"
+            # Redact the VALUE of secret-looking --setenv variables (only the
+            # printed text changes; BWRAP_ARGS keeps the real values).
+            if [[ "${arg}" == "--setenv" && "${_j}" -eq 1 ]] &&
+                _is_secret_env_name "${BWRAP_ARGS[$((i - 1))]}"; then
+                printf " 'REDACTED'"
+            else
+                printf " '%s'" "${BWRAP_ARGS[$i]}"
+            fi
             i=$((i + 1))
         done
         printf " \\\\\n"

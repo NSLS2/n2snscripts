@@ -142,6 +142,10 @@ parse_wrapper_args() {
 resolve_tool_binary() {
     _TOOL_BIN="$(bwrap_find_tool opencode 2> /dev/null || true)"
     if [[ -z "${_TOOL_BIN}" ]]; then
+        if bwrap_tool_is_denied opencode; then
+            echo "Error: you do not have access to 'opencode' (it is restricted for shared/service accounts). Log in as yourself." >&2
+            exit 1
+        fi
         echo "Error: 'opencode' not found in PATH." >&2
         exit 1
     fi
@@ -383,8 +387,69 @@ build_opencode_cache_mount() {
 }
 
 # ── OpenCode env vars ────────────────────────────────────────────
-# Pass through any OPENCODE_* env vars (config overrides, etc.)
-# Also pass through AIFAPIM_* env vars for NSLS-II Hermes gateway.
+# Pass through an ALLOWLIST of harmless OPENCODE_* behaviour toggles, and
+# AIFAPIM_* env vars for the NSLS-II Hermes gateway.  Other host OPENCODE_*
+# variables are dropped: some are secrets (OPENCODE_SERVER_PASSWORD would
+# let the agent, which shares the host network, drive an unsandboxed
+# opencode server) and others redirect config/data/DB/model/server locations
+# or inject config (OPENCODE_CONFIG*, OPENCODE_PERMISSION) and so would
+# bypass the managed config.  In --dry-run the NAMES (never values) of
+# dropped variables are printed to stderr.
+#
+# Names were enumerated from the installed opencode v1 binary
+# (strings of OPENCODE_*) and the docs env-var table.  Add a name here only
+# if it is a pure on/off or numeric tuning toggle: never anything with
+# PASSWORD, TOKEN, SECRET, KEY, URL, PORT, SERVER, DB, HOME, CONFIG, PATH or
+# a *_CONTENT payload.
+_OPENCODE_ENV_ALLOWLIST=(
+    OPENCODE_ALWAYS_NOTIFY_UPDATE
+    OPENCODE_DISABLE_AUTOCOMPACT
+    OPENCODE_DISABLE_AUTOUPDATE
+    OPENCODE_DISABLE_CLAUDE_CODE
+    OPENCODE_DISABLE_CLAUDE_CODE_PROMPT
+    OPENCODE_DISABLE_CLAUDE_CODE_SKILLS
+    OPENCODE_DISABLE_DEFAULT_PLUGINS
+    OPENCODE_DISABLE_EMBEDDED_WEB_UI
+    OPENCODE_DISABLE_EXTERNAL_SKILLS
+    OPENCODE_DISABLE_FFF
+    OPENCODE_DISABLE_LSP_DOWNLOAD
+    OPENCODE_DISABLE_MODELS_FETCH
+    OPENCODE_DISABLE_MOUSE
+    OPENCODE_DISABLE_PROJECT_CONFIG
+    OPENCODE_DISABLE_PRUNE
+    OPENCODE_DISABLE_TERMINAL_TITLE
+    OPENCODE_ENABLE_EXA
+    OPENCODE_ENABLE_EXPERIMENTAL_MODELS
+    OPENCODE_ENABLE_PARALLEL
+    OPENCODE_ENABLE_QUESTION_TOOL
+    OPENCODE_EXPERIMENTAL
+    OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS
+    OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS
+    OPENCODE_EXPERIMENTAL_CODE_MODE
+    OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT
+    OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER
+    OPENCODE_EXPERIMENTAL_EVENT_SYSTEM
+    OPENCODE_EXPERIMENTAL_EXA
+    OPENCODE_EXPERIMENTAL_FILEWATCHER
+    OPENCODE_EXPERIMENTAL_ICON_DISCOVERY
+    OPENCODE_EXPERIMENTAL_LSP_TOOL
+    OPENCODE_EXPERIMENTAL_LSP_TY
+    OPENCODE_EXPERIMENTAL_NATIVE_LLM
+    OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX
+    OPENCODE_EXPERIMENTAL_OXFMT
+    OPENCODE_EXPERIMENTAL_PARALLEL
+    OPENCODE_EXPERIMENTAL_PLAN_MODE
+    OPENCODE_EXPERIMENTAL_REFERENCES
+    OPENCODE_EXPERIMENTAL_SCOUT
+    OPENCODE_EXPERIMENTAL_WEBSOCKETS
+    OPENCODE_EXPERIMENTAL_WORKSPACES
+    OPENCODE_FAST_BOOT
+    OPENCODE_LOG_LEVEL
+    OPENCODE_PRINT_LOGS
+    OPENCODE_PURE
+    OPENCODE_SHOW_TTFD
+)
+
 # With --github-tokens, also forward GH_TOKEN_* vars so the agent
 # can authenticate gh(1) via per-command:
 #   GH_TOKEN="$GH_TOKEN_NSLS2" gh <subcommand>
@@ -393,12 +458,28 @@ build_opencode_env() {
     pass_through_if_set AIFAPIM_HOST
     pass_through_if_set AIFAPIM_API_KEY
 
-    local _key
+    local _key _allowed _ok
+    local _dropped=()
     while IFS= read -r _key; do
         if [[ "${_key}" == OPENCODE_* ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+            _ok=0
+            for _allowed in "${_OPENCODE_ENV_ALLOWLIST[@]}"; do
+                if [[ "${_key}" == "${_allowed}" ]]; then
+                    _ok=1
+                    break
+                fi
+            done
+            if [[ "${_ok}" -eq 1 ]]; then
+                BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+            else
+                _dropped+=("${_key}")
+            fi
         fi
     done < <(compgen -e)
+
+    if [[ "${DRY_RUN}" -eq 1 && ${#_dropped[@]} -gt 0 ]]; then
+        echo "Note: dropped OPENCODE_* env vars not on the allowlist (names only): ${_dropped[*]}" >&2
+    fi
 
     # GitHub CLI token passthrough (opt-in via --github-tokens)
     # In --dry-run mode the value is replaced with REDACTED so that tokens
@@ -423,6 +504,7 @@ build_opencode_env() {
 # ═══════════════════════════════════════════════════════════════════
 
 main() {
+    bwrap_check_account
     parse_wrapper_args "$@"
     resolve_tool_binary
 

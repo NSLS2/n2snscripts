@@ -12,7 +12,8 @@
 #
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write
-#   - OpenCode 2 config (~/.config/opencode2/opencode): read-only (symlinks resolved)
+#   - OpenCode 2 config (~/.config/opencode2/opencode): read-only (symlinks resolved);
+#     service.json / service-*.json (background-service settings) are not mounted
 #   - OpenCode 2 data (~/.local/share/opencode2/opencode): read-write, the
 #     whole directory persists (database incl. saved sign-in, logs, ...)
 #   - OpenCode 2 cache (~/.cache/opencode2/opencode): read-write
@@ -25,7 +26,10 @@
 #     OpenCode 2 can never touch OpenCode 1 data (which it would migrate
 #     one way)
 #   - Git config + includes: read-only (also mirrored under the opencode2
-#     XDG config home, where git looks inside the sandbox)
+#     XDG config home, where git looks inside the sandbox; the mirrored
+#     git/credentials file is masked with /dev/null)
+#   - OPENCODE_* env vars: only an allowlist of harmless switches is passed
+#     (see build_opencode2_env); OPENCODE_SERVER_PASSWORD etc. are dropped
 #   - Pixi cache: read-write
 #   - Pixi config: read-only
 #   - ccache config: read-only
@@ -57,7 +61,8 @@
 #   --dry-run       Print the bwrap command that would be executed without running it.
 #   --exec CMD      Run CMD inside the sandbox instead of opencode2.
 #                   Useful for running one-off commands, scripts, or diagnostic tools
-#                   inside the fully-configured sandbox environment.
+#                   inside the fully-configured sandbox environment.  The command is
+#                   NOT subject to the --standalone argument guard (it is arbitrary).
 #   --new-session   Force bwrap --new-session even on kernels with the TIOCSTI cap
 #                   guard.  Detaches the controlling tty for stricter isolation at the
 #                   cost of SIGWINCH (terminal resize) propagation.
@@ -153,6 +158,10 @@ parse_wrapper_args() {
 resolve_tool_binary() {
     _TOOL_BIN="$(bwrap_find_tool opencode2 2> /dev/null || true)"
     if [[ -z "${_TOOL_BIN}" ]]; then
+        if bwrap_tool_is_denied opencode2; then
+            echo "Error: you do not have access to 'opencode2' (it is restricted for shared/service accounts). Log in as yourself." >&2
+            exit 1
+        fi
         echo "Error: 'opencode2' not found in PATH (OpenCode 2 is installed by ansible when base_opencode2_enable is true)." >&2
         exit 1
     fi
@@ -213,6 +222,13 @@ service that runs tools OUTSIDE the sandbox.  To keep tools sandboxed:
 Limitation: the first non-option argument is taken as the subcommand; options
 that take a value are only recognised for --session/-s, --prompt, --log-level
 and --completions.  Arguments after `--` are never inspected.
+
+--exec runs an arbitrary command and therefore bypasses this argument guard.
+
+Also kept out of the sandbox: service.json (service settings), all OPENCODE_*
+environment variables except a short allowlist of harmless switches (see
+docs/bw-wrappers.md; OPENCODE_SERVER_PASSWORD etc. are dropped), and the
+git credentials file under the mirrored XDG git directory.
 
 All other arguments are passed through to opencode2 unchanged.
 
@@ -370,6 +386,13 @@ resolve_config_symlinks() {
     local entry local_resolved
     for entry in "${OC2_CONFIG_DIR}"/*; do
         [[ -e "${entry}" ]] || continue
+        # service.json (or service-<hash>.json on other channels) holds the
+        # background-service settings, including `service set env KEY VALUE`
+        # values and the port.  The sandbox never runs the service, so the
+        # file is not mounted.
+        case "${entry##*/}" in
+            service*.json) continue ;;
+        esac
         if [[ -L "${entry}" ]]; then
             local_resolved="$(readlink -f "${entry}")"
         else
@@ -510,7 +533,19 @@ build_xdg_mirror_mounts() {
     # Skip the mirror when the host XDG dirs already ARE the opencode2 ones.
     if [[ "${XDG_CONFIG_HOME}" != "${_mirror_cfg}" ]]; then
         if [[ -d "${XDG_CONFIG_HOME}/git" ]]; then
-            BWRAP_ARGS+=(--ro-bind "${XDG_CONFIG_HOME}/git" "${_mirror_cfg}/git")
+            # The XDG git dir may hold `credentials` (the default file of git's
+            # `store` credential helper).  Mask it AFTER the parent bind
+            # (bwrap applies mounts in order); that needs bind-over-bind
+            # (bwrap >= 0.6.3).  Fail closed: without it, do not mirror at all.
+            if [[ -e "${XDG_CONFIG_HOME}/git/credentials" && "${HAS_BIND_OVER_RO}" -ne 1 ]]; then
+                printf 'bwopencode2: warning: bwrap is too old (< 0.6.3) to mask %s/git/credentials;\n' "${XDG_CONFIG_HOME}" >&2
+                printf '             not mirroring the XDG git config into the sandbox.\n' >&2
+            else
+                BWRAP_ARGS+=(--ro-bind "${XDG_CONFIG_HOME}/git" "${_mirror_cfg}/git")
+                if [[ -e "${XDG_CONFIG_HOME}/git/credentials" ]]; then
+                    BWRAP_ARGS+=(--ro-bind /dev/null "${_mirror_cfg}/git/credentials")
+                fi
+            fi
         fi
         if [[ -f "${XDG_CONFIG_HOME}/pixi/config.toml" ]]; then
             BWRAP_ARGS+=(
@@ -531,7 +566,17 @@ build_xdg_mirror_mounts() {
 }
 
 # ── OpenCode env vars ────────────────────────────────────────────
-# Pass through any OPENCODE_* env vars (config overrides, etc.)
+# Pass through ONLY the allowlisted OPENCODE_* env vars (harmless behaviour
+# switches).  Every other OPENCODE_* variable is dropped, because the
+# OpenCode 2 binary reads several sensitive ones, e.g.:
+#   OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD  password of a v2 server; the
+#       sandbox shares the host network, so holding it would let the agent
+#       connect to an UNSANDBOXED server (port 49374) and run tools outside
+#   OPENCODE_SSH_ASKPASS_TOKEN / _PORT, OPENCODE_EDITOR_SSE_PORT,
+#   OPENCODE_PTY_HANDOFF  host-side helper channels
+#   OPENCODE_DB, OPENCODE_TEST_HOME, OPENCODE_CONFIG*, OPENCODE_MODELS_PATH/URL
+#       redirect data/config/model sources outside the sandbox layout
+#   OPENCODE_API_KEY  credentials
 # Also pass through AIFAPIM_* env vars for NSLS-II Hermes gateway.
 # With --github-tokens, also forward GH_TOKEN_* vars so the agent
 # can authenticate gh(1) via per-command:
@@ -542,24 +587,49 @@ build_xdg_mirror_mounts() {
 # so OpenCode 2 uses its own directories even if `opencode2` on PATH is a
 # plain binary rather than the ansible wrapper.
 build_opencode2_env() {
+    # Allowlist of OPENCODE_* variables that may enter the sandbox.
+    # Do NOT add anything that carries a secret, a port, a file path or a URL.
+    local -a _OC2_ENV_ALLOWLIST=(
+        OPENCODE_DISABLE_AUTOUPDATE
+        OPENCODE_DISABLE_FILEWATCHER
+        OPENCODE_FILEWATCHER_DISABLE
+        OPENCODE_DISABLE_MODELS_FETCH
+        OPENCODE_DISABLE_CLAUDE_CODE
+        OPENCODE_DISABLE_CLAUDE_CODE_SKILLS
+        OPENCODE_DISABLE_FFF
+        OPENCODE_DISABLE_PROJECT_CONFIG
+        OPENCODE_LOG_LEVEL
+        OPENCODE_PRINT_LOGS
+    )
+
     # AIFAPIM gateway config
     pass_through_if_set AIFAPIM_HOST
-    # The API key is replaced with REDACTED in --dry-run output so that it is
-    # not printed to the terminal (pass_through_if_set would print it).
-    if [[ -n "${AIFAPIM_API_KEY:-}" ]]; then
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-            BWRAP_ARGS+=(--setenv AIFAPIM_API_KEY REDACTED)
-        else
-            BWRAP_ARGS+=(--setenv AIFAPIM_API_KEY "${AIFAPIM_API_KEY}")
-        fi
-    fi
+    # The API key is passed through unchanged; print_dry_run redacts the value
+    # of any --setenv whose name looks secret (KEY/TOKEN/PASSWORD/...).
+    pass_through_if_set AIFAPIM_API_KEY
 
-    local _key
+    local _key _allowed _name
+    local -a _dropped=()
     while IFS= read -r _key; do
-        if [[ "${_key}" == OPENCODE_* ]]; then
+        [[ "${_key}" == OPENCODE_* ]] || continue
+        _allowed=0
+        for _name in "${_OC2_ENV_ALLOWLIST[@]}"; do
+            if [[ "${_key}" == "${_name}" ]]; then
+                _allowed=1
+                break
+            fi
+        done
+        if [[ "${_allowed}" -eq 1 ]]; then
             BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+        else
+            _dropped+=("${_key}")
         fi
     done < <(compgen -e)
+
+    # Names only, never values.
+    if [[ "${DRY_RUN}" -eq 1 && ${#_dropped[@]} -gt 0 ]]; then
+        printf 'bwopencode2: dry-run: dropped host OPENCODE_* variables (not in allowlist): %s\n' "${_dropped[*]}" >&2
+    fi
 
     # GitHub CLI token passthrough (opt-in via --github-tokens)
     # In --dry-run mode the value is replaced with REDACTED so that tokens
@@ -593,6 +663,7 @@ build_opencode2_env() {
 # ═══════════════════════════════════════════════════════════════════
 
 main() {
+    bwrap_check_account
     parse_wrapper_args "$@"
     resolve_tool_binary
 

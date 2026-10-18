@@ -62,6 +62,39 @@ Every `bw*` wrapper accepts these options:
 
 Tool-specific options are listed in each wrapper's section below.
 
+## Account check
+
+Every `bw*` launcher runs `/opt/nsls2/libexec/agent-account-check` first
+(before parsing any option, including `--help` and `--dry-run`) when that
+script is installed (it is deployed by ansible). The script refuses root and
+members of the shared/service-account group with a boxed message on stderr and
+a non-zero exit status; the launcher exits with that status. The path is fixed
+and cannot be overridden from the environment. When the script is not
+installed nothing happens (the ACLs on the agent installs still apply). When
+the agent command exists on `PATH` but is not executable by you (for example
+because its install directory is ACL-denied), the launcher prints
+`Error: you do not have access to '<tool>' (it is restricted for
+shared/service accounts). Log in as yourself.` instead of "not found".
+
+## Credentials and secrets handling
+
+- **Git credentials are masked.** The host `${XDG_CONFIG_HOME}/git` directory
+  (default `~/.config/git`) is mounted read-only so git config, ignore, and
+  attributes work. If it contains a `credentials` file (the default file of
+  git's `store` credential helper, holding plaintext passwords or tokens),
+  that file is hidden by binding `/dev/null` over it. This needs
+  `bwrap` >= 0.6.3 (the same requirement as binary masking). On an older
+  `bwrap` the wrappers fail closed: when a `credentials` file exists they do
+  **not** mount the XDG git directory at all and print a warning to stderr.
+  `$HOME` itself is a tmpfs, so `~/.git-credentials` is never visible.
+  A credential helper that stores secrets elsewhere (for example
+  `credential.helper = store --file=PATH`, or a path pulled in through a git
+  `include`) is not covered; keep such files out of mounted locations.
+- **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
+  whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
+  `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the
+  printed text is redacted; the real launch passes the real values.
+
 ## `bwopencode`
 
 Launches [opencode](https://opencode.ai) inside a bubblewrap sandbox.
@@ -78,6 +111,38 @@ personal accounts).
 | Option | Description |
 | --- | --- |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+
+### `OPENCODE_*` environment allowlist
+
+Only an allowlist of harmless `OPENCODE_*` behaviour toggles (46 names) is
+forwarded from the host environment into the sandbox. **Behaviour change:**
+any other host `OPENCODE_*` variable is now dropped (previously all were
+passed). Sensitive or location-changing variables are deliberately excluded:
+`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` (the sandbox shares
+the host network, so an agent holding the password could drive an
+unsandboxed opencode server), `OPENCODE_API_KEY`, `OPENCODE_CONSOLE_TOKEN`,
+`OPENCODE_CONFIG*` / `OPENCODE_TUI_CONFIG` / `OPENCODE_PERMISSION` (inject
+config or permissions and bypass the managed config), `OPENCODE_AUTH_CONTENT`,
+`OPENCODE_DB` / `OPENCODE_*_DB`, `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH`,
+and path or URL overrides.
+
+Forwarded: `OPENCODE_DISABLE_{AUTOCOMPACT,AUTOUPDATE,CLAUDE_CODE,
+CLAUDE_CODE_PROMPT,CLAUDE_CODE_SKILLS,DEFAULT_PLUGINS,EMBEDDED_WEB_UI,
+EXTERNAL_SKILLS,FFF,LSP_DOWNLOAD,MODELS_FETCH,MOUSE,PROJECT_CONFIG,PRUNE,
+TERMINAL_TITLE}`, `OPENCODE_ENABLE_{EXA,EXPERIMENTAL_MODELS,PARALLEL,
+QUESTION_TOOL}`, `OPENCODE_EXPERIMENTAL`, the `OPENCODE_EXPERIMENTAL_*`
+feature flags listed in the `_OPENCODE_ENV_ALLOWLIST` array in
+`bin/bwopencode` (including `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`),
+`OPENCODE_ALWAYS_NOTIFY_UPDATE`, `OPENCODE_FAST_BOOT`, `OPENCODE_LOG_LEVEL`,
+`OPENCODE_PRINT_LOGS`, `OPENCODE_PURE`, and `OPENCODE_SHOW_TTFD`.
+`OPENCODE_DISABLE_PROJECT_CONFIG` only disables a repository's own
+`opencode.json` (stricter; it cannot override `/etc/opencode`).
+`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` is a numeric output limit; because
+its name contains `TOKEN`, `--dry-run` prints its value as `REDACTED` (the
+real value is passed). `AIFAPIM_HOST` and `AIFAPIM_API_KEY` are forwarded as
+before. With `--dry-run`, the **names** (never values) of dropped `OPENCODE_*`
+variables are printed to stderr. To permit another variable, add it to
+`_OPENCODE_ENV_ALLOWLIST` in `bin/bwopencode`.
 
 ## `bwopencode2`
 
@@ -127,7 +192,35 @@ Because `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` point at the opencode2 directorie
 the wrapper mirrors the host's `$XDG_CONFIG_HOME/git`, `pixi/config.toml`,
 `ccache` config, and `$XDG_CACHE_HOME/ccache` cache under the same relative
 location in the opencode2 directories so git, pixi, and ccache keep working.
-`~/.gitconfig` and other `$HOME`-relative files are unaffected.
+`~/.gitconfig` and other `$HOME`-relative files are unaffected. The mirrored
+`git/credentials` file (the default file of git's `store` credential helper) is
+masked with `/dev/null`, so git passwords stored there are not readable inside
+the sandbox. This needs bubblewrap >= 0.6.3 (bind over an existing bind); on an
+older bubblewrap the wrapper prints a warning and does not mirror the XDG git
+directory at all.
+
+### What is kept out of the sandbox
+
+- **`service.json`**: OpenCode 2 keeps background-service settings (including
+  values set with `service set env KEY VALUE`, and the port) in
+  `~/.config/opencode2/opencode/service.json` (other release channels may use
+  `service-<hash>.json`). Files matching `service*.json` are not mounted; the
+  rest of the config directory is.
+- **`OPENCODE_*` environment variables**: only this allowlist is passed
+  through; every other `OPENCODE_*` variable is dropped:
+  `OPENCODE_DISABLE_AUTOUPDATE`, `OPENCODE_DISABLE_FILEWATCHER`,
+  `OPENCODE_FILEWATCHER_DISABLE`, `OPENCODE_DISABLE_MODELS_FETCH`,
+  `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS`,
+  `OPENCODE_DISABLE_FFF`, `OPENCODE_DISABLE_PROJECT_CONFIG`,
+  `OPENCODE_LOG_LEVEL`, `OPENCODE_PRINT_LOGS`. The
+  variables that matter most are the server passwords (`OPENCODE_PASSWORD`,
+  `OPENCODE_SERVER_PASSWORD`): the sandbox shares the host network, so an agent
+  holding one could connect to an unsandboxed server on port 49374 and run
+  tools outside the sandbox. Others dropped include `OPENCODE_SSH_ASKPASS_*`,
+  `OPENCODE_EDITOR_SSE_PORT`, `OPENCODE_PTY_HANDOFF`, `OPENCODE_DB`,
+  `OPENCODE_TEST_HOME`, `OPENCODE_CONFIG*`, `OPENCODE_MODELS_PATH`/`_URL`, and
+  `OPENCODE_API_KEY`. With `--dry-run`, the names (never the values) of the
+  dropped host variables are printed to stderr.
 
 ### `--standalone` is enforced
 
@@ -148,7 +241,9 @@ execution to that unsandboxed server. `bwopencode2` therefore:
 The argument scan takes the first non-option argument as the subcommand; only
 `--session`/`-s`, `--prompt`, `--log-level`, and `--completions` are known to
 take a value, and nothing after `--` is inspected. `--exec` bypasses the scan
-because its arguments belong to the command you run. The config directory is
+by design: it runs an arbitrary command, whose arguments are not `opencode2`'s,
+so `bwopencode2 --exec 'opencode2 --server ...'` is not stopped (the host
+server password is no longer in the sandbox environment, see above). The config directory is
 read-only, so commands that write global config (for example `plugin add`)
 fail; edit config on the host.
 

@@ -148,6 +148,10 @@ parse_wrapper_args() {
 resolve_tool_binary() {
     _TOOL_BIN="$(bwrap_find_tool copilot 2> /dev/null || true)"
     if [[ -z "${_TOOL_BIN}" ]]; then
+        if bwrap_tool_is_denied copilot; then
+            echo "Error: you do not have access to 'copilot' (it is restricted for shared/service accounts). Log in as yourself." >&2
+            exit 1
+        fi
         echo "Error: 'copilot' not found in PATH." >&2
         echo "Install the standalone GitHub Copilot CLI from https://github.com/github/copilot-cli" >&2
         exit 1
@@ -424,6 +428,7 @@ build_copilot_env() {
 # ═══════════════════════════════════════════════════════════════════
 
 main() {
+    bwrap_check_account
     parse_wrapper_args "$@"
     resolve_tool_binary
 
