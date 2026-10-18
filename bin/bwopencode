@@ -95,6 +95,7 @@ parse_wrapper_args() {
                     echo "Error: --exec requires a command argument." >&2
                     exit 1
                 fi
+                # shellcheck disable=SC2034  # read by bwrap_resolve_tool in the library
                 TEST_CMD="$2"
                 shift 2
                 ;;
@@ -139,25 +140,6 @@ parse_wrapper_args() {
 # Find the absolute path to the opencode binary on the host so we do
 # not depend on PATH lookup inside the sandbox.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
-resolve_tool_binary() {
-    _TOOL_BIN="$(bwrap_find_tool opencode 2> /dev/null || true)"
-    if [[ -z "${_TOOL_BIN}" ]]; then
-        if bwrap_tool_is_denied opencode; then
-            echo "Error: you do not have access to 'opencode' (it is restricted for shared/service accounts). Log in as yourself." >&2
-            exit 1
-        fi
-        echo "Error: 'opencode' not found in PATH." >&2
-        exit 1
-    fi
-
-    if [[ -n "${TEST_CMD}" ]]; then
-        # Split TEST_CMD into array so multi-word commands work correctly.
-        read -ra _TOOL_CMD <<< "${TEST_CMD}"
-    else
-        _TOOL_CMD=("${_TOOL_BIN}")
-    fi
-}
-
 show_help() {
     cat << 'HELP_EOF'
 bwopencode — opencode inside a bubblewrap sandbox
@@ -244,22 +226,25 @@ ensure_host_dirs() {
 # bind the real file at the expected path.  This avoids exposing the
 # dotfiles tree inside the sandbox.
 #
-# Each resolved target is passed through _check_path_safe before being
-# added to OC_CONFIG_BINDS.  This blocks symlinks that point into
-# sensitive subtrees (e.g. ~/.config/opencode/creds -> ~/.aws/credentials).
+# Every path is canonicalized with realpath (readlink -f) and the canonical
+# result is passed through _check_path_safe before being added to
+# OC_CONFIG_BINDS.  This blocks symlinks that point into sensitive subtrees
+# (e.g. ~/.config/opencode/creds -> ~/.aws/credentials) and, because ALL
+# entries are canonicalized (not only symlinked ones), also a symlinked
+# PARENT directory (~/.config/opencode -> ~/.aws): bwrap's --ro-bind follows
+# the symlink, so the unresolved name alone would hide the real target.
 resolve_config_symlinks() {
     OC_CONFIG_BINDS=()
     [[ -d "${OC_CONFIG_DIR}" ]] || return 0
 
+    # The config directory itself may be (or sit under) a symlink.
+    _bwrap_canonicalize_safe "${OC_CONFIG_DIR}" "opencode config dir"
+
     local entry local_resolved
     for entry in "${OC_CONFIG_DIR}"/*; do
         [[ -e "${entry}" ]] || continue
-        if [[ -L "${entry}" ]]; then
-            local_resolved="$(readlink -f "${entry}")"
-        else
-            local_resolved="${entry}"
-        fi
-        _check_path_safe "${local_resolved}" "opencode config entry '${entry}'"
+        _bwrap_canonicalize_safe "${entry}" "opencode config entry '${entry}'"
+        local_resolved="${_BWRAP_CANON}"
         OC_CONFIG_BINDS+=("--ro-bind" "${local_resolved}" "${entry}")
     done
 }
@@ -506,7 +491,7 @@ build_opencode_env() {
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
-    resolve_tool_binary
+    bwrap_resolve_tool opencode
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help

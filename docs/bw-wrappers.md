@@ -70,11 +70,32 @@ script is installed (it is deployed by ansible). The script refuses root and
 members of the shared/service-account group with a boxed message on stderr and
 a non-zero exit status; the launcher exits with that status. The path is fixed
 and cannot be overridden from the environment. When the script is not
-installed nothing happens (the ACLs on the agent installs still apply). When
-the agent command exists on `PATH` but is not executable by you (for example
-because its install directory is ACL-denied), the launcher prints
-`Error: you do not have access to '<tool>' (it is restricted for
-shared/service accounts). Log in as yourself.` instead of "not found".
+installed nothing happens (the ACLs on the agent installs still apply).
+
+## Agent binary resolution
+
+After the account check every launcher resolves its agent command with the
+shared `bwrap_resolve_tool` library function and distinguishes three failures
+(each exits 1):
+
+- **Restricted.** The command on `PATH` is a symlink whose target directory
+  exists but cannot be entered by you (for example the ansible ACL that denies
+  shared/service accounts access to the agent package directory). The launcher
+  prints the same box as the ansible account check, without the two
+  documentation links and with an extra line naming the tool
+  (`'<tool>' is not available to this account.`). The box code in
+  `lib/bwrap_sandbox_lib.sh` mirrors
+  `roles/base/templates/agent-account-check.sh.j2` in NSLS2/ansible; the two
+  must be kept in step.
+- **Installed incorrectly.** The command is a dangling symlink, or a file that
+  is not executable:
+  `Error: '<tool>' is installed incorrectly (<path> points to a missing file or
+  is not executable). Ask your system administrator.`
+- **Not installed.** `Error: '<tool>' not found in PATH.` (plus an install
+  hint for `bwcopilot` and `bwopencode2`).
+
+Entries listed in `N2SNSCRIPTS_TOOL_EXCLUDE_PATH` are ignored in all three
+cases.
 
 ## Credentials and secrets handling
 
@@ -90,6 +111,14 @@ shared/service accounts). Log in as yourself.` instead of "not found".
   A credential helper that stores secrets elsewhere (for example
   `credential.helper = store --file=PATH`, or a path pulled in through a git
   `include`) is not covered; keep such files out of mounted locations.
+- **Paths are resolved before the blocked-path check.** Config entries and
+  config directories (`~/.config/opencode*`), git include files, and the XDG
+  `git`, `pixi/config.toml` and `ccache` locations are canonicalized with
+  `realpath` (`readlink -f`) before the blocked-path check, so a symlinked
+  parent directory (for example `~/.config/opencode2 -> ~/.aws`) cannot hide a
+  blocked target; such a setup is refused with an error. A git include reached
+  through a symlinked directory is mounted at both its real path and the path
+  git opens.
 - **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
   whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
   `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the
@@ -155,8 +184,8 @@ that must not be reachable from the sandbox.
 bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 ```
 
-Requires the `opencode2` command on `PATH`, which ansible installs when
-`base_opencode2_enable` is true.
+Requires the `opencode2` command on `PATH`, which the ansible base role
+installs.
 
 Accepts the common options above except `--init-auth`, plus `--github-tokens`
 (same behavior as `bwopencode`).
@@ -189,15 +218,22 @@ legacy `auth.json` is only an import source). State is not persisted, so the
 last-used model and prompt history are not remembered between sessions.
 
 Because `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` point at the opencode2 directories,
-the wrapper mirrors the host's `$XDG_CONFIG_HOME/git`, `pixi/config.toml`,
-`ccache` config, and `$XDG_CACHE_HOME/ccache` cache under the same relative
+the wrapper makes the host's `$XDG_CONFIG_HOME/git`, `pixi/config.toml`,
+`ccache` config, and `$XDG_CACHE_HOME/ccache` cache visible at the same relative
 location in the opencode2 directories so git, pixi, and ccache keep working.
-`~/.gitconfig` and other `$HOME`-relative files are unaffected. The mirrored
-`git/credentials` file (the default file of git's `store` credential helper) is
-masked with `/dev/null`, so git passwords stored there are not readable inside
-the sandbox. This needs bubblewrap >= 0.6.3 (bind over an existing bind); on an
-older bubblewrap the wrapper prints a warning and does not mirror the XDG git
-directory at all.
+These are symlinks to the host-path mounts the shared library already made, not
+second binds: git resolves a relative `[include] path = ../shared` against the
+directory of the config path as opened, so a bind at
+`~/.config/opencode2/git` would look for `~/.config/opencode2/shared` and
+silently skip the include, whereas through the symlink `..` resolves to the real
+parent (`~/.config`), where the include is mounted. The read-only mount and the
+`git/credentials` mask of the target apply automatically: that file (the default
+file of git's `store` credential helper) is masked with `/dev/null`, so git
+passwords stored there are not readable inside the sandbox. This needs
+bubblewrap >= 0.6.3 (bind over an existing bind); on an older bubblewrap the
+library prints a warning and does not mount the XDG git directory at all, so no
+symlink is created. `~/.gitconfig` and other `$HOME`-relative files are
+unaffected.
 
 ### What is kept out of the sandbox
 

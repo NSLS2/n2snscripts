@@ -6,8 +6,8 @@
 #   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 #
-# Requires the `opencode2` command (npm @opencode/cli), which ansible installs
-# when base_opencode2_enable is true.  OpenCode 2 is a separate product from
+# Requires the `opencode2` command (npm @opencode/cli), which the ansible base
+# role installs.  OpenCode 2 is a separate product from
 # OpenCode 1 (see bwopencode) and never shares its directories.
 #
 # The sandbox provides filesystem isolation:
@@ -155,25 +155,6 @@ parse_wrapper_args() {
 # Find the absolute path to the opencode2 binary on the host so we do
 # not depend on PATH lookup inside the sandbox.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
-resolve_tool_binary() {
-    _TOOL_BIN="$(bwrap_find_tool opencode2 2> /dev/null || true)"
-    if [[ -z "${_TOOL_BIN}" ]]; then
-        if bwrap_tool_is_denied opencode2; then
-            echo "Error: you do not have access to 'opencode2' (it is restricted for shared/service accounts). Log in as yourself." >&2
-            exit 1
-        fi
-        echo "Error: 'opencode2' not found in PATH (OpenCode 2 is installed by ansible when base_opencode2_enable is true)." >&2
-        exit 1
-    fi
-
-    if [[ -n "${TEST_CMD}" ]]; then
-        # Split TEST_CMD into array so multi-word commands work correctly.
-        read -ra _TOOL_CMD <<< "${TEST_CMD}"
-    else
-        _TOOL_CMD=("${_TOOL_BIN}")
-    fi
-}
-
 show_help() {
     cat << 'HELP_EOF'
 bwopencode2 — OpenCode 2 (opencode2) inside a bubblewrap sandbox
@@ -376,12 +357,19 @@ ensure_host_dirs() {
 # bind the real file at the expected path.  This avoids exposing the
 # dotfiles tree inside the sandbox.
 #
-# Each resolved target is passed through _check_path_safe before being
-# added to OC2_CONFIG_BINDS.  This blocks symlinks that point into
-# sensitive subtrees (e.g. config/creds -> ~/.aws/credentials).
+# Every path is canonicalized with realpath (readlink -f) and the canonical
+# result is passed through _check_path_safe before being added to
+# OC2_CONFIG_BINDS.  This blocks symlinks that point into sensitive subtrees
+# (e.g. config/creds -> ~/.aws/credentials) and, because ALL entries are
+# canonicalized (not only symlinked ones), also a symlinked PARENT directory
+# (~/.config/opencode2 -> ~/.aws): bwrap's --ro-bind follows the symlink, so
+# the unresolved name alone would hide the real target.
 resolve_config_symlinks() {
     OC2_CONFIG_BINDS=()
     [[ -d "${OC2_CONFIG_DIR}" ]] || return 0
+
+    # The config directory itself may be (or sit under) a symlink.
+    _bwrap_canonicalize_safe "${OC2_CONFIG_DIR}" "opencode2 config dir"
 
     local entry local_resolved
     for entry in "${OC2_CONFIG_DIR}"/*; do
@@ -393,12 +381,8 @@ resolve_config_symlinks() {
         case "${entry##*/}" in
             service*.json) continue ;;
         esac
-        if [[ -L "${entry}" ]]; then
-            local_resolved="$(readlink -f "${entry}")"
-        else
-            local_resolved="${entry}"
-        fi
-        _check_path_safe "${local_resolved}" "opencode2 config entry '${entry}'"
+        _bwrap_canonicalize_safe "${entry}" "opencode2 config entry '${entry}'"
+        local_resolved="${_BWRAP_CANON}"
         OC2_CONFIG_BINDS+=("--ro-bind" "${local_resolved}" "${entry}")
     done
 }
@@ -523,44 +507,45 @@ build_opencode2_state_dir() {
 # Inside the sandbox XDG_CONFIG_HOME and XDG_CACHE_HOME point at the
 # opencode2 directories, so git, pixi and ccache would no longer find
 # their configuration at the host locations the shared library mounts.
-# Mirror whatever the host has under its XDG config/cache home at the
-# same relative location under the opencode2 homes (read-only for
-# config, read-write for the ccache cache).  ~/.gitconfig and other
-# $HOME-relative files are unaffected.
+# Make whatever the host has under its XDG config/cache home visible at the
+# same relative location under the opencode2 homes.
+#
+# These are SYMLINKS to the host-path mounts the shared library already made
+# (build_git_mounts / build_pixi_mounts / build_ccache_mounts), not second
+# binds.  Why: git resolves a relative include (`path = ../shared`) against
+# the directory of the config path AS OPENED.  A bind of the git dir at
+# ~/.config/opencode2/git would make `../shared` resolve to
+# ~/.config/opencode2/shared (which does not exist) and git would silently
+# skip it.  Through a symlinked directory the kernel resolves `..` against
+# the real parent, so ~/.config/opencode2/git/../shared is the same file as
+# ~/.config/shared, where the library mounted the include.  The symlink also
+# inherits the read-only mount and the credentials mask of the target for
+# free.  Each symlink is created only when the library really mounted its
+# target (otherwise it would dangle).  Must run AFTER build_home_tmpfs and
+# the library mount builders (sets/reads _BWRAP_XDG_GIT_MOUNTED).
+# ~/.gitconfig and other $HOME-relative files are unaffected.
 build_xdg_mirror_mounts() {
     local _mirror_cfg="${OC2_XDG_CONFIG_HOME}"
 
     # Skip the mirror when the host XDG dirs already ARE the opencode2 ones.
     if [[ "${XDG_CONFIG_HOME}" != "${_mirror_cfg}" ]]; then
-        if [[ -d "${XDG_CONFIG_HOME}/git" ]]; then
-            # The XDG git dir may hold `credentials` (the default file of git's
-            # `store` credential helper).  Mask it AFTER the parent bind
-            # (bwrap applies mounts in order); that needs bind-over-bind
-            # (bwrap >= 0.6.3).  Fail closed: without it, do not mirror at all.
-            if [[ -e "${XDG_CONFIG_HOME}/git/credentials" && "${HAS_BIND_OVER_RO}" -ne 1 ]]; then
-                printf 'bwopencode2: warning: bwrap is too old (< 0.6.3) to mask %s/git/credentials;\n' "${XDG_CONFIG_HOME}" >&2
-                printf '             not mirroring the XDG git config into the sandbox.\n' >&2
-            else
-                BWRAP_ARGS+=(--ro-bind "${XDG_CONFIG_HOME}/git" "${_mirror_cfg}/git")
-                if [[ -e "${XDG_CONFIG_HOME}/git/credentials" ]]; then
-                    BWRAP_ARGS+=(--ro-bind /dev/null "${_mirror_cfg}/git/credentials")
-                fi
-            fi
+        if [[ "${_BWRAP_XDG_GIT_MOUNTED}" -eq 1 ]]; then
+            BWRAP_ARGS+=(--symlink "${XDG_CONFIG_HOME}/git" "${_mirror_cfg}/git")
         fi
+        # build_pixi_mounts binds exactly this file at its host path.
         if [[ -f "${XDG_CONFIG_HOME}/pixi/config.toml" ]]; then
-            BWRAP_ARGS+=(
-                --dir "${_mirror_cfg}/pixi"
-                --ro-bind "${XDG_CONFIG_HOME}/pixi/config.toml" "${_mirror_cfg}/pixi/config.toml"
-            )
+            BWRAP_ARGS+=(--dir "${_mirror_cfg}/pixi"
+                --symlink "${XDG_CONFIG_HOME}/pixi/config.toml" "${_mirror_cfg}/pixi/config.toml")
         fi
         # ccache config is only XDG-relative when the legacy ~/.ccache is absent.
+        # build_ccache_mounts binds it at its host path when it is a directory.
         if [[ "${CCACHE_CONFIG_DIR}" == "${XDG_CONFIG_HOME}/ccache" && -d "${CCACHE_CONFIG_DIR}" ]]; then
-            BWRAP_ARGS+=(--ro-bind "${CCACHE_CONFIG_DIR}" "${_mirror_cfg}/ccache")
+            BWRAP_ARGS+=(--symlink "${CCACHE_CONFIG_DIR}" "${_mirror_cfg}/ccache")
         fi
     fi
     if [[ "${XDG_CACHE_HOME}" != "${OC2_XDG_CACHE_HOME}" ]]; then
         if [[ "${CCACHE_CACHE_DIR}" == "${XDG_CACHE_HOME}/ccache" && -d "${CCACHE_CACHE_DIR}" ]]; then
-            BWRAP_ARGS+=(--bind "${CCACHE_CACHE_DIR}" "${OC2_XDG_CACHE_HOME}/ccache")
+            BWRAP_ARGS+=(--symlink "${CCACHE_CACHE_DIR}" "${OC2_XDG_CACHE_HOME}/ccache")
         fi
     fi
 }
@@ -665,7 +650,7 @@ build_opencode2_env() {
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
-    resolve_tool_binary
+    bwrap_resolve_tool opencode2 "OpenCode 2 is installed by the ansible base role."
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
