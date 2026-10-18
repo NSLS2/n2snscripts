@@ -26,8 +26,9 @@
 #     OpenCode 2 can never touch OpenCode 1 data (which it would migrate
 #     one way)
 #   - Git config + includes: read-only (also mirrored under the opencode2
-#     XDG config home, where git looks inside the sandbox; the mirrored
-#     git/credentials file is masked with /dev/null)
+#     XDG config home, where git looks inside the sandbox; only the
+#     allowed_signers, config, ignore and attributes files of git/ are
+#     mounted, never credentials)
 #   - OPENCODE_* env vars: only an allowlist of harmless switches is passed
 #     (see build_opencode2_env); OPENCODE_SERVER_PASSWORD etc. are dropped
 #   - Pixi cache: read-write
@@ -209,7 +210,7 @@ and --completions.  Arguments after `--` are never inspected.
 Also kept out of the sandbox: service.json (service settings), all OPENCODE_*
 environment variables except a short allowlist of harmless switches (see
 docs/bw-wrappers.md; OPENCODE_SERVER_PASSWORD etc. are dropped), and the
-git credentials file under the mirrored XDG git directory.
+git credentials file (only a few files of the XDG git directory are mounted).
 
 All other arguments are passed through to opencode2 unchanged.
 
@@ -518,18 +519,22 @@ build_opencode2_state_dir() {
 # ~/.config/opencode2/shared (which does not exist) and git would silently
 # skip it.  Through a symlinked directory the kernel resolves `..` against
 # the real parent, so ~/.config/opencode2/git/../shared is the same file as
-# ~/.config/shared, where the library mounted the include.  The symlink also
-# inherits the read-only mount and the credentials mask of the target for
-# free.  Each symlink is created only when the library really mounted its
-# target (otherwise it would dangle).  Must run AFTER build_home_tmpfs and
-# the library mount builders (sets/reads _BWRAP_XDG_GIT_MOUNTED).
+# ~/.config/shared, where the library mounted the include.  The library
+# mounts only allowed_signers, config, ignore and attributes of the host git
+# directory (read-only, never the directory itself, so "credentials" and any
+# file created on the host later stay invisible); the symlink exposes just
+# those.  If the host git directory is itself a symlink the library recreates
+# it, so the mirror still resolves through it.  Each symlink is created only
+# when the library really mounted its target (otherwise it would dangle).
+# Must run AFTER build_home_tmpfs and the library mount builders (reads
+# _BWRAP_XDG_GIT_HAS_FILES).
 # ~/.gitconfig and other $HOME-relative files are unaffected.
 build_xdg_mirror_mounts() {
     local _mirror_cfg="${OC2_XDG_CONFIG_HOME}"
 
     # Skip the mirror when the host XDG dirs already ARE the opencode2 ones.
     if [[ "${XDG_CONFIG_HOME}" != "${_mirror_cfg}" ]]; then
-        if [[ "${_BWRAP_XDG_GIT_MOUNTED}" -eq 1 ]]; then
+        if [[ "${_BWRAP_XDG_GIT_HAS_FILES}" -eq 1 ]]; then
             BWRAP_ARGS+=(--symlink "${XDG_CONFIG_HOME}/git" "${_mirror_cfg}/git")
         fi
         # build_pixi_mounts binds exactly this file at its host path.

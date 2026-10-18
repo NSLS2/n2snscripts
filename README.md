@@ -101,15 +101,15 @@ Common wrapper options:
 `bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
 persists in its data directory), always runs OpenCode 2 with `--standalone`
 (`--exec` bypasses that guard by design), passes only an allowlist of
-`OPENCODE_*` environment variables, does not mount `service.json`, and masks
-the mirrored git `credentials` file; see [docs/bw-wrappers.md](docs/bw-wrappers.md). See each script's `--help` for
+`OPENCODE_*` environment variables, does not mount `service.json`, and never mounts
+the git `credentials` file; see [docs/bw-wrappers.md](docs/bw-wrappers.md). See each script's `--help` for
 the authoritative option list.
 
 Security notes: every launcher runs `/opt/nsls2/libexec/agent-account-check`
 first when installed (refuses root and shared/service accounts);
 `bwopencode` forwards only an allowlist of `OPENCODE_*` behaviour toggles (all
-other host `OPENCODE_*` variables are dropped); `${XDG_CONFIG_HOME}/git/credentials`
-is masked inside every sandbox; and `--dry-run` prints values of secret-looking
+other host `OPENCODE_*` variables are dropped); only `allowed_signers`, `config`, `ignore` and `attributes` of
+`${XDG_CONFIG_HOME}/git` are mounted in every sandbox (never `credentials`); and `--dry-run` prints values of secret-looking
 `--setenv` variables (names containing `KEY`, `TOKEN`, `PASSWORD`, `SECRET`, or
 `CREDENTIAL`) as `REDACTED`. See `docs/bw-wrappers.md`.
 

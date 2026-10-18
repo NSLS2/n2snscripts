@@ -89,9 +89,10 @@ KERNEL_HAS_TIOCSTI_CAP_GUARD=0
 # Git include tracking (used by parse_git_includes).
 # GIT_INCLUDE_PATHS holds the CANONICAL (realpath) include files;
 # GIT_INCLUDE_VISIBLE holds, at the same index, the path git itself will
-# open (the lexically normalised path as computed from the config file's
-# own location).  They differ when a parent directory of the include is a
-# symlink; build_git_mounts then mounts the content at both paths.
+# open once every symlinked directory that precedes a ".." has been
+# resolved physically (see _bwrap_include_visible_path).  They differ when a
+# parent directory of the include is a symlink; build_git_mounts then mounts
+# the content at both paths.
 declare -A _GIT_INCLUDE_SEEN=()
 GIT_INCLUDE_PATHS=()
 GIT_INCLUDE_VISIBLE=()
@@ -99,18 +100,30 @@ GIT_INCLUDE_VISIBLE=()
 # directories that must exist in the sandbox so git can resolve ".." in the
 # include path it opens (see _bwrap_include_visible_path).
 GIT_INCLUDE_PREDIRS=()
+# GIT_INCLUDE_LINKS: at the same index, a newline-separated list of symlinked
+# directories that precede a ".." in the include path.  The sandbox $HOME is
+# a tmpfs, so build_git_mounts recreates them with --symlink; the kernel then
+# resolves ".." against the symlink target exactly as it does on the host.
+GIT_INCLUDE_LINKS=()
 
-# Result of _bwrap_canonicalize_safe / _bwrap_normalize_path (globals,
-# because _check_path_safe calls exit and must not run in a subshell).
+# Results of _bwrap_canonicalize_safe / _bwrap_include_visible_path /
+# _bwrap_path_blocked (globals, because _check_path_safe calls exit and must
+# not run in a subshell).
 _BWRAP_CANON=""
-_BWRAP_NORMALIZED=""
 _BWRAP_INC_VISIBLE=""
 _BWRAP_INC_PREDIRS=""
-_BWRAP_INC_MISMATCH=0
+_BWRAP_INC_LINKS=""
+_BWRAP_BLOCKED_KIND=""
+_BWRAP_BLOCKED_PREFIX=""
 
-# Set to 1 by build_git_mounts when ${XDG_CONFIG_HOME}/git is actually
-# mounted in the sandbox at its host path (launchers may point symlinks at it).
-_BWRAP_XDG_GIT_MOUNTED=0
+# Symlinks already handled by _bwrap_git_recreate_link: path -> 0 (present or
+# recreated in the sandbox) / 1 (could not be recreated).
+declare -A _GIT_LINK_STATUS=()
+
+# Set to 1 by build_git_mounts when at least one file of
+# ${XDG_CONFIG_HOME}/git was mounted (launchers may point symlinks at the
+# directory; it is only guaranteed to resolve in the sandbox in that case).
+_BWRAP_XDG_GIT_HAS_FILES=0
 
 # Working directory state (set by build_workdir_mount)
 _BIND_DIR=""
@@ -716,19 +729,15 @@ parse_git_includes() {
         # a symlink: a symlinked parent directory would otherwise hide the real
         # target from _check_path_safe.  The path git itself will open (and
         # therefore where the sandbox must provide the file) is worked out by
-        # _bwrap_include_visible_path, which does NOT collapse ".." lexically
-        # when that would change what the kernel resolves.
-        local visible resolved predirs
+        # _bwrap_include_visible_path, which also reports the symlinked
+        # directories before a ".." that build_git_mounts must recreate.
+        local visible resolved predirs links
         _bwrap_include_visible_path "${path_val}"
         visible="${_BWRAP_INC_VISIBLE}"
         predirs="${_BWRAP_INC_PREDIRS}"
+        links="${_BWRAP_INC_LINKS}"
         resolved="$(readlink -f "${path_val}" 2> /dev/null || true)"
         [[ -n "${resolved}" ]] || resolved="${visible}"
-        if [[ "${_BWRAP_INC_MISMATCH}" -eq 1 ]]; then
-            printf 'Warning: git include %s uses ".." after a symlinked directory; it is mounted\n' "${path_val}" >&2
-            printf '         at its real path (%s) only, so git may not find it in the sandbox.\n' "${resolved}" >&2
-            visible=""
-        fi
 
         # Deduplicate on the (canonical, visible) pair
         if [[ -e "${resolved}" ]] && [[ -z "${_GIT_INCLUDE_SEEN["${resolved}|${visible}"]:-}" ]]; then
@@ -736,6 +745,7 @@ parse_git_includes() {
             GIT_INCLUDE_PATHS+=("${resolved}")
             GIT_INCLUDE_VISIBLE+=("${visible}")
             GIT_INCLUDE_PREDIRS+=("${predirs}")
+            GIT_INCLUDE_LINKS+=("${links}")
         fi
     done < "${config_file}"
 }
@@ -746,7 +756,13 @@ parse_all_git_includes() {
         parse_git_includes "${_HOME}/.gitconfig"
     fi
     if [[ -f "${XDG_CONFIG_HOME}/git/config" ]]; then
-        parse_git_includes "${XDG_CONFIG_HOME}/git/config"
+        # A config that resolves into a blocked location is not mounted
+        # (see _bwrap_mount_xdg_git_files), so its includes are not followed.
+        local _xdg_cfg_real
+        _xdg_cfg_real="$(readlink -f "${XDG_CONFIG_HOME}/git/config" 2> /dev/null || true)"
+        if [[ -z "${_xdg_cfg_real}" ]] || ! _bwrap_path_blocked "${_xdg_cfg_real}"; then
+            parse_git_includes "${XDG_CONFIG_HOME}/git/config"
+        fi
     fi
 }
 
@@ -771,6 +787,66 @@ _is_prefix_of() {
     # a="/" matches every absolute path; otherwise b must equal a or sit
     # directly beneath it (a/...).
     [[ "${a}" == "/" || "${b}" == "${a}" || "${b}" == "${a}/"* ]]
+}
+
+# _bwrap_path_blocked CANON
+#   Non-exiting form of the check below: return 0 (true) when the canonical
+#   path CANON is blocked, 1 otherwise.  On a hit, _BWRAP_BLOCKED_KIND is
+#   "home" (CANON is $HOME or an ancestor of it) or "prefix" (CANON is inside
+#   the sensitive subtree _BWRAP_BLOCKED_PREFIX).  Used directly where a
+#   blocked entry is skipped with a warning instead of aborting the launcher,
+#   and by _check_path_safe, which prints the error and exits.
+_bwrap_path_blocked() {
+    local canon="$1"
+    _BWRAP_BLOCKED_KIND=""
+    _BWRAP_BLOCKED_PREFIX=""
+
+    # Reject if canon IS $HOME or is a directory that contains $HOME
+    # (i.e. /, /home, the username's parent dir, etc.).
+    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.
+    if _is_prefix_of "${canon}" "${_HOME}"; then
+        _BWRAP_BLOCKED_KIND="home"
+        return 0
+    fi
+
+    # XDG_DATA_HOME is set by resolve_common_paths, which is always called
+    # before any function that invokes this check.
+    local _blocked_prefix
+    local _BLOCKED_PREFIXES=(
+        # SSH / GPG / cloud keys
+        "${_HOME}/.ssh"
+        "${_HOME}/.gnupg"
+        "${_HOME}/.aws"
+        "${_HOME}/.kube"
+        "${_HOME}/.docker"
+        # Package-manager credentials
+        "${_HOME}/.netrc"
+        "${_HOME}/.pypirc"
+        "${_HOME}/.rattler"
+        "${_HOME}/.yarnrc"
+        "${_HOME}/.yarnrc.yml"
+        "${_HOME}/.yarn"
+        "${XDG_DATA_HOME}/uv/credentials"
+        # Password managers
+        "${_HOME}/.password-store"   # pass / gopass encrypted secret store
+        "${_HOME}/.config/1Password" # 1Password CLI session/config
+        "${_HOME}/.config/op"        # 1Password CLI (alternate path)
+        # GitHub CLI tokens
+        "${_HOME}/.config/gh"
+        # System
+        "/root"
+        "/etc/shadow"
+        "/etc/sudoers"
+        "/etc/sudoers.d"
+    )
+    for _blocked_prefix in "${_BLOCKED_PREFIXES[@]}"; do
+        if _is_prefix_of "${_blocked_prefix}" "${canon}"; then
+            _BWRAP_BLOCKED_KIND="prefix"
+            _BWRAP_BLOCKED_PREFIX="${_blocked_prefix}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # _check_path_safe CANON CONTEXT
@@ -836,54 +912,16 @@ _check_path_safe() {
     local canon="$1"
     local context="$2"
 
-    # ── Ancestor-of-home check ───────────────────────────────────
-    # Reject if canon IS $HOME or is a directory that contains $HOME
-    # (i.e. /, /home, the username's parent dir, etc.).
-    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.
-    if _is_prefix_of "${canon}" "${_HOME}"; then
-        echo "Error: ${context} '${canon}' is \$HOME or an ancestor of \$HOME." >&2
-        echo "       Refusing to mount — this would expose the entire home tree." >&2
+    if _bwrap_path_blocked "${canon}"; then
+        if [[ "${_BWRAP_BLOCKED_KIND}" == "home" ]]; then
+            echo "Error: ${context} '${canon}' is \$HOME or an ancestor of \$HOME." >&2
+            echo "       Refusing to mount — this would expose the entire home tree." >&2
+        else
+            echo "Error: ${context} '${canon}' is inside the blocked path '${_BWRAP_BLOCKED_PREFIX}'." >&2
+            echo "       Refusing to mount." >&2
+        fi
         exit 1
     fi
-
-    # ── Sensitive-subtree checks ─────────────────────────────────
-    # XDG_DATA_HOME is set by resolve_common_paths, which is always called
-    # before any function that invokes _check_path_safe.
-    local _blocked_prefix
-    local _BLOCKED_PREFIXES=(
-        # SSH / GPG / cloud keys
-        "${_HOME}/.ssh"
-        "${_HOME}/.gnupg"
-        "${_HOME}/.aws"
-        "${_HOME}/.kube"
-        "${_HOME}/.docker"
-        # Package-manager credentials
-        "${_HOME}/.netrc"
-        "${_HOME}/.pypirc"
-        "${_HOME}/.rattler"
-        "${_HOME}/.yarnrc"
-        "${_HOME}/.yarnrc.yml"
-        "${_HOME}/.yarn"
-        "${XDG_DATA_HOME}/uv/credentials"
-        # Password managers
-        "${_HOME}/.password-store"   # pass / gopass encrypted secret store
-        "${_HOME}/.config/1Password" # 1Password CLI session/config
-        "${_HOME}/.config/op"        # 1Password CLI (alternate path)
-        # GitHub CLI tokens
-        "${_HOME}/.config/gh"
-        # System
-        "/root"
-        "/etc/shadow"
-        "/etc/sudoers"
-        "/etc/sudoers.d"
-    )
-    for _blocked_prefix in "${_BLOCKED_PREFIXES[@]}"; do
-        if _is_prefix_of "${_blocked_prefix}" "${canon}"; then
-            echo "Error: ${context} '${canon}' is inside the blocked path '${_blocked_prefix}'." >&2
-            echo "       Refusing to mount." >&2
-            exit 1
-        fi
-    done
 }
 
 # _check_dir_safe PATH CONTEXT
@@ -928,45 +966,29 @@ _bwrap_canonicalize_safe() {
     _check_path_safe "${_BWRAP_CANON}" "${context}"
 }
 
-# _bwrap_normalize_path PATH
-#   Purely lexical normalisation of an absolute path (collapses "//", "."
-#   and "..") without touching the filesystem.  Result in _BWRAP_NORMALIZED.
-_bwrap_normalize_path() {
-    local path="$1" part
-    local -a parts=() out=()
-    local IFS=/
-    read -r -a parts <<< "${path}"
-    for part in "${parts[@]+"${parts[@]}"}"; do
-        case "${part}" in
-            '' | .) ;;
-            ..) [[ ${#out[@]} -gt 0 ]] && unset 'out[${#out[@]}-1]' ;;
-            *) out+=("${part}") ;;
-        esac
-    done
-    _BWRAP_NORMALIZED="/${out[*]}"
-}
-
 # _bwrap_include_visible_path RAW
 #   Work out where the sandbox must provide a git include so that git can open
-#   the path it computed (RAW, unnormalized).  Sets:
-#     _BWRAP_INC_VISIBLE   RAW with only "." and "//" collapsed
-#     _BWRAP_INC_PREDIRS   newline-separated directories that must exist so the
-#                          kernel can resolve each ".." in RAW
-#     _BWRAP_INC_MISMATCH  1 when a symlinked directory occurs before the last
-#                          ".." (the kernel then resolves ".." against the
-#                          symlink's TARGET, not lexically, so the visible
-#                          destination cannot be chosen lexically)
-#   ".." is applied lexically only when no symlinked directory precedes it,
-#   where lexical and physical resolution agree.  Directories walked before a
-#   ".." (for example ~/dotfiles in ~/dotfiles/../x.conf) are returned in
-#   _BWRAP_INC_PREDIRS because the kernel needs them to exist.  In the mismatch
-#   case the physical targets of the symlinked directories are returned too.
+#   the path it computed (RAW, not normalised).  Sets:
+#     _BWRAP_INC_VISIBLE  the path as the kernel resolves it on the host:
+#                         every component up to the LAST ".." is resolved
+#                         physically (a symlinked directory is replaced by its
+#                         target, so ".." means the parent of the TARGET, as
+#                         on the host); components after it are kept as named
+#     _BWRAP_INC_PREDIRS  newline-separated directories the kernel walks
+#                         before the last ".." (they hold no data; they only
+#                         have to exist in the sandbox)
+#     _BWRAP_INC_LINKS    newline-separated symlinked directories met before
+#                         the last ".."; the sandbox must provide them as
+#                         symlinks (build_git_mounts recreates them) for the
+#                         kernel to resolve ".." the same way there
+#   Without a symlinked directory before a ".." this equals the lexical
+#   normalisation of RAW and _BWRAP_INC_LINKS is empty.
 _bwrap_include_visible_path() {
-    local raw="$1" part cur="" i last_dotdot=-1
-    local -a parts=() stack=()
+    local raw="$1" part cand phys="/" tail="" i last_dotdot=-1
+    local -a parts=()
     local IFS=/
     _BWRAP_INC_PREDIRS=""
-    _BWRAP_INC_MISMATCH=0
+    _BWRAP_INC_LINKS=""
     read -r -a parts <<< "${raw}"
     for ((i = 0; i < ${#parts[@]}; i++)); do
         [[ "${parts[i]}" == ".." ]] && last_dotdot=${i}
@@ -976,23 +998,28 @@ _bwrap_include_visible_path() {
         case "${part}" in
             '' | .) ;;
             ..)
-                [[ ${#stack[@]} -gt 0 ]] && unset 'stack[${#stack[@]}-1]'
+                # phys is physical, so its parent is the physical parent
+                [[ "${phys}" == "/" ]] || phys="${phys%/*}"
+                [[ -n "${phys}" ]] || phys="/"
                 ;;
             *)
-                stack+=("${part}")
-                cur="/${stack[*]}"
                 if [[ "${i}" -lt "${last_dotdot}" ]]; then
-                    if [[ -L "${cur}" ]]; then
-                        _BWRAP_INC_MISMATCH=1
-                        _BWRAP_INC_PREDIRS+="$(readlink -f -- "${cur}" 2> /dev/null || true)"$'\n'
+                    cand="${phys%/}/${part}"
+                    if [[ -L "${cand}" ]]; then
+                        _BWRAP_INC_LINKS+="${cand}"$'\n'
+                        phys="$(readlink -f -- "${cand}" 2> /dev/null || true)"
+                        [[ -n "${phys}" ]] || phys="${cand}"
                     else
-                        _BWRAP_INC_PREDIRS+="${cur}"$'\n'
+                        phys="${cand}"
                     fi
+                    _BWRAP_INC_PREDIRS+="${phys}"$'\n'
+                else
+                    tail+="/${part}"
                 fi
                 ;;
         esac
     done
-    _BWRAP_INC_VISIBLE="/${stack[*]}"
+    _BWRAP_INC_VISIBLE="${phys%/}${tail}"
 }
 
 # validate_extra_path RAW_PATH MODE
@@ -1454,6 +1481,111 @@ build_workdir_mount() {
 }
 
 # ── Git config (read-only) ──────────────────────────────────────
+
+# _bwrap_already_mounted PATH
+#   Return 0 when PATH lies inside a tree that is present in the sandbox with
+#   its host content (symlinks included): the standard system trees, the
+#   working directory, and the pixi / ccache / npm / ~/bin / registered
+#   mounts.  Anything else under the tmpfs $HOME is NOT present.
+_bwrap_already_mounted() {
+    local path="$1" _m
+    for _m in /usr /bin /sbin /lib /lib64 /etc /nsls2/software/bin \
+            "${_BIND_DIR}" "${PIXI_HOME_DIR}" "${CCACHE_CONFIG_DIR}" \
+            "${CCACHE_CACHE_DIR}" "${NPM_CACHE_DIR}" "${_HOME}/bin"; do
+        [[ -n "${_m}" ]] || continue
+        _is_prefix_of "${_m}" "${path}" && return 0
+    done
+    if [[ ${#_MOUNTED_PREFIXES[@]} -gt 0 ]]; then
+        for _m in "${!_MOUNTED_PREFIXES[@]}"; do
+            _is_prefix_of "${_m}" "${path}" && return 0
+        done
+    fi
+    return 1
+}
+
+# _bwrap_git_recreate_link LINK
+#   Make the symlinked directory LINK exist in the sandbox.  The sandbox
+#   $HOME is a tmpfs, so a symlink under $HOME is lost; without it the kernel
+#   resolves ".." in a git include path differently than on the host.  Emits
+#   --symlink <real target> LINK (after the --dir ancestors) once per LINK.
+#   Return 0 when LINK is present (already mounted, or recreated), 1 when it
+#   cannot be: outside $HOME and not inside a mounted tree, dangling, or LINK
+#   or its target inside a blocked location (warned about; never linked).
+_bwrap_git_recreate_link() {
+    local link="$1" target
+    if [[ -n "${_GIT_LINK_STATUS["${link}"]:-}" ]]; then
+        return "${_GIT_LINK_STATUS["${link}"]}"
+    fi
+    _GIT_LINK_STATUS["${link}"]=1
+    if _bwrap_already_mounted "${link}"; then
+        _GIT_LINK_STATUS["${link}"]=0
+        return 0
+    fi
+    [[ "${link}" == "${_HOME}"/* ]] || return 1
+    target="$(readlink -f -- "${link}" 2> /dev/null || true)"
+    [[ -n "${target}" && -d "${target}" ]] || return 1
+    if _bwrap_path_blocked "${link}" || _bwrap_path_blocked "${target}"; then
+        echo "Warning: symlink ${link} resolves into a blocked location (${target}); not recreated." >&2
+        return 1
+    fi
+    _emit_home_intermediate_dirs "${link}"
+    BWRAP_ARGS+=(--symlink "${target}" "${link}")
+    _GIT_LINK_STATUS["${link}"]=0
+    return 0
+}
+
+# _bwrap_mount_xdg_git_files
+#   Mount ONLY allowed_signers, config, ignore and attributes of
+#   ${XDG_CONFIG_HOME}/git, each read-only and only when present.  The
+#   directory itself is never bound: anything else in it (the "store"
+#   credential helper's "credentials" file included) is never mounted, and a
+#   file created on the host later never appears in the sandbox.  A file (or
+#   the whole directory) that resolves into a blocked location is skipped
+#   with a warning; a dangling symlink is skipped silently.  When the
+#   directory is itself a symlink it is recreated as one and the files are
+#   mounted at its real target, so ".." in includes resolves as on the host.
+#   Sets _BWRAP_XDG_GIT_HAS_FILES=1 when at least one file was mounted.
+_bwrap_mount_xdg_git_files() {
+    local gdir="${XDG_CONFIG_HOME}/git" gdir_real dest_dir name f f_real
+    local -a names=() reals=()
+    _BWRAP_XDG_GIT_HAS_FILES=0
+    [[ -d "${gdir}" ]] || return 0
+    gdir_real="$(readlink -f -- "${gdir}" 2> /dev/null || true)"
+    [[ -n "${gdir_real}" ]] || return 0
+    if _bwrap_path_blocked "${gdir_real}"; then
+        echo "Warning: ${gdir} resolves into a blocked location (${gdir_real}); not mounted." >&2
+        return 0
+    fi
+    for name in allowed_signers config ignore attributes; do
+        f="${gdir}/${name}"
+        [[ -e "${f}" ]] || continue
+        f_real="$(readlink -f -- "${f}" 2> /dev/null || true)"
+        [[ -n "${f_real}" && -f "${f_real}" ]] || continue
+        if _bwrap_path_blocked "${f_real}"; then
+            echo "Warning: ${f} resolves into a blocked location (${f_real}); not mounted." >&2
+            continue
+        fi
+        names+=("${name}")
+        reals+=("${f_real}")
+    done
+    [[ ${#names[@]} -gt 0 ]] || return 0
+
+    dest_dir="${gdir}"
+    if [[ -L "${gdir}" ]] && _bwrap_git_recreate_link "${gdir}"; then
+        dest_dir="${gdir_real}"
+    fi
+    if [[ "${dest_dir}" == "${_HOME}"/* ]]; then
+        _emit_home_intermediate_dirs "${dest_dir}" inclusive
+    else
+        BWRAP_ARGS+=(--dir "${dest_dir}")
+    fi
+    local _k
+    for _k in "${!names[@]}"; do
+        BWRAP_ARGS+=(--ro-bind "${reals[${_k}]}" "${dest_dir}/${names[${_k}]}")
+    done
+    _BWRAP_XDG_GIT_HAS_FILES=1
+}
+
 build_git_mounts() {
     # Resolve symlinks so we bind the real file (readlink -f is a no-op on
     # regular files).  Check the resolved target before emitting the bind:
@@ -1464,39 +1596,7 @@ build_git_mounts() {
         _check_path_safe "${_gitconfig_real}" "\$HOME/.gitconfig (resolved)"
         BWRAP_ARGS+=(--ro-bind "${_gitconfig_real}" "${_HOME}/.gitconfig")
     fi
-    if [[ -d "${XDG_CONFIG_HOME}/git" ]]; then
-        # XDG_CONFIG_HOME itself is validated by resolve_common_paths, but
-        # the git subdirectory can be a symlink pointing anywhere (e.g.
-        # ~/.config/git -> ~/.ssh), so canonicalize and check it too.  The
-        # canonical directory is bound at the host path so that relative
-        # includes (../shared) resolve against the host layout.
-        _bwrap_canonicalize_safe "${XDG_CONFIG_HOME}/git" "XDG git config dir"
-        local _git_xdg_real="${_BWRAP_CANON}"
-        #
-        # The XDG git directory may hold "credentials": the default file of
-        # git's "store" credential helper (plaintext passwords/tokens).  The
-        # directory is bound read-only for config/ignore/attributes, so the
-        # credentials file must be masked with /dev/null on top of it.  A
-        # bind over a read-only bind needs bwrap >= 0.6.3
-        # (HAS_BIND_OVER_RO, same requirement as build_binary_masks).  On
-        # older bwrap we fail closed: do not mount the directory at all when
-        # a credentials file is present, and warn.
-        local _git_creds="${XDG_CONFIG_HOME}/git/credentials"
-        if [[ ! -e "${_git_creds}" && ! -L "${_git_creds}" ]]; then
-            BWRAP_ARGS+=(--ro-bind "${_git_xdg_real}" "${XDG_CONFIG_HOME}/git")
-            _BWRAP_XDG_GIT_MOUNTED=1
-        elif [[ "${HAS_BIND_OVER_RO}" -eq 1 ]]; then
-            BWRAP_ARGS+=(
-                --ro-bind "${_git_xdg_real}" "${XDG_CONFIG_HOME}/git"
-                --ro-bind /dev/null "${_git_creds}"
-            )
-            _BWRAP_XDG_GIT_MOUNTED=1
-        else
-            echo "Warning: ${XDG_CONFIG_HOME}/git/credentials exists and this bwrap" \
-                "is too old (< 0.6.3) to mask it; NOT mounting ${XDG_CONFIG_HOME}/git" \
-                "into the sandbox (git config there will be unavailable)." >&2
-        fi
-    fi
+    _bwrap_mount_xdg_git_files
 
     # Git include files (read-only).
     # parse_git_includes canonicalized every include path with readlink -f
@@ -1513,11 +1613,27 @@ build_git_mounts() {
         inc_path="${GIT_INCLUDE_PATHS[${_i}]}"
         inc_visible="${GIT_INCLUDE_VISIBLE[${_i}]:-${inc_path}}"
         _check_path_safe "${inc_path}" "git include path"
+        # Symlinked directories before a ".." in the include path: recreate
+        # them so the kernel resolves ".." as on the host.  If one cannot be
+        # recreated the include is mounted at its real path only.
+        local _link _links_ok=1
+        while IFS= read -r _link; do
+            [[ -n "${_link}" ]] || continue
+            _bwrap_git_recreate_link "${_link}" || _links_ok=0
+        done <<< "${GIT_INCLUDE_LINKS[${_i}]:-}"
+        if [[ "${_links_ok}" -eq 0 ]]; then
+            printf 'Warning: git include %s needs a symlinked directory that cannot be recreated in\n' "${inc_visible}" >&2
+            printf '         the sandbox; it is mounted at its real path (%s) only, so git may not find it.\n' "${inc_path}" >&2
+            inc_visible="${inc_path}"
+        fi
         # Directories the kernel must traverse to resolve ".." in the include
         # path git opens (they hold no data; they only have to exist).
         local _predir
         while IFS= read -r _predir; do
             [[ -n "${_predir}" && -z "${_GIT_INC_DIRS_SEEN["${_predir}"]:-}" ]] || continue
+            # Never create a directory inside a blocked location, not even an
+            # empty one (a symlinked directory pointing there stays unresolved).
+            ! _bwrap_path_blocked "${_predir}" || continue
             _GIT_INC_DIRS_SEEN["${_predir}"]=1
             BWRAP_ARGS+=(--dir "${_predir}")
         done <<< "${GIT_INCLUDE_PREDIRS[${_i}]:-}"

@@ -99,18 +99,24 @@ cases.
 
 ## Credentials and secrets handling
 
-- **Git credentials are masked.** The host `${XDG_CONFIG_HOME}/git` directory
-  (default `~/.config/git`) is mounted read-only so git config, ignore, and
-  attributes work. If it contains a `credentials` file (the default file of
-  git's `store` credential helper, holding plaintext passwords or tokens),
-  that file is hidden by binding `/dev/null` over it. This needs
-  `bwrap` >= 0.6.3 (the same requirement as binary masking). On an older
-  `bwrap` the wrappers fail closed: when a `credentials` file exists they do
-  **not** mount the XDG git directory at all and print a warning to stderr.
-  `$HOME` itself is a tmpfs, so `~/.git-credentials` is never visible.
-  A credential helper that stores secrets elsewhere (for example
-  `credential.helper = store --file=PATH`, or a path pulled in through a git
-  `include`) is not covered; keep such files out of mounted locations.
+- **Only four files of the XDG git directory are mounted.** From the host
+  `${XDG_CONFIG_HOME}/git` directory (default `~/.config/git`) the wrappers
+  mount `allowed_signers`, `config`, `ignore` and `attributes`, each read-only
+  and only if present. The directory itself is never bound: nothing else in it
+  is mounted, including `credentials` (the default file of git's `store`
+  credential helper, holding plaintext passwords or tokens), and files created
+  on the host later never appear in the sandbox. A listed file (or the whole
+  directory) that resolves into a blocked location is skipped with a warning
+  (`Warning: <path> resolves into a blocked location (<resolved>); not
+  mounted.`) rather than aborting; a dangling symlink is skipped silently.
+  `~/.ssh` is never mounted by any path. `$HOME` itself is a tmpfs, so
+  `~/.git-credentials` is never visible. A credential helper that stores
+  secrets elsewhere (for example `credential.helper = store --file=PATH`, or a
+  path pulled in through a git `include`) is not covered; keep such files out
+  of mounted locations. Signing commits inside the sandbox is not possible
+  (`ssh-add` and `ssh-keygen` are masked and no agent socket is passed in).
+  `allowed_signers` is mounted read-only, but `git` verifies SSH signatures
+  with `ssh-keygen`, which is masked as well, so verify signatures on the host.
 - **Paths are resolved before the blocked-path check.** Config entries and
   config directories (`~/.config/opencode*`), git include files, and the XDG
   `git`, `pixi/config.toml` and `ccache` locations are canonicalized with
@@ -119,10 +125,15 @@ cases.
   blocked target; such a setup is refused with an error. A git include reached
   through a symlinked directory is mounted at both its real path and the path
   git opens. `..` in an include path is not collapsed lexically, because the
-  kernel applies it to a symlink's target: directories the path walks through
+  kernel applies it to a symlink's target. Directories the path walks through
   before a `..` (for example `~/dotfiles` in `~/dotfiles/../x.conf`) are created
-  in the sandbox, and when a symlinked directory comes before a `..` the include
-  is mounted at its real path only, with a warning.
+  in the sandbox. Symlinked directories under `$HOME` before a `..` (including
+  a symlinked `~/.config/git`, whose four files are then mounted at the real
+  target) are recreated in the sandbox as symlinks to their real target, so
+  `..` resolves as on the host; a symlink whose target is in a blocked location
+  is never recreated. If a needed symlink cannot be recreated (outside `$HOME`
+  and not in a mounted tree, or dangling or blocked), the include is mounted at
+  its real path only, with a warning.
 - **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
   whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
   `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the
@@ -225,19 +236,18 @@ Because `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` point at the opencode2 directorie
 the wrapper makes the host's `$XDG_CONFIG_HOME/git`, `pixi/config.toml`,
 `ccache` config, and `$XDG_CACHE_HOME/ccache` cache visible at the same relative
 location in the opencode2 directories so git, pixi, and ccache keep working.
-These are symlinks to the host-path mounts the shared library already made, not
-second binds: git resolves a relative `[include] path = ../shared` against the
-directory of the config path as opened, so a bind at
+The git mirror is a symlink to the host-path mounts the shared library already
+made, not a second bind: git resolves a relative `[include] path = ../shared`
+against the directory of the config path as opened, so a bind at
 `~/.config/opencode2/git` would look for `~/.config/opencode2/shared` and
 silently skip the include, whereas through the symlink `..` resolves to the real
-parent (`~/.config`), where the include is mounted. The read-only mount and the
-`git/credentials` mask of the target apply automatically: that file (the default
-file of git's `store` credential helper) is masked with `/dev/null`, so git
-passwords stored there are not readable inside the sandbox. This needs
-bubblewrap >= 0.6.3 (bind over an existing bind); on an older bubblewrap the
-library prints a warning and does not mount the XDG git directory at all, so no
-symlink is created. `~/.gitconfig` and other `$HOME`-relative files are
-unaffected.
+parent (`~/.config`), where the include is mounted. The symlink is created only
+when at least one of the four mounted files (`allowed_signers`, `config`,
+`ignore`, `attributes`; see "Credentials and secrets handling") exists, so it
+exposes just those files, read-only: `credentials` and anything created on the
+host later are not reachable through it. If the host `~/.config/git` is itself a
+symlink the library recreates it in the sandbox and the mirror resolves through
+it. `~/.gitconfig` and other `$HOME`-relative files are unaffected.
 
 ### What is kept out of the sandbox
 
