@@ -99,8 +99,10 @@ KERNEL_HAS_TIOCSTI_CAP_GUARD=0
 # distinct raw path is its own record; build_git_mounts de-duplicates the
 # resulting binds and directories.
 declare -A _GIT_INCLUDE_SEEN=()
-# _GIT_INCLUDE_PARSED: canonical paths of the config files already read by
-# parse_git_includes (cycle protection for nested includes).
+# _GIT_INCLUDE_PARSED: config files already read by parse_git_includes, keyed
+# by the path AS OPENED (not the canonical path: two symlinks to one file each
+# need their own traversal, because their relative includes resolve against
+# different directories).  Include loops end at the depth limit.
 declare -A _GIT_INCLUDE_PARSED=()
 # Maximum include nesting followed (git's own limit is 10).
 _GIT_INCLUDE_MAX_DEPTH=10
@@ -725,21 +727,18 @@ _mount_npm_global_prefix() {
 #   _GIT_INCLUDE_MAX_DEPTH levels of includes are followed, like git).
 #   CONFIG_FILE is the path as git opened it (not normalised): relative
 #   includes resolve against its directory, and the kernel resolves any ".."
-#   in it, exactly as for git.  A file is parsed once (keyed by its canonical
-#   path), so include loops terminate; a canonical path in a blocked location
-#   is never read (build_git_mounts refuses it at mount time).  Conditions of
+#   in it, exactly as for git.  A file is parsed once per path as opened, and
+#   nesting stops at the depth limit, so include loops terminate; a canonical
+#   path in a blocked location is never read (build_git_mounts refuses it at
+#   mount time).  Conditions of
 #   [includeIf] are not evaluated: every candidate is recorded.
 parse_git_includes() {
     local config_file="$1" depth="${2:-0}" line
     [[ -f "${config_file}" && -r "${config_file}" ]] || return 0
     [[ "${depth}" -lt "${_GIT_INCLUDE_MAX_DEPTH}" ]] || return 0
 
-    local self_real
-    self_real="$(readlink -f -- "${config_file}" 2> /dev/null || true)"
-    if [[ -n "${self_real}" ]]; then
-        [[ -z "${_GIT_INCLUDE_PARSED["${self_real}"]:-}" ]] || return 0
-        _GIT_INCLUDE_PARSED["${self_real}"]=1
-    fi
+    [[ -z "${_GIT_INCLUDE_PARSED["${config_file}"]:-}" ]] || return 0
+    _GIT_INCLUDE_PARSED["${config_file}"]=1
 
     # Git resolves relative include paths relative to the location of
     # the config file (the symlink path, NOT the resolved target).
@@ -861,6 +860,12 @@ _bwrap_load_blocked_prefixes() {
         "${_HOME}/.config/op"        # 1Password CLI (alternate path)
         # GitHub CLI tokens
         "${_HOME}/.config/gh"
+        # Default stores of git's "store" credential helper (plaintext).  Listing
+        # them here makes the working-directory / --ro-path / --rw-path checks
+        # refuse them, and refuse a directory that contains an existing one
+        # (for example launching from ~/.config/git).
+        "${_HOME}/.git-credentials"
+        "${XDG_CONFIG_HOME}/git/credentials"
         # System
         "/root"
         "/etc/shadow"

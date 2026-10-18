@@ -117,6 +117,12 @@ cases.
   (`ssh-add` and `ssh-keygen` are masked and no agent socket is passed in).
   `allowed_signers` is mounted read-only, but `git` verifies SSH signatures
   with `ssh-keygen`, which is masked as well, so verify signatures on the host.
+- **Default git credential stores are blocked paths.** `~/.git-credentials`
+  and `$XDG_CONFIG_HOME/git/credentials` (the plaintext files of git's `store`
+  credential helper) are on the blocked list, so a working directory or git
+  root that contains one that exists (for example launching from
+  `~/.config/git`), `--ro-path`, `--rw-path` and an `[include]` pointing at
+  either are refused.
 - **Paths are resolved before the blocked-path check.** Config entries and
   config directories (`~/.config/opencode*`), git include files, and the XDG
   `git`, `pixi/config.toml` and `ccache` locations are canonicalized with
@@ -176,7 +182,11 @@ cases.
   chains deeper than 10 are ignored; unusual symlink layouts (for example a
   symlink at a directory-bind root or under a path the launcher pre-creates)
   fall back to a warning and a lexical mount, and git may still not find the
-  file.
+  file. Includes are tracked per path as opened, so two symlinks to one config
+  are both followed. In short: an unusual include or symlink layout can lose git
+  settings inside the sandbox. That does not expose credentials, so it is
+  treated as a limitation of the sandbox, not a bug, and the include handling is
+  not being extended further.
 - **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
   whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
   `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the
