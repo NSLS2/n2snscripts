@@ -49,7 +49,7 @@ human contributors.
 
 **Source code in this repository is largely AI-generated:** AI tools
 produce the initial implementation of the sandboxed AI CLI wrapper
-scripts (`bin/bwopencode`, `bin/bwcodex`, `bin/bwclaude`,
+scripts (`bin/bwopencode`, `bin/bwopencode2`, `bin/bwcodex`, `bin/bwclaude`,
 `bin/bwcopilot`) and the shared `lib/bwrap_sandbox_lib.sh` sandbox
 library, as well as `bin/gh-protect-branch`, `bin/azoidcapp`,
 `bin/pemdecompose`, `lib/gpg-passwd.sh`, associated documentation, and
@@ -73,7 +73,7 @@ which model contributed to a specific change.
 AI tools are used to:
 
 - Draft and refactor the bubblewrap-sandboxed AI CLI wrapper scripts
-  (`bwopencode`, `bwcodex`, `bwclaude`, `bwcopilot`) and the shared
+  (`bwopencode`, `bwopencode2`, `bwcodex`, `bwclaude`, `bwcopilot`) and the shared
   `bwrap_sandbox_lib.sh` library.
 - Draft and refactor `gh-protect-branch`, `azoidcapp`, `pemdecompose`,
   and `gpg-passwd.sh`.

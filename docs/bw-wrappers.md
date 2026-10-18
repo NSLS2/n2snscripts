@@ -6,7 +6,7 @@ masked privileged binaries, ephemeral auth on shared accounts, and
 filesystem isolation from the rest of the host. See the NSLS-II
 coding-agents documentation for the policy these wrappers implement.
 
-All four wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
+All five wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
 for sandbox construction. Each wrapper's `--help` is the authoritative
 option list; the tables below summarise the common surface.
 
@@ -26,6 +26,8 @@ read-only mounts. They do not expose the rest of the corresponding `/etc`
 configuration directories.
 
 - OpenCode: `/etc/opencode/skills`
+- OpenCode 2 (`bwopencode2`): `/etc/opencode/skills`, `/etc/opencode/agents`,
+  `/etc/opencode/commands`, and `/etc/opencode/plugins`
 - Codex: `/etc/codex/skills`
 - Claude: `/etc/claude-code/.claude/skills` and
   `/etc/claude-code/managed-settings.json`
@@ -36,8 +38,8 @@ configuration directories.
 
 Shared agent skills are a deployment-managed skill collection. The deployment
 defines the source repository or checkout and manages read-only aliases at the
-paths above. When those aliases are present, `bwopencode`, `bwcodex`, and
-`bwclaude` mount them read-only into their sandboxes. A wrapper configured for
+paths above. When those aliases are present, `bwopencode`, `bwopencode2`,
+`bwcodex`, and `bwclaude` mount them read-only into their sandboxes. A wrapper configured for
 Copilot likewise mounts its deployment-defined shared-skill directory
 read-only.
 
@@ -53,7 +55,7 @@ Every `bw*` wrapper accepts these options:
 | `--help`, `-h` | Show wrapper help plus the underlying tool's help |
 | `--dry-run` | Print the `bwrap` command without executing it |
 | `--exec CMD` | Run `CMD` inside the sandbox instead of the tool |
-| `--init-auth` | Persist auth credentials to the host (first-time setup) |
+| `--init-auth` | Persist auth credentials to the host (first-time setup; not available in `bwopencode2`) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 | `--ro-path PATH` | Read-only mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 | `--rw-path PATH` | Read-write mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
@@ -76,6 +78,79 @@ personal accounts).
 | Option | Description |
 | --- | --- |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+
+## `bwopencode2`
+
+Launches [OpenCode 2](https://opencode.ai) (`opencode2`, npm `@opencode/cli`)
+inside a bubblewrap sandbox. It is a separate wrapper from `bwopencode`
+because OpenCode 2 uses different directories and has a background service
+that must not be reachable from the sandbox.
+
+```text
+bwopencode2 [bwopencode2-options] [opencode2 arguments...]
+```
+
+Requires the `opencode2` command on `PATH`, which ansible installs when
+`base_opencode2_enable` is true.
+
+Accepts the common options above except `--init-auth`, plus `--github-tokens`
+(same behavior as `bwopencode`).
+
+### Isolation from OpenCode 1
+
+OpenCode 2 migrates the OpenCode 1 session database one way and cannot load
+OpenCode 1 plugins, so it always uses its own directories, matching the
+ansible-installed `opencode2` wrapper. Inside the sandbox the wrapper sets
+`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` to
+`~/.config/opencode2`, `~/.local/share/opencode2`, `~/.local/state/opencode2`,
+and `~/.cache/opencode2`, even if the `opencode2` on `PATH` is a plain binary.
+OpenCode 2 appends `opencode` to each, and the OpenCode 1 directories are never
+mounted.
+
+| Directory | Mount |
+| --- | --- |
+| `~/.config/opencode2/opencode` | read-only, symlinks resolved |
+| `~/.local/share/opencode2/opencode` | read-write, the whole directory persists |
+| `~/.cache/opencode2/opencode` | read-write (provider npm packages install here) |
+| `~/.local/state/opencode2/opencode` | not persisted (ephemeral) |
+| `<repo>/.opencode` | persistent copy under the data dir `project-dotfiles/<hash>`, so repository content cannot inject config or plugins |
+| `/etc/opencode/opencode.json{,c}`, `skills`, `agents`, `commands`, `plugins` | read-only, when present |
+
+The whole data directory is bound because the OpenCode 2 layout (database with
+`-shm`/`-wal`, `log`, `repos`, `shell`, ...) is not documented. Credentials are
+stored in the `credential` table of its database, so `opencode2 auth login`
+persists across sessions without anything like `--init-auth` (OpenCode 2's
+legacy `auth.json` is only an import source). State is not persisted, so the
+last-used model and prompt history are not remembered between sessions.
+
+Because `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` point at the opencode2 directories,
+the wrapper mirrors the host's `$XDG_CONFIG_HOME/git`, `pixi/config.toml`,
+`ccache` config, and `$XDG_CACHE_HOME/ccache` cache under the same relative
+location in the opencode2 directories so git, pixi, and ccache keep working.
+`~/.gitconfig` and other `$HOME`-relative files are unaffected.
+
+### `--standalone` is enforced
+
+By default OpenCode 2 connects to a shared background service (fixed port
+49374) that survives the CLI and runs tools **outside** any sandbox. The
+sandbox shares the host network, so a CLI started normally would hand tool
+execution to that unsandboxed server. `bwopencode2` therefore:
+
+- adds `--standalone` (a private in-process server inside the sandbox) when
+  `opencode2` is started with no subcommand or a directory argument, or with
+  `run`, `mini`, `models`, or `stats`;
+- refuses (exit status 1) `--server`, `--standalone=...`, `--no-standalone`,
+  and the `service`, `serve`, `api`, `pair`, and `reload` subcommands;
+- passes the other subcommands (`auth`, `debug`, `mcp`, `plugin`, `session`,
+  `upgrade`, `uninstall`, `acp`) through unchanged, since they do not accept
+  `--standalone`.
+
+The argument scan takes the first non-option argument as the subcommand; only
+`--session`/`-s`, `--prompt`, `--log-level`, and `--completions` are known to
+take a value, and nothing after `--` is inspected. `--exec` bypasses the scan
+because its arguments belong to the command you run. The config directory is
+read-only, so commands that write global config (for example `plugin add`)
+fail; edit config on the host.
 
 ## `bwclaude`
 

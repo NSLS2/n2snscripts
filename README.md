@@ -23,6 +23,7 @@ docs/   Per-script and per-library documentation
 | `bwcodex` | OpenAI Codex CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwcopilot` | GitHub Copilot CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwopencode` | OpenCode in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
+| `bwopencode2` | OpenCode 2 (`opencode2`) in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `gh-protect-branch` | Apply NSLS-II standard branch protection to a GitHub repo (all branches); enables secret scanning and push protection; optionally restricts branch creation to named patterns | [docs/gh-protect-branch.md](docs/gh-protect-branch.md) |
 | `pemdecompose` | List and verify certificates in a PEM file | [docs/pemdecompose.md](docs/pemdecompose.md) |
 
@@ -81,6 +82,7 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 
 ```text
 bwopencode [bwopencode-options] [opencode arguments...]
+bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 bwclaude   [bwclaude-options]   [claude arguments...]
 bwcopilot  [bwcopilot-options]  [copilot arguments...]
 bwcodex    [bwcodex-options]    [codex arguments...]
@@ -96,8 +98,10 @@ Common wrapper options:
 | `--init-auth` | Persist auth credentials to the host (first-time setup) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 
-`bwclaude` also supports `--debug`. See each script's `--help` for the
-authoritative option list.
+`bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
+persists in its data directory) and always runs OpenCode 2 with `--standalone`;
+see [docs/bw-wrappers.md](docs/bw-wrappers.md). See each script's `--help` for
+the authoritative option list.
 
 ### `gh-protect-branch`
 
