@@ -98,6 +98,7 @@ parse_wrapper_args() {
                     echo "Error: --exec requires a command argument." >&2
                     exit 1
                 fi
+                # shellcheck disable=SC2034  # read by bwrap_resolve_tool in the library
                 TEST_CMD="$2"
                 shift 2
                 ;;
@@ -145,22 +146,6 @@ parse_wrapper_args() {
 # Does NOT fall back to `gh copilot` — the gh-copilot extension is
 # archived/deprecated as of Oct 2025.
 # Sets globals: _TOOL_BIN, _TOOL_CMD
-resolve_tool_binary() {
-    _TOOL_BIN="$(bwrap_find_tool copilot 2> /dev/null || true)"
-    if [[ -z "${_TOOL_BIN}" ]]; then
-        echo "Error: 'copilot' not found in PATH." >&2
-        echo "Install the standalone GitHub Copilot CLI from https://github.com/github/copilot-cli" >&2
-        exit 1
-    fi
-
-    if [[ -n "${TEST_CMD}" ]]; then
-        # Split TEST_CMD into array so multi-word commands work correctly.
-        read -ra _TOOL_CMD <<< "${TEST_CMD}"
-    else
-        _TOOL_CMD=("${_TOOL_BIN}")
-    fi
-}
-
 show_help() {
     cat << 'HELP_EOF'
 bwcopilot — GitHub Copilot CLI inside a bubblewrap sandbox
@@ -424,8 +409,9 @@ build_copilot_env() {
 # ═══════════════════════════════════════════════════════════════════
 
 main() {
+    bwrap_check_account
     parse_wrapper_args "$@"
-    resolve_tool_binary
+    bwrap_resolve_tool copilot "Install the standalone GitHub Copilot CLI from https://github.com/github/copilot-cli"
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help

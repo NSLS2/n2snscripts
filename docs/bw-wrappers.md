@@ -6,7 +6,7 @@ masked privileged binaries, ephemeral auth on shared accounts, and
 filesystem isolation from the rest of the host. See the NSLS-II
 coding-agents documentation for the policy these wrappers implement.
 
-All four wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
+All five wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
 for sandbox construction. Each wrapper's `--help` is the authoritative
 option list; the tables below summarise the common surface.
 
@@ -26,6 +26,8 @@ read-only mounts. They do not expose the rest of the corresponding `/etc`
 configuration directories.
 
 - OpenCode: `/etc/opencode/skills`
+- OpenCode 2 (`bwopencode2`): `/etc/opencode/skills`, `/etc/opencode/agents`,
+  `/etc/opencode/commands`, and `/etc/opencode/plugins`
 - Codex: `/etc/codex/skills`
 - Claude: `/etc/claude-code/.claude/skills` and
   `/etc/claude-code/managed-settings.json`
@@ -36,8 +38,8 @@ configuration directories.
 
 Shared agent skills are a deployment-managed skill collection. The deployment
 defines the source repository or checkout and manages read-only aliases at the
-paths above. When those aliases are present, `bwopencode`, `bwcodex`, and
-`bwclaude` mount them read-only into their sandboxes. A wrapper configured for
+paths above. When those aliases are present, `bwopencode`, `bwopencode2`,
+`bwcodex`, and `bwclaude` mount them read-only into their sandboxes. A wrapper configured for
 Copilot likewise mounts its deployment-defined shared-skill directory
 read-only.
 
@@ -53,12 +55,151 @@ Every `bw*` wrapper accepts these options:
 | `--help`, `-h` | Show wrapper help plus the underlying tool's help |
 | `--dry-run` | Print the `bwrap` command without executing it |
 | `--exec CMD` | Run `CMD` inside the sandbox instead of the tool |
-| `--init-auth` | Persist auth credentials to the host (first-time setup) |
+| `--init-auth` | Persist auth credentials to the host (first-time setup; not available in `bwopencode2`) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 | `--ro-path PATH` | Read-only mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 | `--rw-path PATH` | Read-write mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 
 Tool-specific options are listed in each wrapper's section below.
+
+## Account check
+
+Every `bw*` launcher runs `/opt/nsls2/libexec/agent-account-check` first
+(before parsing any option, including `--help` and `--dry-run`) when that
+script is installed (it is deployed by ansible). The script refuses root and
+members of the shared/service-account group with a boxed message on stderr and
+a non-zero exit status; the launcher exits with that status. The path is fixed
+and cannot be overridden from the environment. When the script is not
+installed nothing happens (the ACLs on the agent installs still apply).
+
+## Agent binary resolution
+
+After the account check every launcher resolves its agent command with the
+shared `bwrap_resolve_tool` library function and distinguishes three failures
+(each exits 1):
+
+- **Restricted.** The command on `PATH` is a symlink whose target directory
+  exists but cannot be entered by you (for example the ansible ACL that denies
+  shared/service accounts access to the agent package directory). The launcher
+  prints the same box as the ansible account check, without the two
+  documentation links and with an extra line naming the tool
+  (`'<tool>' is not available to this account.`). The box code in
+  `lib/bwrap_sandbox_lib.sh` mirrors
+  `roles/base/templates/agent-account-check.sh.j2` in NSLS2/ansible; the two
+  must be kept in step.
+- **Installed incorrectly.** The command is a dangling symlink, or a file that
+  is not executable:
+  `Error: '<tool>' is installed incorrectly (<path> points to a missing file or
+  is not executable). Ask your system administrator.`
+- **Not installed.** `Error: '<tool>' not found in PATH.` (plus an install
+  hint for `bwcopilot` and `bwopencode2`).
+
+Entries listed in `N2SNSCRIPTS_TOOL_EXCLUDE_PATH` are ignored in all three
+cases.
+
+## Credentials and secrets handling
+
+- **Only four files of the XDG git directory are mounted.** From the host
+  `${XDG_CONFIG_HOME}/git` directory (default `~/.config/git`) the wrappers
+  mount `allowed_signers`, `config`, `ignore` and `attributes`, each read-only
+  and only if present. The directory itself is never bound: nothing else in it
+  is mounted, including `credentials` (the default file of git's `store`
+  credential helper, holding plaintext passwords or tokens), and files created
+  on the host later never appear in the sandbox. A listed file (or the whole
+  directory) that resolves into a blocked location is skipped with a warning
+  (`Warning: <path> resolves into a blocked location (<resolved>); not
+  mounted.`) rather than aborting; a dangling symlink is skipped silently.
+  `~/.ssh` is never mounted by any path. `$HOME` itself is a tmpfs, so
+  `~/.git-credentials` is never visible. A credential helper that stores
+  secrets elsewhere (for example `credential.helper = store --file=PATH`, or a
+  path pulled in through a git `include`) is not covered; keep such files out
+  of mounted locations. Signing commits inside the sandbox is not possible
+  (`ssh-add` and `ssh-keygen` are masked and no agent socket is passed in).
+  `allowed_signers` is mounted read-only, but `git` verifies SSH signatures
+  with `ssh-keygen`, which is masked as well, so verify signatures on the host.
+- **Default git credential stores are blocked paths.** `~/.git-credentials`
+  and `$XDG_CONFIG_HOME/git/credentials` (the plaintext files of git's `store`
+  credential helper) are on the blocked list, so a working directory or git
+  root that contains one that exists (for example launching from
+  `~/.config/git`), `--ro-path`, `--rw-path` and an `[include]` pointing at
+  either are refused.
+- **Blocked paths are matched at their symlink targets too.** Every entry of
+  the blocked list is checked both as written and at its resolved target, so
+  with `~/.config/git -> ~/dotfiles/git` the file `~/dotfiles/git/credentials`
+  is blocked, and a symlinked `~/.git-credentials`, `~/.ssh` or `~/.config` is
+  blocked at its target. This applies to `--ro-path`, `--rw-path`, git includes
+  and the directory checks alike.
+- **Paths are resolved before the blocked-path check.** Config entries and
+  config directories (`~/.config/opencode*`), git include files, and the XDG
+  `git`, `pixi/config.toml` and `ccache` locations are canonicalized with
+  `realpath` (`readlink -f`) before the blocked-path check, so a symlinked
+  parent directory (for example `~/.config/opencode2 -> ~/.aws`) cannot hide a
+  blocked target; such a setup is refused with an error. A git include reached
+  through a symlinked directory is mounted at both its real path and the path
+  git opens. `..` in an include path is not collapsed lexically, because the
+  kernel applies it to a symlink's target. Directories the path walks through
+  before a `..` (for example `~/dotfiles` in `~/dotfiles/../x.conf`) are created
+  in the sandbox. Symlinked directories under `$HOME` before a `..` (including
+  a symlinked `~/.config/git`, whose four files are then mounted at the real
+  target) are recreated in the sandbox as symlinks to their real target, so
+  `..` resolves as on the host; a symlink whose target is in a blocked location
+  is never recreated. If a needed symlink cannot be recreated (outside `$HOME`
+  and not in a mounted tree, or dangling or blocked), the include is mounted at
+  its real path only, with a warning. A host symlink at a path the launcher
+  pre-creates in the sandbox home (`~/.config`, `~/.local`, `~/.local/share`,
+  `~/.cache`, `~/bin`), or at any path already created or populated by an
+  earlier mount, is not recreated either (bwrap cannot create a symlink where a
+  directory exists): the sandbox sees a plain directory there and a warning is
+  printed. Git then resolves `..` through it lexically; when every unrecreated
+  symlink of an include is of this kind, the include is additionally mounted at
+  its lexically collapsed path (for example `~/.config/shared` for
+  `~/.config/git/../shared`), unless that path is already in use (never over
+  `~/.gitconfig` or an XDG git file). Symlinks outside `$HOME` (for example
+  under `/etc`, where only selected entries are bound) are not recreated: the
+  four XDG git files are then mounted at the host path of the symlinked
+  directory. A symlink that is itself the root of a directory mount (for
+  example `~/bin -> ~/dotfiles/bin`, bound as a plain directory at `~/bin`) is
+  not recreated either: the sandbox has a plain directory there, a warning is
+  printed and the lexical fallback above applies. A symlink strictly inside a
+  mounted tree (for example inside the working directory) keeps its host form
+  and needs nothing.
+- **Git includes are followed recursively.** `[include]` / `[includeIf]`
+  `path =` entries of `~/.gitconfig` and `${XDG_CONFIG_HOME}/git/config` are
+  followed through nested includes to a depth of 10 (git's own limit), each
+  file is read once (include loops terminate), and an included file that
+  resolves into a blocked location is neither read nor mounted (the launcher
+  refuses it). Distinct include paths as written each get their own traversal
+  directories (`~/first/../common.conf` and `~/second/../common.conf` both
+  work), even when they name the same file; identical mounts are emitted once.
+- **A directory that contains a blocked location is refused.** The working
+  directory (the git root when inside a repository), `--ro-path` and
+  `--rw-path` are checked on their canonical path: besides `$HOME`, its
+  ancestors and anything inside a blocked tree, a directory that contains a
+  blocked location that exists is refused with `Error: <context> '<dir>'
+  contains the blocked path '<path>'. Refusing to mount.` (for example running
+  from `~/.config` when `~/.config/gh` exists, or from a git root above
+  `~/.ssh`); blocked locations that do not exist are ignored. `bwopencode2`
+  also refuses a directory that equals or contains `~/.config/opencode2/opencode`
+  (for example `~/.config/opencode2`), because `service.json` there is
+  deliberately never mounted and a whole-directory bind would expose it.
+- **Known limitations of the git include handling.** `includeIf` conditions
+  are not evaluated, so every candidate include is mounted; includes configured
+  only through the environment or `git -c include.path=...` are not seen; include
+  chains deeper than 10 are ignored; unusual symlink layouts (for example a
+  symlink at a directory-bind root or under a path the launcher pre-creates)
+  fall back to a warning and a lexical mount, and git may still not find the
+  file. Include values are decoded the way git does (double quotes, the
+  escapes `\n \t \b \" \\`, trailing `#` or `;` comments, any case of
+  `path`); a value that git itself would reject is skipped, and so is one that
+  ends in a backslash (git's line continuation is not supported). Includes are tracked per path as opened, so two symlinks to one config
+  are both followed. In short: an unusual include or symlink layout can lose git
+  settings inside the sandbox. That does not expose credentials, so it is
+  treated as a limitation of the sandbox, not a bug, and the include handling is
+  not being extended further.
+- **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
+  whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
+  `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the
+  printed text is redacted; the real launch passes the real values.
 
 ## `bwopencode`
 
@@ -76,6 +217,147 @@ personal accounts).
 | Option | Description |
 | --- | --- |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+
+### `OPENCODE_*` environment allowlist
+
+Only an allowlist of harmless `OPENCODE_*` behaviour toggles (46 names) is
+forwarded from the host environment into the sandbox. **Behaviour change:**
+any other host `OPENCODE_*` variable is now dropped (previously all were
+passed). Sensitive or location-changing variables are deliberately excluded:
+`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` (the sandbox shares
+the host network, so an agent holding the password could drive an
+unsandboxed opencode server), `OPENCODE_API_KEY`, `OPENCODE_CONSOLE_TOKEN`,
+`OPENCODE_CONFIG*` / `OPENCODE_TUI_CONFIG` / `OPENCODE_PERMISSION` (inject
+config or permissions and bypass the managed config), `OPENCODE_AUTH_CONTENT`,
+`OPENCODE_DB` / `OPENCODE_*_DB`, `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH`,
+and path or URL overrides.
+
+Forwarded: `OPENCODE_DISABLE_{AUTOCOMPACT,AUTOUPDATE,CLAUDE_CODE,
+CLAUDE_CODE_PROMPT,CLAUDE_CODE_SKILLS,DEFAULT_PLUGINS,EMBEDDED_WEB_UI,
+EXTERNAL_SKILLS,FFF,LSP_DOWNLOAD,MODELS_FETCH,MOUSE,PROJECT_CONFIG,PRUNE,
+TERMINAL_TITLE}`, `OPENCODE_ENABLE_{EXA,EXPERIMENTAL_MODELS,PARALLEL,
+QUESTION_TOOL}`, `OPENCODE_EXPERIMENTAL`, the `OPENCODE_EXPERIMENTAL_*`
+feature flags listed in the `_OPENCODE_ENV_ALLOWLIST` array in
+`bin/bwopencode` (including `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`),
+`OPENCODE_ALWAYS_NOTIFY_UPDATE`, `OPENCODE_FAST_BOOT`, `OPENCODE_LOG_LEVEL`,
+`OPENCODE_PRINT_LOGS`, `OPENCODE_PURE`, and `OPENCODE_SHOW_TTFD`.
+`OPENCODE_DISABLE_PROJECT_CONFIG` only disables a repository's own
+`opencode.json` (stricter; it cannot override `/etc/opencode`).
+`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX` is a numeric output limit; because
+its name contains `TOKEN`, `--dry-run` prints its value as `REDACTED` (the
+real value is passed). `AIFAPIM_HOST` and `AIFAPIM_API_KEY` are forwarded as
+before. With `--dry-run`, the **names** (never values) of dropped `OPENCODE_*`
+variables are printed to stderr. To permit another variable, add it to
+`_OPENCODE_ENV_ALLOWLIST` in `bin/bwopencode`.
+
+## `bwopencode2`
+
+Launches [OpenCode 2](https://opencode.ai) (`opencode2`, npm `@opencode/cli`)
+inside a bubblewrap sandbox. It is a separate wrapper from `bwopencode`
+because OpenCode 2 uses different directories and has a background service
+that must not be reachable from the sandbox.
+
+```text
+bwopencode2 [bwopencode2-options] [opencode2 arguments...]
+```
+
+Requires the `opencode2` command on `PATH`, which the ansible base role
+installs.
+
+Accepts the common options above except `--init-auth`, plus `--github-tokens`
+(same behavior as `bwopencode`).
+
+### Isolation from OpenCode 1
+
+OpenCode 2 migrates the OpenCode 1 session database one way and cannot load
+OpenCode 1 plugins, so it always uses its own directories, matching the
+ansible-installed `opencode2` wrapper. Inside the sandbox the wrapper sets
+`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` to
+`~/.config/opencode2`, `~/.local/share/opencode2`, `~/.local/state/opencode2`,
+and `~/.cache/opencode2`, even if the `opencode2` on `PATH` is a plain binary.
+OpenCode 2 appends `opencode` to each, and the OpenCode 1 directories are never
+mounted.
+
+| Directory | Mount |
+| --- | --- |
+| `~/.config/opencode2/opencode` | read-only, symlinks resolved |
+| `~/.local/share/opencode2/opencode` | read-write, the whole directory persists |
+| `~/.cache/opencode2/opencode` | read-write (provider npm packages install here) |
+| `~/.local/state/opencode2/opencode` | not persisted (ephemeral) |
+| `<repo>/.opencode` | persistent copy under the data dir `project-dotfiles/<hash>`, so repository content cannot inject config or plugins |
+| `/etc/opencode/opencode.json{,c}`, `skills`, `agents`, `commands`, `plugins` | read-only, when present |
+
+The whole data directory is bound because the OpenCode 2 layout (database with
+`-shm`/`-wal`, `log`, `repos`, `shell`, ...) is not documented. Credentials are
+stored in the `credential` table of its database, so `opencode2 auth login`
+persists across sessions without anything like `--init-auth` (OpenCode 2's
+legacy `auth.json` is only an import source). State is not persisted, so the
+last-used model and prompt history are not remembered between sessions.
+
+Because `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` point at the opencode2 directories,
+the wrapper makes the host's `$XDG_CONFIG_HOME/git`, `pixi/config.toml`,
+`ccache` config, and `$XDG_CACHE_HOME/ccache` cache visible at the same relative
+location in the opencode2 directories so git, pixi, and ccache keep working.
+The git mirror is a symlink to the host-path mounts the shared library already
+made, not a second bind: git resolves a relative `[include] path = ../shared`
+against the directory of the config path as opened, so a bind at
+`~/.config/opencode2/git` would look for `~/.config/opencode2/shared` and
+silently skip the include, whereas through the symlink `..` resolves to the real
+parent (`~/.config`), where the include is mounted. The symlink is created only
+when at least one of the four mounted files (`allowed_signers`, `config`,
+`ignore`, `attributes`; see "Credentials and secrets handling") exists, so it
+exposes just those files, read-only: `credentials` and anything created on the
+host later are not reachable through it. If the host `~/.config/git` is itself a
+symlink the library recreates it in the sandbox and the mirror resolves through
+it. `~/.gitconfig` and other `$HOME`-relative files are unaffected.
+
+### What is kept out of the sandbox
+
+- **`service.json`**: OpenCode 2 keeps background-service settings (including
+  values set with `service set env KEY VALUE`, and the port) in
+  `~/.config/opencode2/opencode/service.json` (other release channels may use
+  `service-<hash>.json`). Files matching `service*.json` are not mounted; the
+  rest of the config directory is.
+- **`OPENCODE_*` environment variables**: only this allowlist is passed
+  through; every other `OPENCODE_*` variable is dropped:
+  `OPENCODE_DISABLE_AUTOUPDATE`, `OPENCODE_DISABLE_FILEWATCHER`,
+  `OPENCODE_FILEWATCHER_DISABLE`, `OPENCODE_DISABLE_MODELS_FETCH`,
+  `OPENCODE_DISABLE_CLAUDE_CODE`, `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS`,
+  `OPENCODE_DISABLE_FFF`, `OPENCODE_DISABLE_PROJECT_CONFIG`,
+  `OPENCODE_LOG_LEVEL`, `OPENCODE_PRINT_LOGS`. The
+  variables that matter most are the server passwords (`OPENCODE_PASSWORD`,
+  `OPENCODE_SERVER_PASSWORD`): the sandbox shares the host network, so an agent
+  holding one could connect to an unsandboxed server on port 49374 and run
+  tools outside the sandbox. Others dropped include `OPENCODE_SSH_ASKPASS_*`,
+  `OPENCODE_EDITOR_SSE_PORT`, `OPENCODE_PTY_HANDOFF`, `OPENCODE_DB`,
+  `OPENCODE_TEST_HOME`, `OPENCODE_CONFIG*`, `OPENCODE_MODELS_PATH`/`_URL`, and
+  `OPENCODE_API_KEY`. With `--dry-run`, the names (never the values) of the
+  dropped host variables are printed to stderr.
+
+### `--standalone` is enforced
+
+By default OpenCode 2 connects to a shared background service (fixed port
+49374) that survives the CLI and runs tools **outside** any sandbox. The
+sandbox shares the host network, so a CLI started normally would hand tool
+execution to that unsandboxed server. `bwopencode2` therefore:
+
+- adds `--standalone` (a private in-process server inside the sandbox) when
+  `opencode2` is started with no subcommand or a directory argument, or with
+  `run`, `mini`, `models`, or `stats`;
+- refuses (exit status 1) `--server`, `--standalone=...`, `--no-standalone`,
+  and the `service`, `serve`, `api`, `pair`, and `reload` subcommands;
+- passes the other subcommands (`auth`, `debug`, `mcp`, `plugin`, `session`,
+  `upgrade`, `uninstall`, `acp`) through unchanged, since they do not accept
+  `--standalone`.
+
+The argument scan takes the first non-option argument as the subcommand; only
+`--session`/`-s`, `--prompt`, `--log-level`, and `--completions` are known to
+take a value, and nothing after `--` is inspected. `--exec` bypasses the scan
+by design: it runs an arbitrary command, whose arguments are not `opencode2`'s,
+so `bwopencode2 --exec 'opencode2 --server ...'` is not stopped (the host
+server password is no longer in the sandbox environment, see above). The config directory is
+read-only, so commands that write global config (for example `plugin add`)
+fail; edit config on the host.
 
 ## `bwclaude`
 

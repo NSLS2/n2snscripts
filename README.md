@@ -23,6 +23,7 @@ docs/   Per-script and per-library documentation
 | `bwcodex` | OpenAI Codex CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwcopilot` | GitHub Copilot CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwopencode` | OpenCode in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
+| `bwopencode2` | OpenCode 2 (`opencode2`) in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `gh-protect-branch` | Apply NSLS-II standard branch protection to a GitHub repo (all branches); enables secret scanning and push protection; optionally restricts branch creation to named patterns | [docs/gh-protect-branch.md](docs/gh-protect-branch.md) |
 | `pemdecompose` | List and verify certificates in a PEM file | [docs/pemdecompose.md](docs/pemdecompose.md) |
 
@@ -81,6 +82,7 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 
 ```text
 bwopencode [bwopencode-options] [opencode arguments...]
+bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 bwclaude   [bwclaude-options]   [claude arguments...]
 bwcopilot  [bwcopilot-options]  [copilot arguments...]
 bwcodex    [bwcodex-options]    [codex arguments...]
@@ -96,8 +98,20 @@ Common wrapper options:
 | `--init-auth` | Persist auth credentials to the host (first-time setup) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 
-`bwclaude` also supports `--debug`. See each script's `--help` for the
-authoritative option list.
+`bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
+persists in its data directory), always runs OpenCode 2 with `--standalone`
+(`--exec` bypasses that guard by design), passes only an allowlist of
+`OPENCODE_*` environment variables, does not mount `service.json`, and never mounts
+the git `credentials` file; see [docs/bw-wrappers.md](docs/bw-wrappers.md). See each script's `--help` for
+the authoritative option list.
+
+Security notes: every launcher runs `/opt/nsls2/libexec/agent-account-check`
+first when installed (refuses root and shared/service accounts);
+`bwopencode` forwards only an allowlist of `OPENCODE_*` behaviour toggles (all
+other host `OPENCODE_*` variables are dropped); only `allowed_signers`, `config`, `ignore` and `attributes` of
+`${XDG_CONFIG_HOME}/git` are mounted in every sandbox (never `credentials`); and `--dry-run` prints values of secret-looking
+`--setenv` variables (names containing `KEY`, `TOKEN`, `PASSWORD`, `SECRET`, or
+`CREDENTIAL`) as `REDACTED`. See `docs/bw-wrappers.md`.
 
 ### `gh-protect-branch`
 

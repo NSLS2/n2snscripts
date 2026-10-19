@@ -17,7 +17,7 @@
 # Tool-specific wrapper scripts source this file and provide:
 #   - Argument parsing (parse_wrapper_args) — must handle --ro-path/--rw-path
 #     and accumulate values into the shared EXTRA_RO_PATHS/EXTRA_RW_PATHS arrays
-#   - Binary resolution (resolve_tool_binary) setting _TOOL_BIN and _TOOL_CMD
+#   - Binary resolution: call bwrap_resolve_tool NAME [HINT] (sets _TOOL_BIN and _TOOL_CMD)
 #   - Help text (show_help)
 #   - Tool-specific path resolution, host directory creation, mounts, and env vars
 #   - main() orchestrating the build sequence — must call build_extra_path_mounts
@@ -60,7 +60,7 @@ EXTRA_RO_PATHS=()
 # shellcheck disable=SC2034  # used by tool wrappers that source this library
 EXTRA_RW_PATHS=()
 
-# Tool binary (set by tool-specific resolve_tool_binary)
+# Tool binary (set by bwrap_resolve_tool)
 _TOOL_BIN=""
 _TOOL_CMD=()
 
@@ -86,9 +86,67 @@ HAS_BIND_OVER_RO=0
 # Kernel capability flags (set by detect_kernel_capabilities)
 KERNEL_HAS_TIOCSTI_CAP_GUARD=0
 
-# Git include tracking (used by parse_git_includes)
+# Git include tracking (used by parse_git_includes).
+# GIT_INCLUDE_PATHS holds the CANONICAL (realpath) include files;
+# GIT_INCLUDE_VISIBLE holds, at the same index, the path git itself will
+# open once every symlinked directory that precedes a ".." has been
+# resolved physically (see _bwrap_include_visible_path).  They differ when a
+# parent directory of the include is a symlink; build_git_mounts then mounts
+# the content at both paths.
+# _GIT_INCLUDE_SEEN is keyed by the RAW include path (as git computes it), not
+# by (canonical, visible): two raw paths that reach the same file can need
+# different directories to exist in the sandbox (GIT_INCLUDE_PREDIRS), so each
+# distinct raw path is its own record; build_git_mounts de-duplicates the
+# resulting binds and directories.
 declare -A _GIT_INCLUDE_SEEN=()
+# _GIT_INCLUDE_PARSED: config files already read by parse_git_includes, keyed
+# by the path AS OPENED (not the canonical path: two symlinks to one file each
+# need their own traversal, because their relative includes resolve against
+# different directories).  Include loops end at the depth limit.
+declare -A _GIT_INCLUDE_PARSED=()
+# Maximum include nesting followed (git's own limit is 10).
+_GIT_INCLUDE_MAX_DEPTH=10
 GIT_INCLUDE_PATHS=()
+GIT_INCLUDE_VISIBLE=()
+# GIT_INCLUDE_PREDIRS: at the same index, a newline-separated list of
+# directories that must exist in the sandbox so git can resolve ".." in the
+# include path it opens (see _bwrap_include_visible_path).
+GIT_INCLUDE_PREDIRS=()
+# GIT_INCLUDE_LINKS: at the same index, a newline-separated list of symlinked
+# directories that precede a ".." in the include path.  The sandbox $HOME is
+# a tmpfs, so build_git_mounts recreates them with --symlink; the kernel then
+# resolves ".." against the symlink target exactly as it does on the host.
+GIT_INCLUDE_LINKS=()
+# GIT_INCLUDE_RAW: at the same index, the include path exactly as git computes
+# it (not normalised); used to find where git looks for the file when a
+# symlinked directory could not be recreated (see _bwrap_include_lexical_path).
+GIT_INCLUDE_RAW=()
+
+# Results of _bwrap_canonicalize_safe / _bwrap_include_visible_path /
+# _bwrap_path_blocked (globals, because _check_path_safe calls exit and must
+# not run in a subshell).
+_BWRAP_CANON=""
+_BWRAP_INC_VISIBLE=""
+_BWRAP_GIT_VALUE=""
+_BWRAP_INC_PREDIRS=""
+_BWRAP_INC_LINKS=""
+_BWRAP_INC_LEXICAL=""
+_BWRAP_INC_LEXDIRS=""
+_BWRAP_LEX_DEST=""
+_BWRAP_BLOCKED_KIND=""
+_BWRAP_BLOCKED_PREFIX=""
+
+# Symlinks already handled by _bwrap_git_recreate_link: path -> 0 (present or
+# recreated in the sandbox) / 1 (could not be recreated).
+declare -A _GIT_LINK_STATUS=()
+# Subset of the failed symlinks above: LINK -> 1 when LINK exists in the
+# sandbox as a plain directory (see _bwrap_git_recreate_link).
+declare -A _GIT_LINK_CONFLICT=()
+
+# Set to 1 by build_git_mounts when at least one file of
+# ${XDG_CONFIG_HOME}/git was mounted (launchers may point symlinks at the
+# directory; it is only guaranteed to resolve in the sandbox in that case).
+_BWRAP_XDG_GIT_HAS_FILES=0
 
 # Working directory state (set by build_workdir_mount)
 _BIND_DIR=""
@@ -161,17 +219,32 @@ detect_shell() {
     SANDBOX_SHELL="$(command -v bash 2> /dev/null || echo /bin/sh)"
 }
 
-# bwrap_find_tool TOOL
-#   Locate TOOL using PATH with exact, non-empty entries from
-#   N2SNSCRIPTS_TOOL_EXCLUDE_PATH removed.  This affects lookup only.
-bwrap_find_tool() {
-    if [[ -z "${N2SNSCRIPTS_TOOL_EXCLUDE_PATH:-}" ]]; then
-        command -v -- "$1"
-        return
+# bwrap_check_account
+#   Refuse to run for root and shared/service accounts.  The check itself is
+#   /opt/nsls2/libexec/agent-account-check, deployed by ansible: it prints a
+#   boxed refusal to stderr and exits non-zero for those accounts, and exits
+#   0 silently otherwise.  Every launcher calls this first in main().
+#   The path is deliberately hard-coded (not overridable from the environment,
+#   which would let a user point it at /bin/true).  When the script is not
+#   installed this is a no-op: hosts without the ansible deploy are still
+#   protected by the filesystem ACLs on the agent installs.
+bwrap_check_account() {
+    local _checker="/opt/nsls2/libexec/agent-account-check"
+    if [[ -f "${_checker}" && -x "${_checker}" ]]; then
+        "${_checker}" || exit $?
     fi
+}
 
+# _bwrap_filter_path
+#   Set _BWRAP_FILTERED_PATH to PATH with exact, non-empty entries from
+#   N2SNSCRIPTS_TOOL_EXCLUDE_PATH removed.  Returns 1 when every PATH entry
+#   was excluded (PATH="" would make command -v search the current dir).
+#   A no-op for callers when N2SNSCRIPTS_TOOL_EXCLUDE_PATH is unset: they
+#   should skip this function in that case.
+_BWRAP_FILTERED_PATH=""
+_bwrap_filter_path() {
     local _excluded_dir _path_dir _remaining_path="${PATH-}" _remaining_exclusions
-    local _filtered_path _has_separator _has_exclusion_separator _is_excluded _retained_count=0
+    local _has_separator _has_exclusion_separator _is_excluded _retained_count=0
     local -a _excluded_dirs=() _filtered_dirs=()
     local IFS=:
 
@@ -218,12 +291,281 @@ bwrap_find_tool() {
 
     # An empty retained entry is meaningful (it searches the current
     # directory), but an entirely filtered PATH must not become PATH="".
-    # command -v with that value would incorrectly search the current dir.
     [[ "${_retained_count}" -gt 0 ]] || return 1
 
-    _filtered_path="${_filtered_dirs[*]}"
-    local PATH="${_filtered_path}"
+    _BWRAP_FILTERED_PATH="${_filtered_dirs[*]}"
+}
+
+# bwrap_find_tool TOOL
+#   Locate TOOL using PATH with exact, non-empty entries from
+#   N2SNSCRIPTS_TOOL_EXCLUDE_PATH removed.  This affects lookup only.
+bwrap_find_tool() {
+    if [[ -z "${N2SNSCRIPTS_TOOL_EXCLUDE_PATH:-}" ]]; then
+        command -v -- "$1"
+        return
+    fi
+
+    _bwrap_filter_path || return 1
+    local PATH="${_BWRAP_FILTERED_PATH}"
     command -v -- "$1"
+}
+
+# ── Agent binary resolution and the "restricted" box ─────────────
+# NOTE: bwrap_account_name and bwrap_print_banner mirror the box drawing in
+# the ansible template roles/base/templates/agent-account-check.sh.j2 in
+# NSLS2/ansible (same UTF-8/ASCII glyphs, 78-column border, 76-column panel,
+# colour rules and padding arithmetic).  The two copies must be kept in step:
+# a change to the look of one box must be made in the other.
+
+# bwrap_account_name
+#   Print the current account name, or the numeric uid when the uid has no
+#   name.  `id -un` can print the number and still fail for an unnamed uid,
+#   so its exit status is ignored and an empty result falls back to `id -u`.
+bwrap_account_name() {
+    local _name
+    _name="$(/usr/bin/id -un 2> /dev/null || true)"
+    printf '%s\n' "${_name:-$(/usr/bin/id -u)}"
+}
+
+# _bwrap_banner_panel VERTICAL CONTENT STYLE RESET
+#   One left-aligned panel line (76 columns of content between the borders).
+_bwrap_banner_panel() {
+    local _vertical="$1" _content="$2" _style="$3" _reset="$4"
+    local _padding=$((76 - ${#_content}))
+
+    printf '%s %s%s%s%*s %s\n' \
+        "${_vertical}" "${_style}" "${_content}" "${_reset}" "${_padding}" '' "${_vertical}" >&2
+}
+
+# _bwrap_banner_centered VERTICAL CONTENT STYLE RESET
+#   One centred panel line.
+_bwrap_banner_centered() {
+    local _vertical="$1" _content="$2" _style="$3" _reset="$4"
+    local _padding=$((76 - ${#_content}))
+    local _left_padding=$((_padding / 2))
+    local _right_padding=$((_padding - _left_padding))
+
+    printf '%s %*s%s%s%s%*s %s\n' \
+        "${_vertical}" "${_left_padding}" '' "${_style}" "${_content}" "${_reset}" \
+        "${_right_padding}" '' "${_vertical}" >&2
+}
+
+# bwrap_print_banner TITLE LINE...
+#   Draw a boxed message on STDERR (never /dev/tty, so it works without a
+#   terminal): blank line, box, blank line.  Layout: blank panel line,
+#   centred bold-red TITLE between warning markers, blank panel line, each
+#   LINE left-aligned (longer than 76 columns => truncated with an ellipsis
+#   so the border stays aligned), blank panel line.  UTF-8 locales get
+#   box-drawing glyphs; others get ASCII.  Colour only when stderr is a tty,
+#   NO_COLOR is unset and TERM is set and not "dumb".
+#   Mirrors agent-account-check.sh.j2 in NSLS2/ansible -- keep in step.
+bwrap_print_banner() {
+    local _title="$1"
+    shift
+    local _top_left _top_right _bottom_left _bottom_right
+    local _horizontal _vertical _warning_marker _ellipsis
+    local _style_reset='' _style_bold_red='' _border='' _column _line
+
+    if [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" =~ [Uu][Tt][Ff]-?8 ]]; then
+        _top_left='┌'
+        _top_right='┐'
+        _bottom_left='└'
+        _bottom_right='┘'
+        _horizontal='─'
+        _vertical='│'
+        _warning_marker='⚠'
+        _ellipsis='…'
+    else
+        _top_left='+'
+        _top_right='+'
+        _bottom_left='+'
+        _bottom_right='+'
+        _horizontal='-'
+        _vertical='|'
+        _warning_marker='[!]'
+        _ellipsis='...'
+    fi
+
+    if [[ -t 2 && -z "${NO_COLOR:-}" && -n "${TERM:-}" && "${TERM}" != dumb ]]; then
+        _style_reset=$'\033[0m'
+        _style_bold_red=$'\033[1;31m'
+    fi
+
+    # tr is byte-oriented and corrupts multibyte box-drawing characters.
+    for ((_column = 0; _column < 78; _column++)); do
+        _border+="${_horizontal}"
+    done
+
+    printf '\n%s%s%s\n' "${_top_left}" "${_border}" "${_top_right}" >&2
+    _bwrap_banner_panel "${_vertical}" '' '' "${_style_reset}"
+    _bwrap_banner_centered "${_vertical}" "${_warning_marker}  ${_title}  ${_warning_marker}" \
+        "${_style_bold_red}" "${_style_reset}"
+    _bwrap_banner_panel "${_vertical}" '' '' "${_style_reset}"
+    for _line in "$@"; do
+        if ((${#_line} > 76)); then
+            _line="${_line:0:76-${#_ellipsis}}${_ellipsis}"
+        fi
+        _bwrap_banner_panel "${_vertical}" "${_line}" '' "${_style_reset}"
+    done
+    _bwrap_banner_panel "${_vertical}" '' '' "${_style_reset}"
+    printf '%s%s%s\n\n' "${_bottom_left}" "${_border}" "${_bottom_right}" >&2
+}
+
+# _bwrap_first_candidate NAME
+#   Set _BWRAP_CANDIDATE to the first PATH entry (exclusion-filtered by
+#   N2SNSCRIPTS_TOOL_EXCLUDE_PATH, like bwrap_find_tool) called NAME that
+#   exists as a path or as a symlink -- even when it is not usable.  Returns
+#   1 (and leaves it empty) when there is none.
+_BWRAP_CANDIDATE=""
+_bwrap_first_candidate() {
+    local _name="$1" _search_path="${PATH-}" _dir _candidate _has_separator
+    _BWRAP_CANDIDATE=""
+    if [[ -n "${N2SNSCRIPTS_TOOL_EXCLUDE_PATH:-}" ]]; then
+        _bwrap_filter_path || return 1
+        _search_path="${_BWRAP_FILTERED_PATH}"
+    fi
+
+    while :; do
+        if [[ "${_search_path}" == *:* ]]; then
+            _has_separator=1
+            _dir="${_search_path%%:*}"
+            _search_path="${_search_path#*:}"
+        else
+            _has_separator=0
+            _dir="${_search_path}"
+        fi
+        _candidate="${_dir:-.}/${_name}"
+        if [[ -e "${_candidate}" || -L "${_candidate}" ]]; then
+            _BWRAP_CANDIDATE="${_candidate}"
+            return 0
+        fi
+        [[ "${_has_separator}" -eq 1 ]] || break
+    done
+    return 1
+}
+
+# _bwrap_symlink_is_restricted LINK
+#   Return 0 when following the symlink LINK directory by directory from "/"
+#   reaches a directory that exists but cannot be entered (`-d && ! -x`)
+#   before the final file.  That is what an ansible ACL `group:<g>:---` on an
+#   agent package directory looks like to a denied user: the symlink in
+#   /usr/local/bin is visible but its target is `-e` false because a parent
+#   directory cannot be traversed.  Returns 1 otherwise (including a
+#   dangling link, where the missing component's parent IS enterable).
+#   The raw `readlink` target is used (no -f); a relative target is resolved
+#   against the link's directory; "." and ".." are handled lexically; a
+#   component that is itself a symlink is resolved with `readlink -f` (a
+#   failure counts as broken); at most 10 symlink hops are followed.
+_bwrap_symlink_is_restricted() {
+    local _link="$1" _hops=0 _target _resolved _next _comp _i _last
+    local -a _parts
+
+    while :; do
+        ((_hops += 1))
+        [[ "${_hops}" -le 10 ]] || return 1
+        _target="$(readlink -- "${_link}")" || return 1
+        [[ -n "${_target}" ]] || return 1
+        if [[ "${_target}" != /* ]]; then
+            [[ "${_link}" == /* ]] || _link="${PWD}/${_link}"
+            _target="${_link%/*}/${_target}"
+        fi
+
+        _resolved="/"
+        IFS='/' read -ra _parts <<< "${_target}"
+        _last=$((${#_parts[@]} - 1))
+        for ((_i = 0; _i <= _last; _i++)); do
+            _comp="${_parts[_i]}"
+            case "${_comp}" in
+                '' | .) continue ;;
+                ..)
+                    _resolved="${_resolved%/*}"
+                    [[ -n "${_resolved}" ]] || _resolved="/"
+                    continue
+                    ;;
+            esac
+            _next="${_resolved%/}/${_comp}"
+
+            if [[ "${_i}" -eq "${_last}" ]]; then
+                # Final component: another symlink hop, or the end of the road.
+                if [[ -L "${_next}" ]]; then
+                    _link="${_next}"
+                    continue 2
+                fi
+                return 1
+            fi
+
+            if [[ -L "${_next}" ]]; then
+                _next="$(readlink -f -- "${_next}")" || return 1
+            fi
+            [[ -e "${_next}" ]] || return 1
+            [[ -d "${_next}" ]] || return 1
+            if [[ ! -x "${_next}" ]]; then
+                return 0
+            fi
+            _resolved="${_next}"
+        done
+        # Target ended in "/", "." or ".." (a directory): nothing more to follow.
+        return 1
+    done
+}
+
+# bwrap_resolve_tool NAME [NOT_FOUND_HINT]
+#   Resolve the agent binary NAME for a launcher, setting _TOOL_BIN and
+#   _TOOL_CMD (TEST_CMD, split into words, overrides the command).  When NAME
+#   cannot be used, exit 1 with a message that tells three cases apart:
+#     restricted     NAME is a symlink whose target directory exists but
+#                    cannot be entered (the ansible ACL on shared/service
+#                    accounts): the same box as the ansible account check
+#                    (without the docs links), naming the tool.
+#     installed incorrectly
+#                    a dangling symlink, or a file that is not executable.
+#     not installed  nothing called NAME in PATH; NOT_FOUND_HINT (optional)
+#                    is printed on a second line.
+bwrap_resolve_tool() {
+    local _name="$1" _hint="${2:-}" _account _max_name _suffix
+
+    # `command -v` falls back to a non-executable file when no executable
+    # NAME exists in PATH, so a result must also pass -x to count as found.
+    _TOOL_BIN="$(bwrap_find_tool "${_name}" 2> /dev/null || true)"
+    if [[ -n "${_TOOL_BIN}" && -x "${_TOOL_BIN}" ]]; then
+        if [[ -n "${TEST_CMD}" ]]; then
+            # Split TEST_CMD into array so multi-word commands work correctly.
+            read -ra _TOOL_CMD <<< "${TEST_CMD}"
+        else
+            _TOOL_CMD=("${_TOOL_BIN}")
+        fi
+        return 0
+    fi
+
+    if ! _bwrap_first_candidate "${_name}"; then
+        echo "Error: '${_name}' not found in PATH." >&2
+        [[ -z "${_hint}" ]] || echo "${_hint}" >&2
+        exit 1
+    fi
+
+    if [[ -L "${_BWRAP_CANDIDATE}" ]] && _bwrap_symlink_is_restricted "${_BWRAP_CANDIDATE}"; then
+        _account="$(bwrap_account_name)"
+        # Keep the line within the 76-column panel by truncating the account
+        # name with the glyph set the box will use (same logic as the ansible
+        # check).
+        _suffix="' is a shared/service account."
+        _max_name=$((76 - 1 - ${#_suffix}))
+        if ((${#_account} > _max_name)); then
+            if [[ "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" =~ [Uu][Tt][Ff]-?8 ]]; then
+                _account="${_account:0:_max_name-1}…"
+            else
+                _account="${_account:0:_max_name-3}..."
+            fi
+        fi
+        bwrap_print_banner 'AI coding agents cannot be run from this account' \
+            "'${_account}${_suffix}" \
+            "'${_name}' is not available to this account." \
+            'Log in as yourself first:  su - YOUR-USERNAME'
+        exit 1
+    fi
+
+    echo "Error: '${_name}' is installed incorrectly (${_BWRAP_CANDIDATE} points to a missing file or is not executable). Ask your system administrator." >&2
+    exit 1
 }
 
 # ── Dynamic mount helpers ────────────────────────────────────────
@@ -379,9 +721,68 @@ _mount_npm_global_prefix() {
 
 # ── Git include parser ───────────────────────────────────────────
 
+# _bwrap_git_decode_value RAW
+#   Decode a git config value the way git does, so a quoted or commented
+#   include path is recognised.  Result in _BWRAP_GIT_VALUE; returns 1 when the
+#   value is not valid (unterminated quote, unknown escape).  Rules: leading
+#   and trailing whitespace is dropped; a double quote toggles quoting; inside
+#   or outside quotes the escapes \n \t \b \" \\ are decoded; outside quotes
+#   an unescaped '#' or ';' starts a comment.  A trailing backslash (git's line
+#   continuation) is not supported: such a value is treated as invalid and the
+#   include is skipped.
+_bwrap_git_decode_value() {
+    local raw="$1" out="" c next i n=${#1} quoted=0 pending=""
+    _BWRAP_GIT_VALUE=""
+    for ((i = 0; i < n; i++)); do
+        c="${raw:i:1}"
+        if [[ "${c}" == "\\" ]]; then
+            i=$((i + 1))
+            [[ ${i} -lt ${n} ]] || return 1
+            next="${raw:i:1}"
+            case "${next}" in
+                n) c=$'\n' ;;
+                t) c=$'\t' ;;
+                b) c=$'\b' ;;
+                '"' | "\\") c="${next}" ;;
+                *) return 1 ;;
+            esac
+            out+="${pending}${c}"
+            pending=""
+        elif [[ "${c}" == '"' ]]; then
+            quoted=$((1 - quoted))
+        elif [[ ${quoted} -eq 0 && ("${c}" == "#" || "${c}" == ";")   ]]; then
+            break
+        elif [[ ${quoted} -eq 0 && ("${c}" == " " || "${c}" == $'\t')   ]]; then
+            # Whitespace outside quotes is kept only if more text follows.
+            [[ -n "${out}" || -n "${pending}" ]] && pending+=" "
+        else
+            out+="${pending}${c}"
+            pending=""
+        fi
+    done
+    [[ ${quoted} -eq 0 ]] || return 1
+    _BWRAP_GIT_VALUE="${out}"
+}
+
+# parse_git_includes CONFIG_FILE [DEPTH]
+#   Record every [include] / [includeIf] "path =" target of CONFIG_FILE and
+#   follow the included files recursively (DEPTH is the nesting level of
+#   CONFIG_FILE: 0 for ~/.gitconfig and the XDG config; at most
+#   _GIT_INCLUDE_MAX_DEPTH levels of includes are followed, like git).
+#   CONFIG_FILE is the path as git opened it (not normalised): relative
+#   includes resolve against its directory, and the kernel resolves any ".."
+#   in it, exactly as for git.  A file is parsed once per path as opened, and
+#   nesting stops at the depth limit, so include loops terminate; a canonical
+#   path in a blocked location is never read (build_git_mounts refuses it at
+#   mount time).  Conditions of
+#   [includeIf] are not evaluated: every candidate is recorded.
 parse_git_includes() {
-    local config_file="$1"
-    [[ -f "${config_file}" ]] || return 0
+    local config_file="$1" depth="${2:-0}" line
+    [[ -f "${config_file}" && -r "${config_file}" ]] || return 0
+    [[ "${depth}" -lt "${_GIT_INCLUDE_MAX_DEPTH}" ]] || return 0
+
+    [[ -z "${_GIT_INCLUDE_PARSED["${config_file}"]:-}" ]] || return 0
+    _GIT_INCLUDE_PARSED["${config_file}"]=1
 
     # Git resolves relative include paths relative to the location of
     # the config file (the symlink path, NOT the resolved target).
@@ -391,11 +792,12 @@ parse_git_includes() {
     # Matches lines like:  path = /some/path  or  path = ~/relative
     # Pure bash — no grep/sed/xargs subprocesses.
     while IFS= read -r line || [[ -n "${line}" ]]; do
-        [[ "${line}" =~ ^[[:space:]]*path[[:space:]]*=[[:space:]]*(.*) ]] || continue
-        local path_val="${BASH_REMATCH[1]}"
-
-        # Trim trailing whitespace
-        path_val="${path_val%"${path_val##*[![:space:]]}"}"
+        # git variable names are case-insensitive.  The value is decoded the
+        # way git does (quotes, escapes, trailing comments) before anything is
+        # derived from it; an undecodable value is skipped.
+        [[ "${line}" =~ ^[[:space:]]*[Pp][Aa][Tt][Hh][[:space:]]*=[[:space:]]*(.*) ]] || continue
+        _bwrap_git_decode_value "${BASH_REMATCH[1]}" || continue
+        local path_val="${_BWRAP_GIT_VALUE}"
         [[ -z "${path_val}" ]] && continue
 
         # Resolve ~/ prefix
@@ -406,18 +808,32 @@ parse_git_includes() {
             path_val="${config_dir}/${path_val}"
         fi
 
-        # Resolve symlinks and canonicalize
-        local resolved
-        if [[ -L "${path_val}" ]]; then
-            resolved="$(readlink -f "${path_val}" 2> /dev/null || echo "${path_val}")"
-        else
-            resolved="${path_val}"
-        fi
+        # Canonicalize ALWAYS (realpath), not only when the last component is
+        # a symlink: a symlinked parent directory would otherwise hide the real
+        # target from _check_path_safe.  The path git itself will open (and
+        # therefore where the sandbox must provide the file) is worked out by
+        # _bwrap_include_visible_path, which also reports the symlinked
+        # directories before a ".." that build_git_mounts must recreate.
+        local visible resolved predirs links
+        _bwrap_include_visible_path "${path_val}"
+        visible="${_BWRAP_INC_VISIBLE}"
+        predirs="${_BWRAP_INC_PREDIRS}"
+        links="${_BWRAP_INC_LINKS}"
+        resolved="$(readlink -f "${path_val}" 2> /dev/null || true)"
+        [[ -n "${resolved}" ]] || resolved="${visible}"
 
-        # Deduplicate
-        if [[ -e "${resolved}" ]] && [[ -z "${_GIT_INCLUDE_SEEN["${resolved}"]:-}" ]]; then
-            _GIT_INCLUDE_SEEN["${resolved}"]=1
+        # Deduplicate on the raw path as written (see _GIT_INCLUDE_SEEN)
+        if [[ -e "${resolved}" ]] && [[ -z "${_GIT_INCLUDE_SEEN["${path_val}"]:-}" ]]; then
+            _GIT_INCLUDE_SEEN["${path_val}"]=1
             GIT_INCLUDE_PATHS+=("${resolved}")
+            GIT_INCLUDE_VISIBLE+=("${visible}")
+            GIT_INCLUDE_PREDIRS+=("${predirs}")
+            GIT_INCLUDE_LINKS+=("${links}")
+            GIT_INCLUDE_RAW+=("${path_val}")
+            # Nested includes: follow the included file unless it is blocked.
+            if [[ -f "${resolved}" ]] && ! _bwrap_path_blocked "${resolved}"; then
+                parse_git_includes "${path_val}" "$((depth + 1))"
+            fi
         fi
     done < "${config_file}"
 }
@@ -428,7 +844,13 @@ parse_all_git_includes() {
         parse_git_includes "${_HOME}/.gitconfig"
     fi
     if [[ -f "${XDG_CONFIG_HOME}/git/config" ]]; then
-        parse_git_includes "${XDG_CONFIG_HOME}/git/config"
+        # A config that resolves into a blocked location is not mounted
+        # (see _bwrap_mount_xdg_git_files), so its includes are not followed.
+        local _xdg_cfg_real
+        _xdg_cfg_real="$(readlink -f "${XDG_CONFIG_HOME}/git/config" 2> /dev/null || true)"
+        if [[ -z "${_xdg_cfg_real}" ]] || ! _bwrap_path_blocked "${_xdg_cfg_real}"; then
+            parse_git_includes "${XDG_CONFIG_HOME}/git/config"
+        fi
     fi
 }
 
@@ -453,6 +875,100 @@ _is_prefix_of() {
     # a="/" matches every absolute path; otherwise b must equal a or sit
     # directly beneath it (a/...).
     [[ "${a}" == "/" || "${b}" == "${a}" || "${b}" == "${a}/"* ]]
+}
+
+# _bwrap_load_blocked_prefixes
+#   Fill the global array _BWRAP_BLOCKED_LIST with the sensitive locations
+#   that are never mounted (see _check_path_safe for the rationale).
+#   XDG_DATA_HOME is set by resolve_common_paths, which is always called
+#   before any function that uses this list.
+#   Callers compare CANONICAL paths, so each entry is listed both as written
+#   and at its resolved target (readlink -f) when that differs: with
+#   ~/.config/git -> ~/dotfiles/git the credentials file is matched as
+#   ~/dotfiles/git/credentials too, and a symlinked ~/.git-credentials or ~/.ssh
+#   is matched at its target.  readlink -f resolves a missing last component
+#   against its (resolved) parent, so an entry that does not exist yet is
+#   covered as well.  The list is built once per HOME/XDG combination.
+_BWRAP_BLOCKED_LIST=()
+_BWRAP_BLOCKED_KEY=""
+_bwrap_load_blocked_prefixes() {
+    local _key="${_HOME}|${XDG_CONFIG_HOME:-}|${XDG_DATA_HOME:-}"
+    [[ "${_key}" == "${_BWRAP_BLOCKED_KEY}" && ${#_BWRAP_BLOCKED_LIST[@]} -gt 0 ]] && return 0
+    local -a _literal=(
+        # SSH / GPG / cloud keys
+        "${_HOME}/.ssh"
+        "${_HOME}/.gnupg"
+        "${_HOME}/.aws"
+        "${_HOME}/.kube"
+        "${_HOME}/.docker"
+        # Package-manager credentials
+        "${_HOME}/.netrc"
+        "${_HOME}/.pypirc"
+        "${_HOME}/.rattler"
+        "${_HOME}/.yarnrc"
+        "${_HOME}/.yarnrc.yml"
+        "${_HOME}/.yarn"
+        "${XDG_DATA_HOME}/uv/credentials"
+        # Password managers
+        "${_HOME}/.password-store"   # pass / gopass encrypted secret store
+        "${_HOME}/.config/1Password" # 1Password CLI session/config
+        "${_HOME}/.config/op"        # 1Password CLI (alternate path)
+        # GitHub CLI tokens
+        "${_HOME}/.config/gh"
+        # Default stores of git's "store" credential helper (plaintext).  Listing
+        # them here makes the working-directory / --ro-path / --rw-path checks
+        # refuse them, and refuse a directory that contains an existing one
+        # (for example launching from ~/.config/git).
+        "${_HOME}/.git-credentials"
+        "${XDG_CONFIG_HOME}/git/credentials"
+        # System
+        "/root"
+        "/etc/shadow"
+        "/etc/sudoers"
+        "/etc/sudoers.d"
+    )
+    local _e _r
+    _BWRAP_BLOCKED_LIST=()
+    for _e in "${_literal[@]}"; do
+        _BWRAP_BLOCKED_LIST+=("${_e}")
+        _r="$(readlink -f -- "${_e}" 2> /dev/null || true)"
+        if [[ -n "${_r}" && "${_r}" != "${_e}" ]]; then
+            _BWRAP_BLOCKED_LIST+=("${_r}")
+        fi
+    done
+    _BWRAP_BLOCKED_KEY="${_key}"
+}
+
+# _bwrap_path_blocked CANON
+#   Non-exiting form of the check below: return 0 (true) when the canonical
+#   path CANON is blocked, 1 otherwise.  On a hit, _BWRAP_BLOCKED_KIND is
+#   "home" (CANON is $HOME or an ancestor of it) or "prefix" (CANON is inside
+#   the sensitive subtree _BWRAP_BLOCKED_PREFIX).  Used directly where a
+#   blocked entry is skipped with a warning instead of aborting the launcher,
+#   and by _check_path_safe, which prints the error and exits.
+_bwrap_path_blocked() {
+    local canon="$1"
+    _BWRAP_BLOCKED_KIND=""
+    _BWRAP_BLOCKED_PREFIX=""
+
+    # Reject if canon IS $HOME or is a directory that contains $HOME
+    # (i.e. /, /home, the username's parent dir, etc.).
+    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.
+    if _is_prefix_of "${canon}" "${_HOME}"; then
+        _BWRAP_BLOCKED_KIND="home"
+        return 0
+    fi
+
+    local _blocked_prefix
+    _bwrap_load_blocked_prefixes
+    for _blocked_prefix in "${_BWRAP_BLOCKED_LIST[@]}"; do
+        if _is_prefix_of "${_blocked_prefix}" "${canon}"; then
+            _BWRAP_BLOCKED_KIND="prefix"
+            _BWRAP_BLOCKED_PREFIX="${_blocked_prefix}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # _check_path_safe CANON CONTEXT
@@ -518,51 +1034,43 @@ _check_path_safe() {
     local canon="$1"
     local context="$2"
 
-    # ── Ancestor-of-home check ───────────────────────────────────
-    # Reject if canon IS $HOME or is a directory that contains $HOME
-    # (i.e. /, /home, the username's parent dir, etc.).
-    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.
-    if _is_prefix_of "${canon}" "${_HOME}"; then
-        echo "Error: ${context} '${canon}' is \$HOME or an ancestor of \$HOME." >&2
-        echo "       Refusing to mount — this would expose the entire home tree." >&2
+    if _bwrap_path_blocked "${canon}"; then
+        if [[ "${_BWRAP_BLOCKED_KIND}" == "home" ]]; then
+            echo "Error: ${context} '${canon}' is \$HOME or an ancestor of \$HOME." >&2
+            echo "       Refusing to mount — this would expose the entire home tree." >&2
+        else
+            echo "Error: ${context} '${canon}' is inside the blocked path '${_BWRAP_BLOCKED_PREFIX}'." >&2
+            echo "       Refusing to mount." >&2
+        fi
         exit 1
     fi
+}
 
-    # ── Sensitive-subtree checks ─────────────────────────────────
-    # XDG_DATA_HOME is set by resolve_common_paths, which is always called
-    # before any function that invokes _check_path_safe.
-    local _blocked_prefix
-    local _BLOCKED_PREFIXES=(
-        # SSH / GPG / cloud keys
-        "${_HOME}/.ssh"
-        "${_HOME}/.gnupg"
-        "${_HOME}/.aws"
-        "${_HOME}/.kube"
-        "${_HOME}/.docker"
-        # Package-manager credentials
-        "${_HOME}/.netrc"
-        "${_HOME}/.pypirc"
-        "${_HOME}/.rattler"
-        "${_HOME}/.yarnrc"
-        "${_HOME}/.yarnrc.yml"
-        "${_HOME}/.yarn"
-        "${XDG_DATA_HOME}/uv/credentials"
-        # Password managers
-        "${_HOME}/.password-store"   # pass / gopass encrypted secret store
-        "${_HOME}/.config/1Password" # 1Password CLI session/config
-        "${_HOME}/.config/op"        # 1Password CLI (alternate path)
-        # GitHub CLI tokens
-        "${_HOME}/.config/gh"
-        # System
-        "/root"
-        "/etc/shadow"
-        "/etc/sudoers"
-        "/etc/sudoers.d"
-    )
-    for _blocked_prefix in "${_BLOCKED_PREFIXES[@]}"; do
-        if _is_prefix_of "${_blocked_prefix}" "${canon}"; then
-            echo "Error: ${context} '${canon}' is inside the blocked path '${_blocked_prefix}'." >&2
-            echo "       Refusing to mount." >&2
+# EXTRA_BLOCKED_DIRS: launcher-specific locations that a mounted directory
+# must not CONTAIN (they may be entered by other means, e.g. mounted file by
+# file).  bwopencode2 sets it to its config directory, whose service.json is
+# deliberately never mounted.  Existing paths only.
+EXTRA_BLOCKED_DIRS=()
+
+# _check_dir_contains_blocked CANON CONTEXT
+#   Companion of _check_path_safe for a directory that is bound WHOLE (working
+#   directory or git root, --ro-path, --rw-path): exit 1 when the canonical
+#   directory CANON is, or is an ancestor of, a blocked location that exists
+#   on disk (anything in the blocked list, a symlink's target included, or an
+#   EXTRA_BLOCKED_DIRS entry).  Binding such a directory would expose the
+#   blocked location through the parent mount (e.g. running from ~/.config
+#   would bind ~/.config/gh read-write).  Blocked locations that do not exist
+#   are ignored.  Call AFTER _check_path_safe (which reports $HOME, its
+#   ancestors and paths inside a blocked tree first).
+_check_dir_contains_blocked() {
+    local canon="$1" context="$2" _b _t
+    _bwrap_load_blocked_prefixes
+    for _b in "${_BWRAP_BLOCKED_LIST[@]}" "${EXTRA_BLOCKED_DIRS[@]+"${EXTRA_BLOCKED_DIRS[@]}"}"; do
+        [[ -n "${_b}" ]] || continue
+        [[ -e "${_b}" || -L "${_b}" ]] || continue
+        _t="$(readlink -f -- "${_b}" 2> /dev/null || true)"
+        if _is_prefix_of "${canon}" "${_b}" || { [[ -n "${_t}" ]] && _is_prefix_of "${canon}" "${_t}"; }; then
+            echo "Error: ${context} '${canon}' contains the blocked path '${_b}'. Refusing to mount." >&2
             exit 1
         fi
     done
@@ -590,6 +1098,110 @@ _check_dir_safe() {
         canon="${path}"
     fi
     _check_path_safe "${canon}" "${context}"
+}
+
+# _bwrap_canonicalize_safe PATH CONTEXT
+#   Canonicalize PATH with readlink -f (falls back to PATH itself when
+#   readlink fails or PATH does not exist) and run _check_path_safe on the
+#   canonical result.  ALWAYS canonicalizes, so a symlinked parent directory
+#   cannot hide a blocked target (bwrap's --ro-bind follows the symlink and
+#   would mount the real file).
+#
+#   The canonical path is returned in the global _BWRAP_CANON, NOT on stdout:
+#   _check_path_safe calls exit 1, and inside $(...) that would only leave
+#   the subshell and let the launcher carry on.
+_bwrap_canonicalize_safe() {
+    local path="$1"
+    local context="$2"
+    _BWRAP_CANON="$(readlink -f "${path}" 2> /dev/null || true)"
+    [[ -n "${_BWRAP_CANON}" ]] || _BWRAP_CANON="${path}"
+    _check_path_safe "${_BWRAP_CANON}" "${context}"
+}
+
+# _bwrap_include_visible_path RAW
+#   Work out where the sandbox must provide a git include so that git can open
+#   the path it computed (RAW, not normalised).  Sets:
+#     _BWRAP_INC_VISIBLE  the path as the kernel resolves it on the host:
+#                         every component up to the LAST ".." is resolved
+#                         physically (a symlinked directory is replaced by its
+#                         target, so ".." means the parent of the TARGET, as
+#                         on the host); components after it are kept as named
+#     _BWRAP_INC_PREDIRS  newline-separated directories the kernel walks
+#                         before the last ".." (they hold no data; they only
+#                         have to exist in the sandbox)
+#     _BWRAP_INC_LINKS    newline-separated symlinked directories met before
+#                         the last ".."; the sandbox must provide them as
+#                         symlinks (build_git_mounts recreates them) for the
+#                         kernel to resolve ".." the same way there
+#   Without a symlinked directory before a ".." this equals the lexical
+#   normalisation of RAW and _BWRAP_INC_LINKS is empty.
+_bwrap_include_visible_path() {
+    local raw="$1" part cand phys="/" tail="" i last_dotdot=-1
+    local -a parts=()
+    local IFS=/
+    _BWRAP_INC_PREDIRS=""
+    _BWRAP_INC_LINKS=""
+    read -r -a parts <<< "${raw}"
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        [[ "${parts[i]}" == ".." ]] && last_dotdot=${i}
+    done
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        part="${parts[i]}"
+        case "${part}" in
+            '' | .) ;;
+            ..)
+                # phys is physical, so its parent is the physical parent
+                [[ "${phys}" == "/" ]] || phys="${phys%/*}"
+                [[ -n "${phys}" ]] || phys="/"
+                ;;
+            *)
+                if [[ "${i}" -lt "${last_dotdot}" ]]; then
+                    cand="${phys%/}/${part}"
+                    if [[ -L "${cand}" ]]; then
+                        _BWRAP_INC_LINKS+="${cand}"$'\n'
+                        phys="$(readlink -f -- "${cand}" 2> /dev/null || true)"
+                        [[ -n "${phys}" ]] || phys="${cand}"
+                    else
+                        phys="${cand}"
+                    fi
+                    _BWRAP_INC_PREDIRS+="${phys}"$'\n'
+                else
+                    tail+="/${part}"
+                fi
+                ;;
+        esac
+    done
+    _BWRAP_INC_VISIBLE="${phys%/}${tail}"
+}
+
+# _bwrap_include_lexical_path RAW
+#   Work out where git looks for an include in a sandbox where every symlinked
+#   directory of RAW exists as a plain directory (so ".." is collapsed
+#   lexically).  Sets:
+#     _BWRAP_INC_LEXICAL  RAW normalised lexically
+#     _BWRAP_INC_LEXDIRS  newline-separated directories the kernel walks
+#                         before the last ".."
+_bwrap_include_lexical_path() {
+    local raw="$1" part cur="" i last_dotdot=-1
+    local -a parts=()
+    local IFS=/
+    _BWRAP_INC_LEXDIRS=""
+    read -r -a parts <<< "${raw}"
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        [[ "${parts[i]}" == ".." ]] && last_dotdot=${i}
+    done
+    for ((i = 0; i < ${#parts[@]}; i++)); do
+        part="${parts[i]}"
+        case "${part}" in
+            '' | .) ;;
+            ..) cur="${cur%/*}" ;;
+            *)
+                cur+="/${part}"
+                [[ "${i}" -lt "${last_dotdot}" ]] && _BWRAP_INC_LEXDIRS+="${cur}"$'\n'
+                ;;
+        esac
+    done
+    _BWRAP_INC_LEXICAL="${cur:-/}"
 }
 
 # validate_extra_path RAW_PATH MODE
@@ -626,6 +1238,9 @@ validate_extra_path() {
 
     # ── Safety check ─────────────────────────────────────────────
     _check_path_safe "${canon}" "--${mode}-path"
+    if [[ -d "${canon}" ]]; then
+        _check_dir_contains_blocked "${canon}" "--${mode}-path"
+    fi
 
     # All checks passed — return the canonical path.
     echo "${canon}"
@@ -1041,6 +1656,14 @@ build_workdir_mount() {
     # already canonical paths, so no readlink -f step is needed here.
     _check_path_safe "${_BIND_DIR}" "working directory"
 
+    # A directory that CONTAINS a blocked location (e.g. ~/.config with
+    # ~/.config/gh) is refused too: the whole tree is bound read-write.  The
+    # check runs on the canonical path.
+    local _bind_canon
+    _bind_canon="$(readlink -f -- "${_BIND_DIR}" 2> /dev/null || true)"
+    [[ -n "${_bind_canon}" ]] || _bind_canon="${_BIND_DIR}"
+    _check_dir_contains_blocked "${_bind_canon}" "working directory"
+
     # If the bind dir is under HOME, create intermediate directories in the
     # tmpfs so the bind mount point is reachable.  _BIND_DIR is itself the
     # bind mount point, so only its ancestors are pre-created.
@@ -1051,6 +1674,237 @@ build_workdir_mount() {
 }
 
 # ── Git config (read-only) ──────────────────────────────────────
+
+# _bwrap_already_mounted PATH
+#   Return 0 when PATH lies inside a tree that is present in the sandbox with
+#   its host content (symlinks included): the standard system trees, the /etc
+#   DIRECTORY trees build_etc_mounts binds (never /etc itself: only selected
+#   entries of it are bound, so e.g. /etc/xdg is NOT present), the working
+#   directory, and the pixi / ccache / npm / ~/bin / registered mounts.
+#   Anything else under the tmpfs $HOME is NOT present.
+_bwrap_already_mounted() {
+    local path="$1" _m
+    for _m in /usr /bin /sbin /lib /lib64 \
+            /etc/ssl /etc/pki /etc/crypto-policies /etc/ca-certificates \
+            /etc/alternatives /etc/ld.so.conf.d /nsls2/software/bin \
+            "${_BIND_DIR}" "${PIXI_HOME_DIR}" "${CCACHE_CONFIG_DIR}" \
+            "${CCACHE_CACHE_DIR}" "${NPM_CACHE_DIR}" "${_HOME}/bin"; do
+        [[ -n "${_m}" ]] || continue
+        _is_prefix_of "${_m}" "${path}" && return 0
+    done
+    if [[ ${#_MOUNTED_PREFIXES[@]} -gt 0 ]]; then
+        for _m in "${!_MOUNTED_PREFIXES[@]}"; do
+            _is_prefix_of "${_m}" "${path}" && return 0
+        done
+    fi
+    return 1
+}
+
+# _bwrap_is_bind_root PATH
+#   Return 0 when PATH is EXACTLY the root of a directory the launcher binds
+#   whole (the working directory, the pixi / ccache / npm / ~/bin trees, any
+#   registered mount), other than the system trees /usr /bin /sbin /lib
+#   /lib64 /proc /dev /tmp (those are real directories, or symlinks that
+#   build_sys_mounts recreates as symlinks).  A bind's source is resolved, so
+#   when PATH is a symlink the sandbox sees a plain directory at PATH; a
+#   symlink strictly INSIDE a bound tree keeps its host form.
+_bwrap_is_bind_root() {
+    local path="$1" _m
+    for _m in "${_BIND_DIR}" "${PIXI_HOME_DIR}" "${CCACHE_CONFIG_DIR}" \
+            "${CCACHE_CACHE_DIR}" "${NPM_CACHE_DIR}" "${_HOME}/bin"; do
+        [[ -n "${_m}" && "${_m}" == "${path}" ]] && return 0
+    done
+    if [[ ${#_MOUNTED_PREFIXES[@]} -gt 0 ]]; then
+        for _m in "${!_MOUNTED_PREFIXES[@]}"; do
+            case "${_m}" in
+                /usr | /bin | /sbin | /lib | /lib64 | /proc | /dev | /tmp) continue ;;
+            esac
+            [[ "${_m}" == "${path}" ]] && return 0
+        done
+    fi
+    return 1
+}
+
+# _bwrap_dest_in_args PATH
+#   Return 0 when some element of BWRAP_ARGS equals PATH or lies below it
+#   (--dir / --tmpfs / --bind / --ro-bind / --symlink destination, or a child
+#   of PATH): PATH already exists in the sandbox as a directory (or other
+#   object) or has been populated, so a --symlink at PATH would make bwrap
+#   fail at startup.
+_bwrap_dest_in_args() {
+    local path="$1" _a
+    for _a in "${BWRAP_ARGS[@]+"${BWRAP_ARGS[@]}"}"; do
+        [[ "${_a}" == "${path}" || "${_a}" == "${path}"/* ]] && return 0
+    done
+    return 1
+}
+
+# _bwrap_git_recreate_link LINK
+#   Make the symlinked directory LINK exist in the sandbox.  The sandbox
+#   $HOME is a tmpfs, so a symlink under $HOME is lost; without it the kernel
+#   resolves ".." in a git include path differently than on the host.  Emits
+#   --symlink <real target> LINK (after the --dir ancestors) once per LINK.
+#   Return 0 when LINK is present (already mounted, or recreated), 1 when it
+#   cannot be: outside $HOME and not inside a mounted tree (symlinks outside
+#   $HOME, e.g. under /etc, are never recreated), dangling, LINK or its target
+#   inside a blocked location, LINK already present in BWRAP_ARGS, or LINK is
+#   itself the root of a directory bind (_bwrap_is_bind_root; the last two are
+#   warned about and never linked).
+#   Ordering rule: bwrap fails at startup when --symlink's destination
+#   exists.  build_home_tmpfs pre-creates ~/.config, ~/.local, ~/.local/share,
+#   ~/.cache and ~/bin as directories and other mounts populate paths below
+#   them before this runs, so a host symlink at such a path is NOT emitted;
+#   the sandbox keeps the plain directory (_GIT_LINK_CONFLICT[LINK]=1).
+_bwrap_git_recreate_link() {
+    local link="$1" target
+    if [[ -n "${_GIT_LINK_STATUS["${link}"]:-}" ]]; then
+        return "${_GIT_LINK_STATUS["${link}"]}"
+    fi
+    _GIT_LINK_STATUS["${link}"]=1
+    if _bwrap_is_bind_root "${link}"; then
+        # The symlink IS the root of a directory bind (e.g. ~/bin -> dotfiles
+        # with --ro-bind ~/bin ~/bin): the bind source is the symlink's
+        # target, so the sandbox has a plain directory at LINK and ".."
+        # through it resolves lexically.
+        _GIT_LINK_CONFLICT["${link}"]=1
+        printf 'Warning: %s is a symlink on the host but a plain directory in the sandbox\n' "${link}" >&2
+        printf '         (it is the root of a directory mount); not recreated. Git includes that use ".."\n' >&2
+        printf '         through it may not resolve.\n' >&2
+        return 1
+    fi
+    if _bwrap_already_mounted "${link}"; then
+        _GIT_LINK_STATUS["${link}"]=0
+        return 0
+    fi
+    [[ "${link}" == "${_HOME}"/* ]] || return 1
+    target="$(readlink -f -- "${link}" 2> /dev/null || true)"
+    [[ -n "${target}" && -d "${target}" ]] || return 1
+    if _bwrap_path_blocked "${link}" || _bwrap_path_blocked "${target}"; then
+        echo "Warning: symlink ${link} resolves into a blocked location (${target}); not recreated." >&2
+        return 1
+    fi
+    if _bwrap_dest_in_args "${link}"; then
+        _GIT_LINK_CONFLICT["${link}"]=1
+        printf 'Warning: %s is a symlink on the host but exists as a plain directory in the sandbox\n' "${link}" >&2
+        printf '         (it is pre-created or already populated); not recreated. Git includes that use ".."\n' >&2
+        printf '         through it may not resolve.\n' >&2
+        return 1
+    fi
+    _emit_home_intermediate_dirs "${link}"
+    BWRAP_ARGS+=(--symlink "${target}" "${link}")
+    _GIT_LINK_STATUS["${link}"]=0
+    return 0
+}
+
+# _bwrap_mount_xdg_git_files
+#   Mount ONLY allowed_signers, config, ignore and attributes of
+#   ${XDG_CONFIG_HOME}/git, each read-only and only when present.  The
+#   directory itself is never bound: anything else in it (the "store"
+#   credential helper's "credentials" file included) is never mounted, and a
+#   file created on the host later never appears in the sandbox.  A file (or
+#   the whole directory) that resolves into a blocked location is skipped
+#   with a warning; a dangling symlink is skipped silently.  When the
+#   directory is itself a symlink it is recreated as one and the files are
+#   mounted at its real target, so ".." in includes resolves as on the host.
+#   Sets _BWRAP_XDG_GIT_HAS_FILES=1 when at least one file was mounted.
+_bwrap_mount_xdg_git_files() {
+    local gdir="${XDG_CONFIG_HOME}/git" gdir_real dest_dir name f f_real
+    local -a names=() reals=()
+    _BWRAP_XDG_GIT_HAS_FILES=0
+    [[ -d "${gdir}" ]] || return 0
+    gdir_real="$(readlink -f -- "${gdir}" 2> /dev/null || true)"
+    [[ -n "${gdir_real}" ]] || return 0
+    if _bwrap_path_blocked "${gdir_real}"; then
+        echo "Warning: ${gdir} resolves into a blocked location (${gdir_real}); not mounted." >&2
+        return 0
+    fi
+    for name in allowed_signers config ignore attributes; do
+        f="${gdir}/${name}"
+        [[ -e "${f}" ]] || continue
+        f_real="$(readlink -f -- "${f}" 2> /dev/null || true)"
+        [[ -n "${f_real}" && -f "${f_real}" ]] || continue
+        if _bwrap_path_blocked "${f_real}"; then
+            echo "Warning: ${f} resolves into a blocked location (${f_real}); not mounted." >&2
+            continue
+        fi
+        names+=("${name}")
+        reals+=("${f_real}")
+    done
+    [[ ${#names[@]} -gt 0 ]] || return 0
+
+    dest_dir="${gdir}"
+    if [[ -L "${gdir}" ]] && _bwrap_git_recreate_link "${gdir}"; then
+        dest_dir="${gdir_real}"
+    fi
+    if [[ "${dest_dir}" == "${_HOME}"/* ]]; then
+        _emit_home_intermediate_dirs "${dest_dir}" inclusive
+    else
+        BWRAP_ARGS+=(--dir "${dest_dir}")
+    fi
+    local _k
+    for _k in "${!names[@]}"; do
+        BWRAP_ARGS+=(--ro-bind "${reals[${_k}]}" "${dest_dir}/${names[${_k}]}")
+    done
+    _BWRAP_XDG_GIT_HAS_FILES=1
+}
+
+# _bwrap_git_lexical_mount RAW INC_PATH
+#   Fallback for a git include whose symlinked directories exist in the
+#   sandbox as plain directories: mount INC_PATH (read-only) at RAW collapsed
+#   lexically, creating the directories git walks before the last ".." (the
+#   caller's _GIT_INC_DIRS_SEEN / _GIT_INC_BOUND dedupe).  Returns 1 without
+#   emitting the bind when that is not safe: the destination is outside $HOME
+#   or blocked, is already in BWRAP_ARGS (never mounted over an existing
+#   destination such as ~/.gitconfig or an XDG git file), or a walked
+#   component is blocked, outside $HOME and not mounted, or a symlink that is
+#   present in the sandbox as a symlink (not a plain directory).  Sets
+#   _BWRAP_LEX_DEST on success.  Runs in the caller's shell (it appends to
+#   BWRAP_ARGS), so it must not be used in a command substitution.
+_bwrap_git_lexical_mount() {
+    local raw="$1" inc_path="$2" d lex parent
+    local -a dirs=()
+    _BWRAP_LEX_DEST=""
+    [[ -n "${raw}" ]] || return 1
+    _bwrap_include_lexical_path "${raw}"
+    lex="${_BWRAP_INC_LEXICAL}"
+    [[ "${lex}" == "${_HOME}"/* && "${lex}" != "${inc_path}" ]] || return 1
+    _bwrap_path_blocked "${lex}" && return 1
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] || continue
+        if _is_prefix_of "${d}" "${_HOME}"; then
+            continue # $HOME or an ancestor: exists (the tmpfs mount point)
+        elif [[ "${d}" == "${_HOME}"/* ]]; then
+            _bwrap_path_blocked "${d}" && return 1
+            if [[ -L "${d}" && -z "${_GIT_LINK_CONFLICT["${d}"]:-}" ]]; then
+                return 1
+            fi
+            dirs+=("${d}")
+        else
+            _bwrap_already_mounted "${d}" || return 1
+        fi
+    done <<< "${_BWRAP_INC_LEXDIRS}"
+    if [[ -z "${_GIT_INC_BOUND["${lex}"]:-}" ]]; then
+        if _bwrap_dest_in_args "${lex}"; then
+            printf 'Warning: not mounting git include at %s: that path is already in use in the sandbox.\n' "${lex}" >&2
+            return 1
+        fi
+        for d in "${dirs[@]+"${dirs[@]}"}"; do
+            [[ -z "${_GIT_INC_DIRS_SEEN["${d}"]:-}" ]] || continue
+            _GIT_INC_DIRS_SEEN["${d}"]=1
+            BWRAP_ARGS+=(--dir "${d}")
+        done
+        parent="${lex%/*}"
+        if [[ "${parent}" != "${_HOME}" && -z "${_GIT_INC_DIRS_SEEN["${parent}"]:-}" ]]; then
+            _GIT_INC_DIRS_SEEN["${parent}"]=1
+            BWRAP_ARGS+=(--dir "${parent}")
+        fi
+        _GIT_INC_BOUND["${lex}"]=1
+        BWRAP_ARGS+=(--ro-bind-try "${inc_path}" "${lex}")
+    fi
+    _BWRAP_LEX_DEST="${lex}"
+    return 0
+}
+
 build_git_mounts() {
     # Resolve symlinks so we bind the real file (readlink -f is a no-op on
     # regular files).  Check the resolved target before emitting the bind:
@@ -1061,27 +1915,84 @@ build_git_mounts() {
         _check_path_safe "${_gitconfig_real}" "\$HOME/.gitconfig (resolved)"
         BWRAP_ARGS+=(--ro-bind "${_gitconfig_real}" "${_HOME}/.gitconfig")
     fi
-    if [[ -d "${XDG_CONFIG_HOME}/git" ]]; then
-        # XDG_CONFIG_HOME is already validated by resolve_common_paths;
-        # no additional check needed here.
-        BWRAP_ARGS+=(--ro-bind "${XDG_CONFIG_HOME}/git" "${XDG_CONFIG_HOME}/git")
-    fi
+    _bwrap_mount_xdg_git_files
 
     # Git include files (read-only).
-    # parse_git_includes already resolved symlinks in include paths via
-    # readlink -f.  Check each resolved include path before mounting —
-    # a git config could contain  path = ~/.ssh/id_rsa  or similar.
+    # parse_git_includes canonicalized every include path with readlink -f
+    # (GIT_INCLUDE_PATHS) and recorded the path git will actually open
+    # (GIT_INCLUDE_VISIBLE).  Check each canonical path before mounting — a
+    # git config could contain  path = ~/.ssh/id_rsa  or an include whose
+    # parent directory is a symlink into a blocked tree.  When the visible
+    # path differs from the canonical one (symlinked parent), also mount the
+    # content at the visible path, since git opens the include there.
     declare -A _GIT_INC_DIRS_SEEN=()
-    local inc_path local_parent
-    for inc_path in "${GIT_INCLUDE_PATHS[@]+"${GIT_INCLUDE_PATHS[@]}"}"; do
+    declare -A _GIT_INC_BOUND=()
+    local inc_path inc_visible local_parent _i
+    for _i in "${!GIT_INCLUDE_PATHS[@]}"; do
+        inc_path="${GIT_INCLUDE_PATHS[${_i}]}"
+        inc_visible="${GIT_INCLUDE_VISIBLE[${_i}]:-${inc_path}}"
         _check_path_safe "${inc_path}" "git include path"
-        # Ensure parent directory exists as a mount point (deduplicated)
-        local_parent="${inc_path%/*}"
-        if [[ -z "${_GIT_INC_DIRS_SEEN["${local_parent}"]:-}" ]]; then
-            _GIT_INC_DIRS_SEEN["${local_parent}"]=1
-            BWRAP_ARGS+=(--dir "${local_parent}")
+        # Symlinked directories before a ".." in the include path: recreate
+        # them so the kernel resolves ".." as on the host.  If one cannot be
+        # recreated the include is mounted at its real path only.
+        local _link _links_ok=1 _conflict_only=1
+        while IFS= read -r _link; do
+            [[ -n "${_link}" ]] || continue
+            if ! _bwrap_git_recreate_link "${_link}"; then
+                _links_ok=0
+                [[ -n "${_GIT_LINK_CONFLICT["${_link}"]:-}" ]] || _conflict_only=0
+            fi
+        done <<< "${GIT_INCLUDE_LINKS[${_i}]:-}"
+        local _lex=""
+        if [[ "${_links_ok}" -eq 0 ]]; then
+            inc_visible="${inc_path}"
+            # Every symlink that could not be recreated exists in the sandbox
+            # as a plain directory (conflict with a pre-created directory):
+            # git resolves ".." there lexically, so provide the include at
+            # its lexically collapsed path as well.  Never done when a
+            # symlink failed for another reason (missing, blocked, outside
+            # $HOME): that component does not exist in the sandbox.
+            if [[ "${_conflict_only}" -eq 1 ]]; then
+                _bwrap_git_lexical_mount "${GIT_INCLUDE_RAW[${_i}]:-}" "${inc_path}" && _lex="${_BWRAP_LEX_DEST}"
+            fi
+            if [[ -n "${_lex}" ]]; then
+                printf 'Warning: git include %s: a symlinked directory is a plain directory in the sandbox;\n' "${GIT_INCLUDE_RAW[${_i}]}" >&2
+                printf '         the include is also mounted at %s, where git looks for it there.\n' "${_lex}" >&2
+            else
+                printf 'Warning: git include %s needs a symlinked directory that cannot be recreated in\n' "${GIT_INCLUDE_VISIBLE[${_i}]:-${inc_path}}" >&2
+                printf '         the sandbox; it is mounted at its real path (%s) only, so git may not find it.\n' "${inc_path}" >&2
+            fi
         fi
-        BWRAP_ARGS+=(--ro-bind-try "${inc_path}" "${inc_path}")
+        # Directories the kernel must traverse to resolve ".." in the include
+        # path git opens (they hold no data; they only have to exist).
+        local _predir
+        while IFS= read -r _predir; do
+            [[ -n "${_predir}" && -z "${_GIT_INC_DIRS_SEEN["${_predir}"]:-}" ]] || continue
+            # Never create a directory inside a blocked location, not even an
+            # empty one (a symlinked directory pointing there stays unresolved).
+            ! _bwrap_path_blocked "${_predir}" || continue
+            _GIT_INC_DIRS_SEEN["${_predir}"]=1
+            BWRAP_ARGS+=(--dir "${_predir}")
+        done <<< "${GIT_INCLUDE_PREDIRS[${_i}]:-}"
+        if [[ -z "${_GIT_INC_BOUND["${inc_path}"]:-}" ]]; then
+            _GIT_INC_BOUND["${inc_path}"]=1
+            # Ensure parent directory exists as a mount point (deduplicated)
+            local_parent="${inc_path%/*}"
+            if [[ -z "${_GIT_INC_DIRS_SEEN["${local_parent}"]:-}" ]]; then
+                _GIT_INC_DIRS_SEEN["${local_parent}"]=1
+                BWRAP_ARGS+=(--dir "${local_parent}")
+            fi
+            BWRAP_ARGS+=(--ro-bind-try "${inc_path}" "${inc_path}")
+        fi
+        if [[ "${inc_visible}" != "${inc_path}" && -z "${_GIT_INC_BOUND["${inc_visible}"]:-}" ]]; then
+            _GIT_INC_BOUND["${inc_visible}"]=1
+            local_parent="${inc_visible%/*}"
+            if [[ -z "${_GIT_INC_DIRS_SEEN["${local_parent}"]:-}" ]]; then
+                _GIT_INC_DIRS_SEEN["${local_parent}"]=1
+                BWRAP_ARGS+=(--dir "${local_parent}")
+            fi
+            BWRAP_ARGS+=(--ro-bind-try "${inc_path}" "${inc_visible}")
+        fi
     done
 }
 
@@ -1092,17 +2003,21 @@ build_pixi_mounts() {
     fi
 
     # Pixi checks multiple config locations; bind any that exist.
+    # The config files can be symlinks (or live under a symlinked directory)
+    # pointing anywhere: canonicalize and check before binding the real file.
     if [[ -f "${XDG_CONFIG_HOME}/pixi/config.toml" ]]; then
+        _bwrap_canonicalize_safe "${XDG_CONFIG_HOME}/pixi/config.toml" "pixi config.toml (resolved)"
         BWRAP_ARGS+=(
             --dir "${XDG_CONFIG_HOME}/pixi"
-            --ro-bind "${XDG_CONFIG_HOME}/pixi/config.toml" "${XDG_CONFIG_HOME}/pixi/config.toml"
+            --ro-bind "${_BWRAP_CANON}" "${XDG_CONFIG_HOME}/pixi/config.toml"
         )
     fi
     if [[ -f "${_HOME}/.pixi/config.toml" ]]; then
         # Already available via the pixi overlay, but if the overlay is not
         # present (dir doesn't exist), bind it explicitly.
         if [[ ! -d "${PIXI_HOME_DIR}" ]]; then
-            BWRAP_ARGS+=(--ro-bind "${_HOME}/.pixi/config.toml" "${_HOME}/.pixi/config.toml")
+            _bwrap_canonicalize_safe "${_HOME}/.pixi/config.toml" "\$HOME/.pixi/config.toml (resolved)"
+            BWRAP_ARGS+=(--ro-bind "${_BWRAP_CANON}" "${_HOME}/.pixi/config.toml")
         fi
     fi
 }
@@ -1326,6 +2241,18 @@ _bwrap_flag_arity() {
     esac
 }
 
+# _is_secret_env_name NAME
+#   Return 0 if NAME looks like it holds a secret (case-insensitive match on
+#   KEY, TOKEN, PASSWORD, SECRET or CREDENTIAL).  Used only by print_dry_run
+#   to redact printed --setenv values; the real launch path never calls it.
+_is_secret_env_name() {
+    local _upper="${1^^}"
+    case "${_upper}" in
+        *KEY* | *TOKEN* | *PASSWORD* | *SECRET* | *CREDENTIAL*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 print_dry_run() {
     local _BWRAP_BIN _ENV_BIN
     _BWRAP_BIN="$(command -v bwrap)"
@@ -1352,7 +2279,14 @@ print_dry_run() {
         printf "    %s" "${arg}"
         i=$((i + 1))
         for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
-            printf " '%s'" "${BWRAP_ARGS[$i]}"
+            # Redact the VALUE of secret-looking --setenv variables (only the
+            # printed text changes; BWRAP_ARGS keeps the real values).
+            if [[ "${arg}" == "--setenv" && "${_j}" -eq 1 ]] &&
+                _is_secret_env_name "${BWRAP_ARGS[$((i - 1))]}"; then
+                printf " 'REDACTED'"
+            else
+                printf " '%s'" "${BWRAP_ARGS[$i]}"
+            fi
             i=$((i + 1))
         done
         printf " \\\\\n"

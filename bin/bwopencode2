@@ -1,0 +1,739 @@
+#!/usr/bin/env bash
+# bwopencode2 — Launch OpenCode 2 (opencode2) inside a bubblewrap (bwrap) sandbox.
+#
+# Requires: bwrap >= 0.4.0 (RHEL 8)
+#   - 0.4.0: base functionality
+#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
+#   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+#
+# Requires the `opencode2` command (npm @opencode/cli), which the ansible base
+# role installs.  OpenCode 2 is a separate product from
+# OpenCode 1 (see bwopencode) and never shares its directories.
+#
+# The sandbox provides filesystem isolation:
+#   - Current directory: read-write
+#   - OpenCode 2 config (~/.config/opencode2/opencode): read-only (symlinks resolved);
+#     service.json / service-*.json (background-service settings) are not mounted
+#   - OpenCode 2 data (~/.local/share/opencode2/opencode): read-write, the
+#     whole directory persists (database incl. saved sign-in, logs, ...)
+#   - OpenCode 2 cache (~/.cache/opencode2/opencode): read-write
+#   - OpenCode 2 state (~/.local/state/opencode2/opencode): ephemeral
+#     (last-used model and prompt history are not remembered)
+#   - Managed config: /etc/opencode/opencode.json{,c} and
+#     /etc/opencode/{agents,commands,plugins,skills}, read-only
+#   - Project .opencode/: persistent copy kept outside the repository
+#   - XDG_{CONFIG,DATA,STATE,CACHE}_HOME point at the opencode2 directories so
+#     OpenCode 2 can never touch OpenCode 1 data (which it would migrate
+#     one way)
+#   - Git config + includes: read-only (also mirrored under the opencode2
+#     XDG config home, where git looks inside the sandbox; only the
+#     allowed_signers, config, ignore and attributes files of git/ are
+#     mounted, never credentials)
+#   - OPENCODE_* env vars: only an allowlist of harmless switches is passed
+#     (see build_opencode2_env); OPENCODE_SERVER_PASSWORD etc. are dropped
+#   - Pixi cache: read-write
+#   - Pixi config: read-only
+#   - ccache config: read-only
+#   - ccache cache: read-write
+#   - npm config: read-only
+#   - npm cache: read-write
+#   - System and user binaries: read-only
+#   - SSH binaries: masked (ssh, scp, sftp, ssh-agent, etc.)
+#   - Network tools: masked (telnet, nc/ncat, socat, rsync, rsh)
+#   - Kerberos tools: masked (kinit, klist, kdestroy, kswitch)
+#   - Privilege escalation: masked (sudo, su, pkexec)
+#   - Namespace tools: masked (nsenter, unshare, chroot)
+#   - Keyring tools: masked (keyctl)
+#   - SSH/GPG agent env vars: stripped
+#   - ~/.bashrc and other shell rc files: not mounted
+#
+# Sandbox-escape guard: OpenCode 2 normally talks to a shared background
+# service (fixed port 49374) that runs tools OUTSIDE any sandbox.  The wrapper
+# therefore forces `--standalone` (a private in-process server) for the
+# commands that accept it and refuses --server and the server-related
+# commands (service, serve, api, pair, reload).  See --help.
+#
+# Usage:
+#   bwopencode2 [bwopencode2-options] [opencode2 arguments...]
+#   bwopencode2 --help
+#
+# Options:
+#   --help, -h      Show this help (wrapper options + opencode2's own help).
+#   --dry-run       Print the bwrap command that would be executed without running it.
+#   --exec CMD      Run CMD inside the sandbox instead of opencode2.
+#                   Useful for running one-off commands, scripts, or diagnostic tools
+#                   inside the fully-configured sandbox environment.  The command is
+#                   NOT subject to the --standalone argument guard (it is arbitrary).
+#   --new-session   Force bwrap --new-session even on kernels with the TIOCSTI cap
+#                   guard.  Detaches the controlling tty for stricter isolation at the
+#                   cost of SIGWINCH (terminal resize) propagation.
+#   --ro-path PATH  Mount PATH read-only into the sandbox.  May be repeated to
+#                   accumulate multiple paths.  Dangerous paths are blocked:
+#                   $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws, ~/.kube,
+#                   ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler, ~/.yarnrc,
+#                   ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
+#                   $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
+#                   /etc/sudoers{,.d}.
+#   --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated to
+#                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
+#   --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox.
+#
+# There is no --init-auth: OpenCode 2 stores credentials in its database
+# (the `credential` table in opencode.db), which lives in the persistent
+# data directory, so sign-in (`opencode2 auth login`) persists on its own.
+
+set -euo pipefail
+
+# Source the shared sandbox library.
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=../lib/bwrap_sandbox_lib.sh
+source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
+
+# ═══════════════════════════════════════════════════════════════════
+# Tool-specific state
+# ═══════════════════════════════════════════════════════════════════
+
+FORWARD_GH_TOKENS=0
+OC2_CONFIG_BINDS=()
+
+# ═══════════════════════════════════════════════════════════════════
+# Tool-specific functions
+# ═══════════════════════════════════════════════════════════════════
+
+parse_wrapper_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help | -h)
+                SHOW_HELP=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --exec)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --exec requires a command argument." >&2
+                    exit 1
+                fi
+                TEST_CMD="$2"
+                shift 2
+                ;;
+            --github-tokens)
+                FORWARD_GH_TOKENS=1
+                shift
+                ;;
+            --new-session)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh (sandboxed_exec)
+                FORCE_NEW_SESSION=1
+                shift
+                ;;
+            --ro-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --ro-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RO_PATHS+=("$2")
+                shift 2
+                ;;
+            --rw-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --rw-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RW_PATHS+=("$2")
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
+    TOOL_ARGS=("$@")
+}
+
+# Find the absolute path to the opencode2 binary on the host so we do
+# not depend on PATH lookup inside the sandbox.
+# Sets globals: _TOOL_BIN, _TOOL_CMD
+show_help() {
+    cat << 'HELP_EOF'
+bwopencode2 — OpenCode 2 (opencode2) inside a bubblewrap sandbox
+
+Wrapper options (consumed before opencode2 sees the command line):
+  -h, --help      Show this message followed by opencode2's own help.
+  --dry-run       Print the bwrap command that would be run, then exit.
+  --exec CMD      Run CMD inside the fully-configured sandbox instead of opencode2.
+                  Use this to run scripts, diagnostic tools, or any command with
+                  the same filesystem isolation and environment as opencode2 itself.
+                  Example: bwopencode2 --exec bash
+                           bwopencode2 --exec 'env | sort'
+  --new-session   Force bwrap to call setsid(2), detaching the sandbox from the
+                  controlling terminal.  This is the default on older kernels
+                  (< 5.14); on newer kernels we omit it so that SIGWINCH (terminal
+                  resize) propagates from tmux/screen.  Use this flag to opt back
+                  into stricter terminal isolation when SIGWINCH is not important.
+  --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
+                  May be repeated to accumulate multiple extra paths.
+                  Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
+                  ~/.kube, ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler,
+                  ~/.yarnrc, ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
+                  $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
+                  /etc/sudoers{,.d}.
+                  Symlinks are resolved before the safety check is applied.
+  --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
+                  Same blocked-path rules as --ro-path.  May be repeated.
+  --github-tokens Forward any GH_TOKEN_* environment variables into the
+                  sandbox so the agent can authenticate the gh(1) CLI.
+                  Off by default.  When set, use per-command token selection:
+                    GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
+                    GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
+
+OpenCode 2 data lives under ~/.config|.local/share|.local/state|.cache/opencode2
+(never the OpenCode 1 directories).  Sign-in is stored in the database in the
+persistent data directory, so there is no --init-auth.
+
+Sandbox-escape guard: OpenCode 2 normally connects to a shared background
+service that runs tools OUTSIDE the sandbox.  To keep tools sandboxed:
+  - `--standalone` (a private in-process server) is added automatically when
+    you run opencode2 with no subcommand or with run, mini, models or stats.
+  - `--server`, `--standalone=...` and `--no-standalone` are refused, as are
+    the service, serve, api, pair and reload subcommands.
+  - All other subcommands (auth, debug, mcp, plugin, session, upgrade, ...)
+    are passed through unchanged.
+Limitation: the first non-option argument is taken as the subcommand; options
+that take a value are only recognised for --session/-s, --prompt, --log-level
+and --completions.  Arguments after `--` are never inspected.
+
+--exec runs an arbitrary command and therefore bypasses this argument guard.
+
+Also kept out of the sandbox: service.json (service settings), all OPENCODE_*
+environment variables except a short allowlist of harmless switches (see
+docs/bw-wrappers.md; OPENCODE_SERVER_PASSWORD etc. are dropped), and the
+git credentials file (only a few files of the XDG git directory are mounted).
+
+All other arguments are passed through to opencode2 unchanged.
+
+HELP_EOF
+    # Delegate to opencode2 --help inside the sandbox so the user sees the full
+    # opencode2 option set in the same invocation.  We re-exec this script with
+    # --exec so the sandbox is fully constructed; opencode2 --help is passed
+    # as the sandbox command.
+    exec "$0" --exec "${_TOOL_BIN} --help"
+}
+
+# ── Sandbox-escape guard (arguments) ─────────────────────────────
+# The OpenCode 2 background service listens on a fixed, shared port and runs
+# tools outside any sandbox.  Because the sandbox shares the host network, a
+# CLI started without --standalone would delegate tool execution to it.
+#
+# guard_tool_args scans TOOL_ARGS and either refuses the invocation or
+# injects --standalone:
+#   - refuse: --server[=...], --standalone=..., --no-standalone anywhere before
+#     a bare `--`; subcommands service, serve, api, pair, reload.
+#   - inject --standalone: no subcommand (or a directory argument), run, mini,
+#     models, stats (the commands whose `--help` lists the flag).
+#   - the known subcommands auth, debug, mcp, plugin, session, upgrade/update,
+#     uninstall, acp do not accept --standalone and are passed through.
+#
+# Known limitations: the subcommand is the first non-option argument; only the
+# root flags --session/-s, --prompt, --log-level and --completions are known to
+# consume the next argument.  Combined short flags are not split.  A bare `--`
+# ends option scanning, so a prompt after `--` can never trigger a refusal.
+guard_tool_args() {
+    local _n=${#TOOL_ARGS[@]} _i _arg _sub="" _sub_idx=-1 _has_standalone=0 _inject_front=0
+
+    # Pass 1: options that would bypass the private server (all positions).
+    for ((_i = 0; _i < _n; _i++)); do
+        _arg="${TOOL_ARGS[_i]}"
+        case "${_arg}" in
+            --)
+                break
+                ;;
+            --server | --server=*)
+                echo "Error: bwopencode2 refuses '--server': it would connect to a server" >&2
+                echo "       that runs tools outside the sandbox." >&2
+                exit 1
+                ;;
+            --standalone=* | --no-standalone)
+                echo "Error: bwopencode2 refuses '${_arg}': the sandbox requires --standalone." >&2
+                exit 1
+                ;;
+            --standalone)
+                _has_standalone=1
+                ;;
+        esac
+    done
+
+    # Pass 2: find the subcommand (first non-option argument).
+    _i=0
+    while ((_i < _n)); do
+        _arg="${TOOL_ARGS[_i]}"
+        case "${_arg}" in
+            --)
+                break
+                ;;
+            --session | -s | --prompt | --log-level | --completions)
+                _i=$((_i + 2))
+                ;;
+            -*)
+                _i=$((_i + 1))
+                ;;
+            *)
+                _sub="${_arg}"
+                _sub_idx=${_i}
+                break
+                ;;
+        esac
+    done
+
+    case "${_sub}" in
+        service | serve | api | pair | reload)
+            echo "Error: bwopencode2 refuses '${_sub}': it starts or talks to a server that" >&2
+            echo "       runs outside the sandbox." >&2
+            exit 1
+            ;;
+        "")
+            # No subcommand: interactive TUI.
+            _inject_front=1
+            ;;
+        run | mini | models | stats)
+            if [[ "${_has_standalone}" -eq 0 ]]; then
+                # Insert right after the subcommand word.
+                local -a _new_args=()
+                for ((_i = 0; _i < _n; _i++)); do
+                    _new_args+=("${TOOL_ARGS[_i]}")
+                    if [[ "${_i}" -eq "${_sub_idx}" ]]; then
+                        _new_args+=(--standalone)
+                    fi
+                done
+                TOOL_ARGS=("${_new_args[@]}")
+            fi
+            ;;
+        auth | debug | mcp | plugin | session | upgrade | update | uninstall | acp)
+            : # known subcommands without --standalone: unchanged
+            ;;
+        *)
+            # Not a known subcommand: the TUI's positional directory argument
+            # (e.g. `opencode2 ~/proj`), which also needs --standalone.
+            _inject_front=1
+            ;;
+    esac
+
+    if [[ "${_inject_front}" -eq 1 && "${_has_standalone}" -eq 0 ]]; then
+        TOOL_ARGS=(--standalone ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
+    fi
+}
+
+resolve_opencode2_paths() {
+    # Derived from the resolved $HOME, never from the (possibly overridden)
+    # XDG_* variables, so they match the ansible `opencode2` wrapper, which
+    # exports XDG_*_HOME=$HOME/.{config,local/share,local/state,cache}/opencode2.
+    # OpenCode 2 appends "opencode" to each of those.
+    OC2_XDG_CONFIG_HOME="${_HOME}/.config/opencode2"
+    OC2_XDG_DATA_HOME="${_HOME}/.local/share/opencode2"
+    OC2_XDG_STATE_HOME="${_HOME}/.local/state/opencode2"
+    OC2_XDG_CACHE_HOME="${_HOME}/.cache/opencode2"
+    OC2_CONFIG_DIR="${OC2_XDG_CONFIG_HOME}/opencode"
+    # The config directory holds service.json, which is never mounted: refuse
+    # a working directory / --ro-path / --rw-path that would bind it whole.
+    # shellcheck disable=SC2034  # read by _check_dir_contains_blocked in the library
+    EXTRA_BLOCKED_DIRS=("${OC2_CONFIG_DIR}")
+    OC2_DATA_DIR="${OC2_XDG_DATA_HOME}/opencode"
+    OC2_STATE_DIR="${OC2_XDG_STATE_HOME}/opencode"
+    OC2_CACHE_DIR="${OC2_XDG_CACHE_HOME}/opencode"
+
+    # The fixed paths cannot reach a blocked path unless $HOME itself does;
+    # the checks mirror bwopencode and also catch symlinked directories.
+    _check_dir_safe "${OC2_DATA_DIR}"  "opencode2 data dir"
+    _check_dir_safe "${OC2_CACHE_DIR}" "opencode2 cache dir"
+}
+
+# Ensure writable directories exist on host.  The data dir is bound whole
+# because the OpenCode 2 layout is not documented (database + -shm/-wal, log,
+# repos, shell, ...), so no file list could be kept in sync.
+ensure_host_dirs() {
+    mkdir -p "${OC2_DATA_DIR}" "${OC2_CACHE_DIR}"
+}
+
+# Resolve opencode2 config symlinks.
+# We resolve each entry in ~/.config/opencode2/opencode/ so that symlinks
+# pointing outside (e.g. into a dotfiles repo) are followed, and we
+# bind the real file at the expected path.  This avoids exposing the
+# dotfiles tree inside the sandbox.
+#
+# Every path is canonicalized with realpath (readlink -f) and the canonical
+# result is passed through _check_path_safe before being added to
+# OC2_CONFIG_BINDS.  This blocks symlinks that point into sensitive subtrees
+# (e.g. config/creds -> ~/.aws/credentials) and, because ALL entries are
+# canonicalized (not only symlinked ones), also a symlinked PARENT directory
+# (~/.config/opencode2 -> ~/.aws): bwrap's --ro-bind follows the symlink, so
+# the unresolved name alone would hide the real target.
+resolve_config_symlinks() {
+    OC2_CONFIG_BINDS=()
+    [[ -d "${OC2_CONFIG_DIR}" ]] || return 0
+
+    # The config directory itself may be (or sit under) a symlink.
+    _bwrap_canonicalize_safe "${OC2_CONFIG_DIR}" "opencode2 config dir"
+
+    local entry local_resolved
+    for entry in "${OC2_CONFIG_DIR}"/*; do
+        [[ -e "${entry}" ]] || continue
+        # service.json (or service-<hash>.json on other channels) holds the
+        # background-service settings, including `service set env KEY VALUE`
+        # values and the port.  The sandbox never runs the service, so the
+        # file is not mounted.
+        case "${entry##*/}" in
+            service*.json) continue ;;
+        esac
+        _bwrap_canonicalize_safe "${entry}" "opencode2 config entry '${entry}'"
+        local_resolved="${_BWRAP_CANON}"
+        OC2_CONFIG_BINDS+=("--ro-bind" "${local_resolved}" "${entry}")
+    done
+}
+
+# ── Managed OpenCode config (read-only, highest priority) ────────
+# If a managed config exists at /etc/opencode/ on the host (deployed
+# by ansible), bind-mount it RO into the sandbox.  OpenCode 2 reads
+# managed settings from the same /etc/opencode path as OpenCode 1; it
+# takes precedence over all other config sources and config in the
+# project cannot override it.
+#
+# Both opencode.json and opencode.jsonc are mounted when present, so
+# opencode2 can pick whichever format it prefers.
+#
+# On hosts without /etc/opencode/, nothing is bound here — opencode2
+# falls back to user config as usual.  A warning is emitted to stderr
+# in that case so misconfigured managed hosts (e.g. ansible deployment
+# failure) are noticed.
+build_managed_config() {
+    local _has_json=0 _has_jsonc=0
+    [[ -f /etc/opencode/opencode.json  ]] && _has_json=1
+    [[ -f /etc/opencode/opencode.jsonc ]] && _has_jsonc=1
+
+    if [[ $((_has_json + _has_jsonc)) -gt 0   ]]; then
+        # At least one host-managed config exists — bind whichever are present.
+        BWRAP_ARGS+=(--dir /etc/opencode)
+        if [[ "${_has_json}" -eq 1  ]]; then
+            BWRAP_ARGS+=(--ro-bind /etc/opencode/opencode.json /etc/opencode/opencode.json)
+        fi
+        if [[ "${_has_jsonc}" -eq 1 ]]; then
+            BWRAP_ARGS+=(--ro-bind /etc/opencode/opencode.jsonc /etc/opencode/opencode.jsonc)
+        fi
+    else
+        printf 'bwopencode2: warning: no /etc/opencode/opencode.json{,c} found on host.\n' >&2
+        printf '             Falling back to user config at ~/.config/opencode2/opencode/.\n' >&2
+    fi
+}
+
+# The host-managed skills alias may point into /opt/nsls2/skills.  Bind
+# its resolved source at OpenCode's documented managed-skills location so the
+# alias target and every supporting file remain available inside the sandbox.
+build_managed_skills() {
+    [[ -d /etc/opencode/skills && -r /etc/opencode/skills ]] || return 0
+    BWRAP_ARGS+=(--dir /etc/opencode)
+    build_managed_ro_bind /etc/opencode/skills /etc/opencode/skills
+}
+
+# OpenCode 2 also reads managed agents, commands, and plugins from
+# /etc/opencode.  Bind each one read-only when it exists on the host.
+build_managed_extras() {
+    local _name
+    for _name in agents commands plugins; do
+        [[ -d "/etc/opencode/${_name}" && -r "/etc/opencode/${_name}" ]] || continue
+        BWRAP_ARGS+=(--dir /etc/opencode)
+        build_managed_ro_bind "/etc/opencode/${_name}" "/etc/opencode/${_name}"
+    done
+}
+
+# ── Persistent .opencode/ directory ──────────────────────────────
+# OpenCode creates .opencode/ inside the repo root for project-level
+# config, rules, and plugins.  We store this in a persistent location
+# outside the repo so it survives `git clean -xfd` on the host, and so
+# repository-supplied .opencode/ content cannot inject config or plugins.
+#
+# The persistent directory is keyed by a hash of the bind dir path,
+# stored under ~/.local/share/opencode2/opencode/project-dotfiles/<hash>/.
+# Inside the sandbox, this is bind-mounted on top of <repo>/.opencode/.
+build_persistent_dotdir() {
+    [[ -n "${_GIT_ROOT}" ]] || return 0
+
+    local _repo_hash
+    _repo_hash="$(printf '%s' "${_GIT_ROOT}" | sha256sum)"
+    _repo_hash="${_repo_hash:0:16}"
+    local _persist_dir="${OC2_DATA_DIR}/project-dotfiles/${_repo_hash}"
+    mkdir -p "${_persist_dir}"
+
+    BWRAP_ARGS+=(
+        --bind "${_persist_dir}" "${_GIT_ROOT}/.opencode"
+    )
+}
+
+# ── OpenCode 2 config (read-only, symlinks resolved) ─────────────
+build_opencode2_config_mount() {
+    if [[ ${#OC2_CONFIG_BINDS[@]} -gt 0 ]]; then
+        BWRAP_ARGS+=(
+            --dir "${OC2_CONFIG_DIR}"
+            "${OC2_CONFIG_BINDS[@]}"
+        )
+    fi
+}
+
+# ── OpenCode 2 data (read-write, whole directory) ────────────────
+# Credentials live in opencode.db (the `credential` table), so persisting
+# the data directory persists sign-in.  There is no tmpfs + selective
+# persistence scheme (as in bwopencode) because the data layout is
+# undocumented.
+build_opencode2_data_mount() {
+    BWRAP_ARGS+=(
+        --bind "${OC2_DATA_DIR}" "${OC2_DATA_DIR}"
+    )
+}
+
+# ── OpenCode 2 cache (read-write) ────────────────────────────────
+# Provider npm packages are installed here, so it must be writable.
+build_opencode2_cache_mount() {
+    BWRAP_ARGS+=(
+        --bind "${OC2_CACHE_DIR}" "${OC2_CACHE_DIR}"
+    )
+}
+
+# ── OpenCode 2 state (ephemeral) ─────────────────────────────────
+# $HOME is a tmpfs, so state is discarded on exit; this avoids lock
+# clashes on NFS homes.  Create the directory chain so OpenCode 2 can
+# write into it without having to create parents.
+build_opencode2_state_dir() {
+    BWRAP_ARGS+=(
+        --dir "${OC2_STATE_DIR}"
+    )
+}
+
+# ── XDG mirror for tools that read $XDG_CONFIG_HOME / $XDG_CACHE_HOME ─
+# Inside the sandbox XDG_CONFIG_HOME and XDG_CACHE_HOME point at the
+# opencode2 directories, so git, pixi and ccache would no longer find
+# their configuration at the host locations the shared library mounts.
+# Make whatever the host has under its XDG config/cache home visible at the
+# same relative location under the opencode2 homes.
+#
+# These are SYMLINKS to the host-path mounts the shared library already made
+# (build_git_mounts / build_pixi_mounts / build_ccache_mounts), not second
+# binds.  Why: git resolves a relative include (`path = ../shared`) against
+# the directory of the config path AS OPENED.  A bind of the git dir at
+# ~/.config/opencode2/git would make `../shared` resolve to
+# ~/.config/opencode2/shared (which does not exist) and git would silently
+# skip it.  Through a symlinked directory the kernel resolves `..` against
+# the real parent, so ~/.config/opencode2/git/../shared is the same file as
+# ~/.config/shared, where the library mounted the include.  The library
+# mounts only allowed_signers, config, ignore and attributes of the host git
+# directory (read-only, never the directory itself, so "credentials" and any
+# file created on the host later stay invisible); the symlink exposes just
+# those.  If the host git directory is itself a symlink the library recreates
+# it, so the mirror still resolves through it.  Each symlink is created only
+# when the library really mounted its target (otherwise it would dangle).
+# Must run AFTER build_home_tmpfs and the library mount builders (reads
+# _BWRAP_XDG_GIT_HAS_FILES).
+# ~/.gitconfig and other $HOME-relative files are unaffected.
+build_xdg_mirror_mounts() {
+    local _mirror_cfg="${OC2_XDG_CONFIG_HOME}"
+
+    # Skip the mirror when the host XDG dirs already ARE the opencode2 ones.
+    if [[ "${XDG_CONFIG_HOME}" != "${_mirror_cfg}" ]]; then
+        if [[ "${_BWRAP_XDG_GIT_HAS_FILES}" -eq 1 ]]; then
+            BWRAP_ARGS+=(--symlink "${XDG_CONFIG_HOME}/git" "${_mirror_cfg}/git")
+        fi
+        # build_pixi_mounts binds exactly this file at its host path.
+        if [[ -f "${XDG_CONFIG_HOME}/pixi/config.toml" ]]; then
+            BWRAP_ARGS+=(--dir "${_mirror_cfg}/pixi"
+                --symlink "${XDG_CONFIG_HOME}/pixi/config.toml" "${_mirror_cfg}/pixi/config.toml")
+        fi
+        # ccache config is only XDG-relative when the legacy ~/.ccache is absent.
+        # build_ccache_mounts binds it at its host path when it is a directory.
+        if [[ "${CCACHE_CONFIG_DIR}" == "${XDG_CONFIG_HOME}/ccache" && -d "${CCACHE_CONFIG_DIR}" ]]; then
+            BWRAP_ARGS+=(--symlink "${CCACHE_CONFIG_DIR}" "${_mirror_cfg}/ccache")
+        fi
+    fi
+    if [[ "${XDG_CACHE_HOME}" != "${OC2_XDG_CACHE_HOME}" ]]; then
+        if [[ "${CCACHE_CACHE_DIR}" == "${XDG_CACHE_HOME}/ccache" && -d "${CCACHE_CACHE_DIR}" ]]; then
+            BWRAP_ARGS+=(--symlink "${CCACHE_CACHE_DIR}" "${OC2_XDG_CACHE_HOME}/ccache")
+        fi
+    fi
+}
+
+# ── OpenCode env vars ────────────────────────────────────────────
+# Pass through ONLY the allowlisted OPENCODE_* env vars (harmless behaviour
+# switches).  Every other OPENCODE_* variable is dropped, because the
+# OpenCode 2 binary reads several sensitive ones, e.g.:
+#   OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD  password of a v2 server; the
+#       sandbox shares the host network, so holding it would let the agent
+#       connect to an UNSANDBOXED server (port 49374) and run tools outside
+#   OPENCODE_SSH_ASKPASS_TOKEN / _PORT, OPENCODE_EDITOR_SSE_PORT,
+#   OPENCODE_PTY_HANDOFF  host-side helper channels
+#   OPENCODE_DB, OPENCODE_TEST_HOME, OPENCODE_CONFIG*, OPENCODE_MODELS_PATH/URL
+#       redirect data/config/model sources outside the sandbox layout
+#   OPENCODE_API_KEY  credentials
+# Also pass through AIFAPIM_* env vars for NSLS-II Hermes gateway.
+# With --github-tokens, also forward GH_TOKEN_* vars so the agent
+# can authenticate gh(1) via per-command:
+#   GH_TOKEN="$GH_TOKEN_NSLS2" gh <subcommand>
+#
+# ── OpenCode 2 install directory (read-only) ─────────────────────
+# /usr/local/bin/opencode2 is a wrapper script (deployed by ansible) that runs
+# /opt/nsls2/opencode2/node_modules/@opencode/cli/bin/opencode.exe.  The
+# sandbox mounts /usr but not /opt, so without this mount the wrapper cannot
+# find the binary and exits with "binary not found or not executable".  The
+# path is fixed by the ansible base role.  Mounted read-only; nothing is bound
+# when the directory is absent (for example a plain opencode2 elsewhere on PATH).
+build_opencode2_install_mount() {
+    if [[ -d /opt/nsls2/opencode2 ]]; then
+        BWRAP_ARGS+=(
+            --dir /opt/nsls2
+            --ro-bind /opt/nsls2/opencode2 /opt/nsls2/opencode2
+        )
+    fi
+}
+
+# Must run AFTER build_env_vars: the XDG_* values set here override the
+# host pass-through from build_env_vars (bwrap --setenv: last one wins),
+# so OpenCode 2 uses its own directories even if `opencode2` on PATH is a
+# plain binary rather than the ansible wrapper.
+build_opencode2_env() {
+    # Allowlist of OPENCODE_* variables that may enter the sandbox.
+    # Do NOT add anything that carries a secret, a port, a file path or a URL.
+    local -a _OC2_ENV_ALLOWLIST=(
+        OPENCODE_DISABLE_AUTOUPDATE
+        OPENCODE_DISABLE_FILEWATCHER
+        OPENCODE_FILEWATCHER_DISABLE
+        OPENCODE_DISABLE_MODELS_FETCH
+        OPENCODE_DISABLE_CLAUDE_CODE
+        OPENCODE_DISABLE_CLAUDE_CODE_SKILLS
+        OPENCODE_DISABLE_FFF
+        OPENCODE_DISABLE_PROJECT_CONFIG
+        OPENCODE_LOG_LEVEL
+        OPENCODE_PRINT_LOGS
+    )
+
+    # AIFAPIM gateway config
+    pass_through_if_set AIFAPIM_HOST
+    # The API key is passed through unchanged; print_dry_run redacts the value
+    # of any --setenv whose name looks secret (KEY/TOKEN/PASSWORD/...).
+    pass_through_if_set AIFAPIM_API_KEY
+
+    local _key _allowed _name
+    local -a _dropped=()
+    while IFS= read -r _key; do
+        [[ "${_key}" == OPENCODE_* ]] || continue
+        _allowed=0
+        for _name in "${_OC2_ENV_ALLOWLIST[@]}"; do
+            if [[ "${_key}" == "${_name}" ]]; then
+                _allowed=1
+                break
+            fi
+        done
+        if [[ "${_allowed}" -eq 1 ]]; then
+            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+        else
+            _dropped+=("${_key}")
+        fi
+    done < <(compgen -e)
+
+    # Names only, never values.
+    if [[ "${DRY_RUN}" -eq 1 && ${#_dropped[@]} -gt 0 ]]; then
+        printf 'bwopencode2: dry-run: dropped host OPENCODE_* variables (not in allowlist): %s\n' "${_dropped[*]}" >&2
+    fi
+
+    # GitHub CLI token passthrough (opt-in via --github-tokens)
+    # In --dry-run mode the value is replaced with REDACTED so that tokens
+    # are not printed to the terminal in the bwrap command output.
+    if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
+        local _gh_val
+        while IFS= read -r _key; do
+            if [[ "${_key}" == GH_TOKEN_* ]]; then
+                if [[ "${DRY_RUN}" -eq 1 ]]; then
+                    _gh_val="REDACTED"
+                else
+                    _gh_val="${!_key}"
+                fi
+                BWRAP_ARGS+=(--setenv "${_key}" "${_gh_val}")
+            fi
+        done < <(compgen -e)
+    fi
+
+    # Separate XDG homes for OpenCode 2 (see build_xdg_mirror_mounts for the
+    # git/pixi/ccache side effect).
+    BWRAP_ARGS+=(
+        --setenv XDG_CONFIG_HOME "${OC2_XDG_CONFIG_HOME}"
+        --setenv XDG_DATA_HOME "${OC2_XDG_DATA_HOME}"
+        --setenv XDG_STATE_HOME "${OC2_XDG_STATE_HOME}"
+        --setenv XDG_CACHE_HOME "${OC2_XDG_CACHE_HOME}"
+    )
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════
+
+main() {
+    bwrap_check_account
+    parse_wrapper_args "$@"
+    bwrap_resolve_tool opencode2 "OpenCode 2 is installed by the ansible base role."
+
+    if [[ "${SHOW_HELP}" -eq 1 ]]; then
+        show_help
+        # show_help does exec, never returns
+    fi
+
+    # --exec runs an arbitrary command, so its arguments are not opencode2's.
+    if [[ -z "${TEST_CMD}" ]]; then
+        guard_tool_args
+    fi
+
+    detect_bwrap_capabilities
+    detect_kernel_capabilities
+    resolve_common_paths
+    resolve_opencode2_paths
+    detect_shell
+    ensure_host_dirs
+    parse_all_git_includes
+    resolve_config_symlinks
+    init_sandbox_path
+
+    # Build bwrap argument list
+    build_base_sandbox
+    build_binary_masks
+    build_proc_dev_tmp
+    build_sys_mounts
+    build_etc_mounts
+    build_managed_config
+    build_managed_skills
+    build_managed_extras
+    build_home_tmpfs
+    build_workdir_mount
+    build_persistent_dotdir
+    build_opencode2_config_mount
+    build_opencode2_data_mount
+    build_opencode2_cache_mount
+    build_opencode2_state_dir
+    build_git_mounts
+    build_pixi_mounts
+    build_ccache_mounts
+    build_npm_mounts
+    build_xdg_mirror_mounts
+    build_user_bin_mount
+    build_nsls2_mount
+    build_opencode2_install_mount
+    build_dynamic_tool_mounts
+    build_extra_path_mounts
+
+    # Environment variables
+    build_env_vars
+    build_opencode2_env
+
+    # Launch
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        print_dry_run
+    else
+        launch_sandbox
+    fi
+}
+
+main "$@"
