@@ -127,6 +127,7 @@ GIT_INCLUDE_RAW=()
 # not run in a subshell).
 _BWRAP_CANON=""
 _BWRAP_INC_VISIBLE=""
+_BWRAP_GIT_VALUE=""
 _BWRAP_INC_PREDIRS=""
 _BWRAP_INC_LINKS=""
 _BWRAP_INC_LEXICAL=""
@@ -720,6 +721,49 @@ _mount_npm_global_prefix() {
 
 # ── Git include parser ───────────────────────────────────────────
 
+# _bwrap_git_decode_value RAW
+#   Decode a git config value the way git does, so a quoted or commented
+#   include path is recognised.  Result in _BWRAP_GIT_VALUE; returns 1 when the
+#   value is not valid (unterminated quote, unknown escape).  Rules: leading
+#   and trailing whitespace is dropped; a double quote toggles quoting; inside
+#   or outside quotes the escapes \n \t \b \" \\ are decoded; outside quotes
+#   an unescaped '#' or ';' starts a comment.  A trailing backslash (git's line
+#   continuation) is not supported: such a value is treated as invalid and the
+#   include is skipped.
+_bwrap_git_decode_value() {
+    local raw="$1" out="" c next i n=${#1} quoted=0 pending=""
+    _BWRAP_GIT_VALUE=""
+    for ((i = 0; i < n; i++)); do
+        c="${raw:i:1}"
+        if [[ "${c}" == "\\" ]]; then
+            i=$((i + 1))
+            [[ ${i} -lt ${n} ]] || return 1
+            next="${raw:i:1}"
+            case "${next}" in
+                n) c=$'\n' ;;
+                t) c=$'\t' ;;
+                b) c=$'\b' ;;
+                '"' | "\\") c="${next}" ;;
+                *) return 1 ;;
+            esac
+            out+="${pending}${c}"
+            pending=""
+        elif [[ "${c}" == '"' ]]; then
+            quoted=$((1 - quoted))
+        elif [[ ${quoted} -eq 0 && ("${c}" == "#" || "${c}" == ";")   ]]; then
+            break
+        elif [[ ${quoted} -eq 0 && ("${c}" == " " || "${c}" == $'\t')   ]]; then
+            # Whitespace outside quotes is kept only if more text follows.
+            [[ -n "${out}" || -n "${pending}" ]] && pending+=" "
+        else
+            out+="${pending}${c}"
+            pending=""
+        fi
+    done
+    [[ ${quoted} -eq 0 ]] || return 1
+    _BWRAP_GIT_VALUE="${out}"
+}
+
 # parse_git_includes CONFIG_FILE [DEPTH]
 #   Record every [include] / [includeIf] "path =" target of CONFIG_FILE and
 #   follow the included files recursively (DEPTH is the nesting level of
@@ -748,11 +792,12 @@ parse_git_includes() {
     # Matches lines like:  path = /some/path  or  path = ~/relative
     # Pure bash — no grep/sed/xargs subprocesses.
     while IFS= read -r line || [[ -n "${line}" ]]; do
-        [[ "${line}" =~ ^[[:space:]]*path[[:space:]]*=[[:space:]]*(.*) ]] || continue
-        local path_val="${BASH_REMATCH[1]}"
-
-        # Trim trailing whitespace
-        path_val="${path_val%"${path_val##*[![:space:]]}"}"
+        # git variable names are case-insensitive.  The value is decoded the
+        # way git does (quotes, escapes, trailing comments) before anything is
+        # derived from it; an undecodable value is skipped.
+        [[ "${line}" =~ ^[[:space:]]*[Pp][Aa][Tt][Hh][[:space:]]*=[[:space:]]*(.*) ]] || continue
+        _bwrap_git_decode_value "${BASH_REMATCH[1]}" || continue
+        local path_val="${_BWRAP_GIT_VALUE}"
         [[ -z "${path_val}" ]] && continue
 
         # Resolve ~/ prefix

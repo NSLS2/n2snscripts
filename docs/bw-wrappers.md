@@ -182,7 +182,10 @@ cases.
   chains deeper than 10 are ignored; unusual symlink layouts (for example a
   symlink at a directory-bind root or under a path the launcher pre-creates)
   fall back to a warning and a lexical mount, and git may still not find the
-  file. Includes are tracked per path as opened, so two symlinks to one config
+  file. Include values are decoded the way git does (double quotes, the
+  escapes `\n \t \b \" \\`, trailing `#` or `;` comments, any case of
+  `path`); a value that git itself would reject is skipped, and so is one that
+  ends in a backslash (git's line continuation is not supported). Includes are tracked per path as opened, so two symlinks to one config
   are both followed. In short: an unusual include or symlink layout can lose git
   settings inside the sandbox. That does not expose credentials, so it is
   treated as a limitation of the sandbox, not a bug, and the include handling is
