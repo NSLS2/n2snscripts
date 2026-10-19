@@ -882,9 +882,19 @@ _is_prefix_of() {
 #   that are never mounted (see _check_path_safe for the rationale).
 #   XDG_DATA_HOME is set by resolve_common_paths, which is always called
 #   before any function that uses this list.
+#   Callers compare CANONICAL paths, so each entry is listed both as written
+#   and at its resolved target (readlink -f) when that differs: with
+#   ~/.config/git -> ~/dotfiles/git the credentials file is matched as
+#   ~/dotfiles/git/credentials too, and a symlinked ~/.git-credentials or ~/.ssh
+#   is matched at its target.  readlink -f resolves a missing last component
+#   against its (resolved) parent, so an entry that does not exist yet is
+#   covered as well.  The list is built once per HOME/XDG combination.
 _BWRAP_BLOCKED_LIST=()
+_BWRAP_BLOCKED_KEY=""
 _bwrap_load_blocked_prefixes() {
-    _BWRAP_BLOCKED_LIST=(
+    local _key="${_HOME}|${XDG_CONFIG_HOME:-}|${XDG_DATA_HOME:-}"
+    [[ "${_key}" == "${_BWRAP_BLOCKED_KEY}" && ${#_BWRAP_BLOCKED_LIST[@]} -gt 0 ]] && return 0
+    local -a _literal=(
         # SSH / GPG / cloud keys
         "${_HOME}/.ssh"
         "${_HOME}/.gnupg"
@@ -917,6 +927,16 @@ _bwrap_load_blocked_prefixes() {
         "/etc/sudoers"
         "/etc/sudoers.d"
     )
+    local _e _r
+    _BWRAP_BLOCKED_LIST=()
+    for _e in "${_literal[@]}"; do
+        _BWRAP_BLOCKED_LIST+=("${_e}")
+        _r="$(readlink -f -- "${_e}" 2> /dev/null || true)"
+        if [[ -n "${_r}" && "${_r}" != "${_e}" ]]; then
+            _BWRAP_BLOCKED_LIST+=("${_r}")
+        fi
+    done
+    _BWRAP_BLOCKED_KEY="${_key}"
 }
 
 # _bwrap_path_blocked CANON

@@ -123,6 +123,12 @@ cases.
   root that contains one that exists (for example launching from
   `~/.config/git`), `--ro-path`, `--rw-path` and an `[include]` pointing at
   either are refused.
+- **Blocked paths are matched at their symlink targets too.** Every entry of
+  the blocked list is checked both as written and at its resolved target, so
+  with `~/.config/git -> ~/dotfiles/git` the file `~/dotfiles/git/credentials`
+  is blocked, and a symlinked `~/.git-credentials`, `~/.ssh` or `~/.config` is
+  blocked at its target. This applies to `--ro-path`, `--rw-path`, git includes
+  and the directory checks alike.
 - **Paths are resolved before the blocked-path check.** Config entries and
   config directories (`~/.config/opencode*`), git include files, and the XDG
   `git`, `pixi/config.toml` and `ccache` locations are canonicalized with
