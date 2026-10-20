@@ -3,7 +3,6 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 #
 # The sandbox provides filesystem isolation:
@@ -430,7 +429,8 @@ build_claude_env() {
     if [[ -n "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]]; then
         pass_through_if_set ANTHROPIC_FOUNDRY_API_KEY
     elif [[ -n "${AIFAPIM_API_KEY:-}" ]]; then
-        BWRAP_ARGS+=(--setenv ANTHROPIC_FOUNDRY_API_KEY "${AIFAPIM_API_KEY}")
+        # Through SANDBOX_ENV, not --setenv: keeps the key off bwrap's argv.
+        SANDBOX_ENV+=("ANTHROPIC_FOUNDRY_API_KEY=${AIFAPIM_API_KEY}")
     fi
 
     # Foundry base URL: prefer explicit ANTHROPIC_FOUNDRY_BASE_URL override;

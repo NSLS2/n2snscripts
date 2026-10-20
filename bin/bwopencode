@@ -3,7 +3,6 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 #
 # The sandbox provides filesystem isolation:
@@ -469,7 +468,7 @@ build_opencode_env() {
                 fi
             done
             if [[ "${_ok}" -eq 1 ]]; then
-                BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+                SANDBOX_ENV+=("${_key}=${!_key}")
             else
                 _dropped+=("${_key}")
             fi

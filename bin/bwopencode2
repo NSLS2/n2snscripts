@@ -3,7 +3,6 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 #
 # Requires the `opencode2` command (npm @opencode/cli), which the ansible base
@@ -604,7 +603,8 @@ build_opencode2_install_mount() {
 }
 
 # Must run AFTER build_env_vars: the XDG_* values set here override the
-# host pass-through from build_env_vars (bwrap --setenv: last one wins),
+# host pass-through from build_env_vars (--setenv overrides the forwarded
+# environment),
 # so OpenCode 2 uses its own directories even if `opencode2` on PATH is a
 # plain binary rather than the ansible wrapper.
 build_opencode2_env() {
@@ -626,7 +626,7 @@ build_opencode2_env() {
     # AIFAPIM gateway config
     pass_through_if_set AIFAPIM_HOST
     # The API key is passed through unchanged; print_dry_run redacts the value
-    # of any --setenv whose name looks secret (KEY/TOKEN/PASSWORD/...).
+    # of any variable whose name looks secret (KEY/TOKEN/PASSWORD/...).
     pass_through_if_set AIFAPIM_API_KEY
 
     local _key _allowed _name
@@ -641,7 +641,7 @@ build_opencode2_env() {
             fi
         done
         if [[ "${_allowed}" -eq 1 ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+            SANDBOX_ENV+=("${_key}=${!_key}")
         else
             _dropped+=("${_key}")
         fi

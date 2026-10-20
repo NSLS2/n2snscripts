@@ -68,7 +68,6 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 
 - `bash` >= 4.x (the `bw*` wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0 for the `bw*` wrappers
-  - 0.5.0+ enables `--clearenv`
   - 0.6.3+ enables bind-over-ro-bind binary masking
 - `gpg(1)` for `gpg-passwd.sh`
 - `openssl(1)` for `pemdecompose`

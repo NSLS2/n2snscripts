@@ -16,7 +16,6 @@ option list; the tables below summarise the common surface.
 
 - `bash` >= 4.x (the wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0
-  - 0.5.0+ enables `--clearenv`
   - 0.6.3+ enables bind-over-ro-bind binary masking
 
 ## Managed system paths
@@ -203,10 +202,17 @@ cases.
   settings inside the sandbox. That does not expose credentials, so it is
   treated as a limitation of the sandbox, not a bug, and the include handling is
   not being extended further.
-- **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
-  whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
-  `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the
-  printed text is redacted; the real launch passes the real values.
+- **Forwarded variables stay off the command line.** Values passed through
+  from the host (API keys, `GH_TOKEN_*`, ...) are given to `bwrap` in its
+  environment via `env -i`, not as `--setenv` arguments, so they do not
+  appear in `ps` output for the running sandbox (`/proc/<pid>/environ` is
+  readable only by you). They are visible on `env`'s own command line only
+  for the instant before it starts `bwrap`.
+- **`--dry-run` redacts secrets.** Every printed variable (on the `env -i`
+  line or as `--setenv NAME VALUE`) whose `NAME` contains (case-insensitive)
+  `KEY`, `TOKEN`, `PASSWORD`, `SECRET`, or `CREDENTIAL` is printed with the
+  value `REDACTED`. Only the printed text is redacted; the real launch passes
+  the real values.
 
 ## `bwopencode`
 
