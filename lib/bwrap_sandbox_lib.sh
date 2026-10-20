@@ -2472,12 +2472,14 @@ print_dry_run() {
     # Print bwrap arguments one flag-plus-values per line.  Each flag's
     # value count comes from _bwrap_flag_arity, so a value beginning with
     # "--" is grouped with its flag instead of being misread as a new flag.
+    # Values are %q-quoted so a path containing a quote, space or other
+    # special character still yields a valid, pasteable command.
     local i=0 arg _arity _j
     while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
         arg="${BWRAP_ARGS[$i]}"
         _bwrap_flag_arity "${arg}"
         _arity="${_BWRAP_FLAG_ARITY}"
-        printf "    %s" "${arg}"
+        printf "    %q" "${arg}"
         i=$((i + 1))
         for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
             # Redact the VALUE of secret-looking --setenv variables (only the
@@ -2486,7 +2488,7 @@ print_dry_run() {
                 _is_secret_env_name "${BWRAP_ARGS[$((i - 1))]}"; then
                 printf " 'REDACTED'"
             else
-                printf " '%s'" "${BWRAP_ARGS[$i]}"
+                printf " %q" "${BWRAP_ARGS[$i]}"
             fi
             i=$((i + 1))
         done
