@@ -260,6 +260,13 @@ project-dotfiles to the host data dir; `auth.json` is persisted only if
 it already exists on the host (use `--init-auth` once to create it for
 personal accounts).
 
+Requires at least a minimal OpenCode config: `/etc/opencode/opencode.json` or
+`opencode.jsonc` (deployed by ansible on managed hosts), or an `opencode.json`,
+`opencode.jsonc` or `config.json` in `~/.config/opencode`. Either is enough.
+If none exists the wrapper exits with status 2 before touching anything on the
+host (`--dry-run` and `--exec` included; `--help` is unaffected). Only the
+presence of a readable file is checked, not its content.
+
 ### `OPENCODE_*` environment allowlist
 
 Only an allowlist of harmless `OPENCODE_*` behaviour toggles (46 names) is
@@ -296,8 +303,8 @@ variables are printed to stderr. To permit another variable, add it to
 
 Launches [OpenCode 2](https://opencode.ai) (`opencode2`, npm `@opencode/cli`)
 inside a bubblewrap sandbox. It is a separate wrapper from `bwopencode`
-because OpenCode 2 uses different directories and has a background service
-that must not be reachable from the sandbox.
+because OpenCode 2 uses different directories on the host and has a background
+service that must not be reachable from the sandbox.
 
 ```text
 bwopencode2 [bwopencode2-options] [opencode2 arguments...]
@@ -306,27 +313,30 @@ bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 Requires the `opencode2` command on `PATH`, which the ansible base role
 installs.
 
+Requires at least a minimal OpenCode config, as `bwopencode` does: the
+system-wide `/etc/opencode/opencode.json{,c}` (shared with `bwopencode`), or an
+`opencode.json`, `opencode.jsonc` or `config.json` in
+`~/.config/opencode2/opencode`. If neither exists the wrapper exits with
+status 2. The OpenCode 1 config in `~/.config/opencode` is not used.
+
 Accepts the common options above except `--init-auth`.
 
-### Isolation from OpenCode 1
+### Host directories and sandbox locations
 
-OpenCode 2 migrates the OpenCode 1 session database one way and cannot load
-OpenCode 1 plugins, so it always uses its own directories, matching the
-ansible-installed `opencode2` wrapper. Inside the sandbox the wrapper sets
-`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` to
-`~/.config/opencode2`, `~/.local/share/opencode2`, `~/.local/state/opencode2`,
-and `~/.cache/opencode2`, even if the `opencode2` on `PATH` is a plain binary.
-OpenCode 2 appends `opencode` to each, and the OpenCode 1 directories are never
-mounted.
+On the host OpenCode 2 follows the ansible-installed `opencode2` wrapper's
+convention of separate `opencode2` directories. Inside the sandbox everything is
+mounted at the **standard** locations (the same ones `bwopencode` uses, under
+`$XDG_CONFIG_HOME` and so on), so the wrapper sets no `XDG_*` variable and git,
+pixi and ccache find their config where the shared library mounts it.
 
-| Directory | Mount |
-| --- | --- |
-| `~/.config/opencode2/opencode` | read-only, symlinks resolved |
-| `~/.local/share/opencode2/opencode` | read-write, the whole directory persists |
-| `~/.cache/opencode2/opencode` | read-write (provider npm packages install here) |
-| `~/.local/state/opencode2/opencode` | not persisted (ephemeral) |
-| `<repo>/.opencode` | persistent copy under the data dir `project-dotfiles/<hash>`, so repository content cannot inject config or plugins |
-| `/etc/opencode/opencode.json{,c}`, `skills`, `agents`, `commands`, `plugins` | read-only, when present |
+| Host | Sandbox | Mount |
+| --- | --- | --- |
+| `~/.config/opencode2/opencode` | `~/.config/opencode` | read-only, symlinks resolved |
+| `~/.local/share/opencode2/opencode` | `~/.local/share/opencode` | read-write, the whole directory persists |
+| `~/.cache/opencode2/opencode` | `~/.cache/opencode` | read-write (provider npm packages install here) |
+| (none) | `~/.local/state/opencode` | not persisted (ephemeral) |
+| `<repo>/.opencode` | `<repo>/.opencode` | persistent copy under the host data dir `project-dotfiles/<hash>`, so repository content cannot inject config or plugins |
+| `/etc/opencode/opencode.json{,c}`, `skills`, `agents`, `commands`, `plugins` | same | read-only, when present |
 
 The whole data directory is bound because the OpenCode 2 layout (database with
 `-shm`/`-wal`, `log`, `repos`, `shell`, ...) is not documented. Credentials are
@@ -335,22 +345,23 @@ persists across sessions without anything like `--init-auth` (OpenCode 2's
 legacy `auth.json` is only an import source). State is not persisted, so the
 last-used model and prompt history are not remembered between sessions.
 
-Because `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` point at the opencode2 directories,
-the wrapper makes the host's `$XDG_CONFIG_HOME/git`, `pixi/config.toml`,
-`ccache` config, and `$XDG_CACHE_HOME/ccache` cache visible at the same relative
-location in the opencode2 directories so git, pixi, and ccache keep working.
-The git mirror is a symlink to the host-path mounts the shared library already
-made, not a second bind: git resolves a relative `[include] path = ../shared`
-against the directory of the config path as opened, so a bind at
-`~/.config/opencode2/git` would look for `~/.config/opencode2/shared` and
-silently skip the include, whereas through the symlink `..` resolves to the real
-parent (`~/.config`), where the include is mounted. The symlink is created only
-when at least one of the four mounted files (`allowed_signers`, `config`,
-`ignore`, `attributes`; see "Credentials and secrets handling") exists, so it
-exposes just those files, read-only: `credentials` and anything created on the
-host later are not reachable through it. If the host `~/.config/git` is itself a
-symlink the library recreates it in the sandbox and the mirror resolves through
-it. `~/.gitconfig` and other `$HOME`-relative files are unaffected.
+### Config and authoring directories
+
+A system-wide `/etc/opencode` config is mounted when present, and the user
+config in `~/.config/opencode2/opencode` is layered on it, so personal tuning
+still works on managed hosts. The `skills`, `agents` and `commands` read-write
+authoring directories (see above) live under the host config directory and are
+mounted under `~/.config/opencode`; because the host and sandbox paths differ, a
+relative symlink inside them cannot resolve and is skipped with a warning
+(absolute symlinks work).
+
+### Isolation from OpenCode 1
+
+OpenCode 2 migrates the OpenCode 1 session database one way and cannot load
+OpenCode 1 plugins, so on the host it uses its own `opencode2` config, data and
+cache directories, and the OpenCode 1 ones are never mounted, even when an
+`opencode2` directory does not exist yet (data and cache are created on first
+run).
 
 ### What is kept out of the sandbox
 

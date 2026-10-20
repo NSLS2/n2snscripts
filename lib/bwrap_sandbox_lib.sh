@@ -146,11 +146,6 @@ declare -A _GIT_LINK_STATUS=()
 # sandbox as a plain directory (see _bwrap_git_recreate_link).
 declare -A _GIT_LINK_CONFLICT=()
 
-# Set to 1 by build_git_mounts when at least one file of
-# ${XDG_CONFIG_HOME}/git was mounted (launchers may point symlinks at the
-# directory; it is only guaranteed to resolve in the sandbox in that case).
-_BWRAP_XDG_GIT_HAS_FILES=0
-
 # Working directory state (set by build_workdir_mount)
 _BIND_DIR=""
 _GIT_ROOT=""
@@ -2119,11 +2114,9 @@ _bwrap_git_recreate_link() {
 #   with a warning; a dangling symlink is skipped silently.  When the
 #   directory is itself a symlink it is recreated as one and the files are
 #   mounted at its real target, so ".." in includes resolves as on the host.
-#   Sets _BWRAP_XDG_GIT_HAS_FILES=1 when at least one file was mounted.
 _bwrap_mount_xdg_git_files() {
     local gdir="${XDG_CONFIG_HOME}/git" gdir_real dest_dir name f f_real
     local -a names=() reals=()
-    _BWRAP_XDG_GIT_HAS_FILES=0
     [[ -d "${gdir}" ]] || return 0
     gdir_real="$(readlink -f -- "${gdir}" 2> /dev/null || true)"
     [[ -n "${gdir_real}" ]] || return 0
@@ -2158,7 +2151,6 @@ _bwrap_mount_xdg_git_files() {
     for _k in "${!names[@]}"; do
         BWRAP_ARGS+=(--ro-bind "${reals[${_k}]}" "${dest_dir}/${names[${_k}]}")
     done
-    _BWRAP_XDG_GIT_HAS_FILES=1
 }
 
 # _bwrap_git_lexical_mount RAW INC_PATH
@@ -2408,11 +2400,15 @@ _path_visible_from_host() {
     [[ ${_visible} -eq 1 ]]
 }
 
-# _mount_authoring_dir DIR CREATE KIND
+# _mount_authoring_dir DIR CREATE KIND [SRC]
 #   Mount DIR read-write.  CREATE=1 creates it on the host first (skipped
 #   under --dry-run, which must not mutate host state) so a first-time user
 #   can author into it; CREATE=0 mounts it only when it already exists.  KIND
 #   is the word used in warnings (e.g. "skill").
+#
+#   SRC is the host directory to mount at DIR, for when the tool looks in one
+#   place and the files live in another (default: DIR itself).  CREATE and the
+#   existence test apply to SRC.
 #
 #   The directory is resolved with readlink -f and bound whole at its logical
 #   path, so entries created inside the sandbox persist on the host.  An
@@ -2421,7 +2417,9 @@ _path_visible_from_host() {
 #   otherwise mounted, so each symlink's resolved target is also bound
 #   read-write at its own path.  Only that target is exposed, not the
 #   repository around it.  A target that resolves into a blocked location, or
-#   is a directory containing one, is skipped with a warning.
+#   is a directory containing one, is skipped with a warning.  With a
+#   distinct SRC a RELATIVE symlink would resolve against DIR inside the
+#   sandbox rather than against SRC, so it is skipped with a warning.
 #
 #   bwrap cannot bind over a symlink inside a bound directory, so when DIR
 #   itself is reached through a symlink (its resolved path differs from DIR)
@@ -2435,24 +2433,26 @@ _path_visible_from_host() {
 #   alone.  Must be called AFTER the tool's own home mount: that mount may be
 #   a tmpfs that would hide a directory bound underneath it.
 _mount_authoring_dir() {
-    local _dir="$1" _create="$2" _kind="$3"
-    local _canon _entry _real
+    local _dir="$1" _create="$2" _kind="$3" _src="${4:-$1}"
+    local _canon _entry _real _link
 
-    if [[ ! -e "${_dir}" ]]; then
+    if [[ ! -e "${_src}" ]]; then
         [[ "${_create}" -eq 1 ]] || return 0
-    elif [[ ! -d "${_dir}" ]]; then
+    elif [[ ! -d "${_src}" ]]; then
         return 0
     fi
 
     # -m, not -f: a directory about to be created may have missing parents
     # too (a fresh ~/.config/opencode), and -f yields nothing for those.
-    _canon="$(readlink -m -- "${_dir}" 2> /dev/null || true)"
+    _canon="$(readlink -m -- "${_src}" 2> /dev/null || true)"
     [[ -n "${_canon}" ]] || return 0
     if _bwrap_bind_blocked "${_canon}"; then
-        echo "Warning: ${_kind} directory '${_dir}' resolves into or contains a blocked location (${_canon}); not mounted." >&2
+        echo "Warning: ${_kind} directory '${_src}' resolves into or contains a blocked location (${_canon}); not mounted." >&2
         return 0
     fi
-    _path_visible_from_host "${_dir}" && return 0
+    if [[ "${_src}" == "${_dir}" ]]; then
+        _path_visible_from_host "${_dir}" && return 0
+    fi
 
     if [[ "${_create}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
         mkdir -p -- "${_canon}"
@@ -2460,7 +2460,7 @@ _mount_authoring_dir() {
 
     _emit_home_intermediate_dirs "${_dir}" inclusive
 
-    if [[ "${_canon}" != "${_dir}" ]]; then
+    if [[ "${_src}" == "${_dir}" && "${_canon}" != "${_dir}" ]]; then
         [[ -d "${_canon}" ]] || return 0
         for _entry in "${_dir}"/* "${_dir}"/.[!.]* "${_dir}"/..?*; do
             [[ -e "${_entry}" ]] || continue
@@ -2479,11 +2479,18 @@ _mount_authoring_dir() {
     BWRAP_ARGS+=(--bind "${_canon}" "${_dir}")
     _MOUNTED_PREFIXES["${_dir}"]=1
 
-    [[ -d "${_dir}" ]] || return 0
-    for _entry in "${_dir}"/* "${_dir}"/.[!.]* "${_dir}"/..?*; do
+    [[ -d "${_canon}" ]] || return 0
+    for _entry in "${_canon}"/* "${_canon}"/.[!.]* "${_canon}"/..?*; do
         [[ -L "${_entry}" ]] || continue
         _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
         [[ -n "${_real}" && -e "${_real}" ]] || continue
+        if [[ "${_src}" != "${_dir}" ]]; then
+            _link="$(readlink -- "${_entry}" 2> /dev/null || true)"
+            if [[ "${_link}" != /* ]]; then
+                echo "Warning: ${_kind} '${_entry}' is a relative symlink and would not resolve at '${_dir}'; not mounted." >&2
+                continue
+            fi
+        fi
         _path_visible_from_host "${_real}" && continue
         if _bwrap_bind_blocked "${_real}"; then
             echo "Warning: ${_kind} '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
@@ -2506,6 +2513,13 @@ build_authoring_dir_mounts() {
     for _dir in "$@"; do
         _mount_authoring_dir "${_dir}" 1 "${_kind}"
     done
+}
+
+# build_authoring_dir_mounts_from KIND SRC DEST
+#   Like build_authoring_dir_mounts for one directory, but mount the host
+#   directory SRC (created when missing) at DEST, where the tool looks.
+build_authoring_dir_mounts_from() {
+    _mount_authoring_dir "$3" 1 "$1" "$2"
 }
 
 # build_personal_authoring_mounts KIND DIR...
