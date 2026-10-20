@@ -311,7 +311,11 @@ build_persistent_dotdir() {
     _repo_hash="$(printf '%s' "${_GIT_ROOT}" | sha256sum)"
     _repo_hash="${_repo_hash:0:16}"
     local _persist_dir="${OC_DATA_DIR}/project-dotfiles/${_repo_hash}"
-    mkdir -p "${_persist_dir}"
+    # The host mkdir is skipped on --dry-run (no host-state changes); the
+    # bind is still emitted so the printed command matches a real run.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p "${_persist_dir}"
+    fi
 
     BWRAP_ARGS+=(
         --bind "${_persist_dir}" "${_GIT_ROOT}/.opencode"
@@ -359,12 +363,15 @@ build_opencode_data_mounts() {
 
     # auth.json: only persist if it already exists on the host.
     # Use --init-auth on first run to bootstrap persistent auth.
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
     if [[ "${INIT_AUTH}" -eq 1 ]] && [[ ! -f "${OC_AUTH_FILE}" ]]; then
-        # Use umask to ensure file is created with 0600 permissions atomically
-        ( umask 077 && printf '{}\n' > "${OC_AUTH_FILE}" )
-        echo "Created ${OC_AUTH_FILE} — auth tokens will persist after this session." >&2
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+            # Use umask to ensure file is created with 0600 permissions atomically
+            ( umask 077 && printf '{}\n' > "${OC_AUTH_FILE}" )
+            echo "Created ${OC_AUTH_FILE} — auth tokens will persist after this session." >&2
+        fi
     fi
-    if [[ -f "${OC_AUTH_FILE}" ]]; then
+    if _persist_bind_wanted "${OC_AUTH_FILE}"; then
         BWRAP_ARGS+=(--bind "${OC_AUTH_FILE}" "${OC_AUTH_FILE}")
     fi
 }
@@ -508,7 +515,10 @@ main() {
     resolve_common_paths
     resolve_opencode_paths
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     parse_all_git_includes
     resolve_config_symlinks
     init_sandbox_path

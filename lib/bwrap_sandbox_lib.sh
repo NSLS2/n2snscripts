@@ -579,6 +579,14 @@ bwrap_resolve_tool() {
     exit 1
 }
 
+# _persist_bind_wanted PATH
+#   True if PATH exists, or under --dry-run --init-auth: there a real run
+#   would have created the stub file and bound it, so the bind is emitted for
+#   an accurate dry-run even though the stub was not created.
+_persist_bind_wanted() {
+    [[ -e "$1" ]] || { [[ "${INIT_AUTH:-0}" -eq 1 ]] && [[ "${DRY_RUN}" -eq 1 ]]; }
+}
+
 # _expand_leading_tilde VALUE
 #   Print VALUE with only a LEADING tilde expanded:
 #     "~" / "~/path"        -> $HOME / $HOME/path

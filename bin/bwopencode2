@@ -467,7 +467,11 @@ build_persistent_dotdir() {
     _repo_hash="$(printf '%s' "${_GIT_ROOT}" | sha256sum)"
     _repo_hash="${_repo_hash:0:16}"
     local _persist_dir="${OC2_DATA_DIR}/project-dotfiles/${_repo_hash}"
-    mkdir -p "${_persist_dir}"
+    # The host mkdir is skipped on --dry-run (no host-state changes); the
+    # bind is still emitted so the printed command matches a real run.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p "${_persist_dir}"
+    fi
 
     BWRAP_ARGS+=(
         --bind "${_persist_dir}" "${_GIT_ROOT}/.opencode"
@@ -697,7 +701,10 @@ main() {
     resolve_common_paths
     resolve_opencode2_paths
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     parse_all_git_includes
     resolve_config_symlinks
     init_sandbox_path

@@ -302,14 +302,17 @@ build_copilot_home_mount() {
         fi
     done
 
-    # Handle config.json: copy or bind depending on --init-auth
+    # Handle config.json: copy or bind depending on --init-auth.
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
     if [[ "${INIT_AUTH}" -eq 1 ]]; then
         # --init-auth: bind-mount config.json so changes persist
-        if [[ ! -f "${COPILOT_CONFIG_FILE}" ]]; then
+        if [[ ! -f "${COPILOT_CONFIG_FILE}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
             ( umask 077 && printf '{"banner": "never"}\n' > "${COPILOT_CONFIG_FILE}" )
             echo "Created ${COPILOT_CONFIG_FILE} — auth tokens will persist after this session." >&2
         fi
-        BWRAP_ARGS+=(--bind "${COPILOT_CONFIG_FILE}" "${COPILOT_CONFIG_FILE}")
+        if _persist_bind_wanted "${COPILOT_CONFIG_FILE}"; then
+            BWRAP_ARGS+=(--bind "${COPILOT_CONFIG_FILE}" "${COPILOT_CONFIG_FILE}")
+        fi
     elif [[ -f "${COPILOT_CONFIG_FILE}" ]]; then
         # Normal mode: copy config.json into tmpfs via --file
         # This makes host auth available but changes don't persist
@@ -428,7 +431,10 @@ main() {
     resolve_common_paths
     resolve_copilot_paths
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     parse_all_git_includes
     init_sandbox_path
 

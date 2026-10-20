@@ -284,13 +284,16 @@ build_claude_home_mount() {
 
     # With --init-auth, create a stub settings.json on the host if none exists,
     # so it can be bind-mounted read-write and persist across sessions.
-    if [[ "${INIT_AUTH}" -eq 1 ]] && [[ ! -e "${_settings_path}" ]]; then
-        ( umask 022 && printf '{}' > "${_settings_path}" )
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
+    if [[ "${INIT_AUTH}" -eq 1 ]] && [[ ! -e "${_settings_path}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
+        ( umask 077 && printf '{}' > "${_settings_path}" )
         echo "Created ${_settings_path} — settings will persist after this session." >&2
     fi
 
-    # settings.json: read-write if it exists (claude may update it during the session)
-    if [[ -e "${_settings_path}" ]]; then
+    # settings.json: read-write if it exists (claude may update it during the
+    # session).  _persist_bind_wanted also emits the bind under
+    # --dry-run --init-auth, where the stub above is not created.
+    if _persist_bind_wanted "${_settings_path}"; then
         BWRAP_ARGS+=(--bind "${_settings_path}" "${_settings_path}")
     fi
 
@@ -301,12 +304,15 @@ build_claude_home_mount() {
     fi
 
     # Credentials: ephemeral by default, persistent with --init-auth.
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
     if [[ "${INIT_AUTH}" -eq 1 ]]; then
-        if [[ ! -f "${CLAUDE_CREDENTIALS_FILE}" ]]; then
+        if [[ ! -f "${CLAUDE_CREDENTIALS_FILE}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
             ( umask 077 && printf '{}' > "${CLAUDE_CREDENTIALS_FILE}" )
             echo "Created ${CLAUDE_CREDENTIALS_FILE} — credentials will persist after this session." >&2
         fi
-        BWRAP_ARGS+=(--bind "${CLAUDE_CREDENTIALS_FILE}" "${CLAUDE_CREDENTIALS_FILE}")
+        if _persist_bind_wanted "${CLAUDE_CREDENTIALS_FILE}"; then
+            BWRAP_ARGS+=(--bind "${CLAUDE_CREDENTIALS_FILE}" "${CLAUDE_CREDENTIALS_FILE}")
+        fi
     elif [[ -f "${CLAUDE_CREDENTIALS_FILE}" ]]; then
         # Normal mode: copy credentials into tmpfs via --file so host auth is
         # available but changes don't persist.
@@ -319,10 +325,15 @@ build_claude_home_mount() {
     # UI/session state (onboarding flags, feature caches, project history) —
     # not a credential.  Without this, $HOME is tmpfs and claude triggers
     # the onboarding flow on every invocation.
-    if [[ ! -f "${CLAUDE_STATE_FILE}" ]]; then
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
+    if [[ ! -f "${CLAUDE_STATE_FILE}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
         ( umask 077 && printf '{}' > "${CLAUDE_STATE_FILE}" )
     fi
-    BWRAP_ARGS+=(--bind "${CLAUDE_STATE_FILE}" "${CLAUDE_STATE_FILE}")
+    # A real run always creates and binds the state file, so emit the bind
+    # under --dry-run too (where the stub above is not created).
+    if [[ -f "${CLAUDE_STATE_FILE}" ]] || [[ "${DRY_RUN}" -eq 1 ]]; then
+        BWRAP_ARGS+=(--bind "${CLAUDE_STATE_FILE}" "${CLAUDE_STATE_FILE}")
+    fi
 }
 
 # ── Claude cache (read-write) ────────────────────────────────────
@@ -477,7 +488,10 @@ main() {
     resolve_common_paths
     resolve_claude_paths
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     parse_all_git_includes
     init_sandbox_path
 

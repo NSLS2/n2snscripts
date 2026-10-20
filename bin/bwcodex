@@ -379,11 +379,14 @@ build_codex_home_mount() {
 
     # auth.json: only persist if it already exists on the host.
     # Use --init-auth on first run to bootstrap persistent ChatGPT-login auth.
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
     if [[ "${INIT_AUTH}" -eq 1 ]] && [[ ! -f "${CODEX_AUTH_FILE}" ]]; then
-        ( umask 077 && printf '{}\n' > "${CODEX_AUTH_FILE}" )
-        echo "Created ${CODEX_AUTH_FILE} — auth tokens will persist after this session." >&2
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+            ( umask 077 && printf '{}\n' > "${CODEX_AUTH_FILE}" )
+            echo "Created ${CODEX_AUTH_FILE} — auth tokens will persist after this session." >&2
+        fi
     fi
-    if [[ -f "${CODEX_AUTH_FILE}" ]]; then
+    if _persist_bind_wanted "${CODEX_AUTH_FILE}"; then
         BWRAP_ARGS+=(--bind "${CODEX_AUTH_FILE}" "${CODEX_AUTH_FILE}")
     fi
 }
@@ -477,7 +480,10 @@ main() {
     resolve_common_paths
     resolve_codex_paths
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     check_codex_config
     parse_all_git_includes
     init_sandbox_path
