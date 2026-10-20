@@ -59,6 +59,7 @@ Every `bw*` wrapper accepts these options:
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 | `--ro-path PATH` | Read-only mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 | `--rw-path PATH` | Read-write mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
+| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 `--ro-path` and `--rw-path` may be nested: a path nested under another
 overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
@@ -220,10 +221,6 @@ project-dotfiles to the host data dir; `auth.json` is persisted only if
 it already exists on the host (use `--init-auth` once to create it for
 personal accounts).
 
-| Option | Description |
-| --- | --- |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
-
 ### `OPENCODE_*` environment allowlist
 
 Only an allowlist of harmless `OPENCODE_*` behaviour toggles (46 names) is
@@ -270,8 +267,7 @@ bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 Requires the `opencode2` command on `PATH`, which the ansible base role
 installs.
 
-Accepts the common options above except `--init-auth`, plus `--github-tokens`
-(same behavior as `bwopencode`).
+Accepts the common options above except `--init-auth`.
 
 ### Isolation from OpenCode 1
 
@@ -395,7 +391,6 @@ Additional options:
 | Option | Effect |
 | --- | --- |
 | `--debug` | Enable verbose debug logging: sets `ANTHROPIC_LOG=debug`, `NODE_DEBUG=http,https,tls`, and passes `--debug --verbose` to `claude` |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 The Claude home is `~/.claude`, or `$CLAUDE_CONFIG_DIR` when that is set on the
 host (it is then also set inside the sandbox, pointing at the same directory).
@@ -424,12 +419,6 @@ inside a bubblewrap sandbox.
 ```text
 bwcopilot [bwcopilot-options] [copilot arguments...]
 ```
-
-Additional options:
-
-| Option | Effect |
-| --- | --- |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 On shared accounts, auth tokens are ephemeral. On a personal machine,
 run `bwcopilot --init-auth` once to persist tokens.
@@ -474,7 +463,6 @@ Additional options:
 | --- | --- |
 | `--debug` | Enable verbose Codex logging (sets `RUST_LOG=debug`) |
 | `--persist-config` | Bind-mount `~/.codex/config.toml` read-write into the sandbox so changes (e.g. project-trust grants) persist across sessions. Without this flag, `config.toml` is staged read-write into a per-session copy that is discarded on exit. Concurrent `--persist-config` sessions may race on writes |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 Note: Codex CLI also enforces its own inner Landlock-based sandbox for
 agent tool calls. The outer `bwrap` here is complementary — it scopes
