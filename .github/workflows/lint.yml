@@ -51,7 +51,7 @@ jobs:
             echo "to_ref=${SHA}"               >> "$GITHUB_OUTPUT"
           elif [[ "$EVENT_NAME" == "push" ]]; then
             # On branch creation, $BEFORE is 40 zeros; after force-push, the old SHA
-            # may be unfetchable. Both break pre-commit --from-ref, so fall back to --all-files.
+            # may be unfetchable. Both break prek --from-ref, so fall back to --all-files.
             if [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE" 2>/dev/null; then
               echo "from_ref=" >> "$GITHUB_OUTPUT"
               echo "to_ref="   >> "$GITHUB_OUTPUT"
@@ -101,32 +101,32 @@ jobs:
             echo "gitleaks=$GITLEAKS_VER"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Run pre-commit (changed files)
-        id: pre_commit
+      - name: Run prek (changed files)
+        id: prek
         env:
           FROM_REF: ${{ steps.refs.outputs.from_ref }}
           TO_REF: ${{ steps.refs.outputs.to_ref }}
         run: |
           set -o pipefail
           if [[ -n "$FROM_REF" ]]; then
-            pixi run -e dev pre-commit run \
+            pixi run -e dev prek run \
               --from-ref "$FROM_REF" \
               --to-ref   "$TO_REF"   \
               --show-diff-on-failure \
               --color always \
-              2>&1 | tee /tmp/pre-commit-output.txt
+              2>&1 | tee /tmp/prek-output.txt
           else
-            pixi run -e dev pre-commit run \
+            pixi run -e dev prek run \
               --all-files \
               --show-diff-on-failure \
               --color always \
-              2>&1 | tee /tmp/pre-commit-output.txt
+              2>&1 | tee /tmp/prek-output.txt
           fi
 
       - name: Write job summary
         if: always()
         env:
-          PRE_COMMIT_OUTCOME: ${{ steps.pre_commit.outcome }}
+          PREK_OUTCOME: ${{ steps.prek.outcome }}
           FROM_REF: ${{ steps.refs.outputs.from_ref }}
           TO_REF: ${{ steps.refs.outputs.to_ref }}
           RUFF_VER: ${{ steps.versions.outputs.ruff }}
@@ -141,7 +141,7 @@ jobs:
           SHELLCHECK_VER: ${{ steps.versions.outputs.shellcheck }}
           GITLEAKS_VER: ${{ steps.versions.outputs.gitleaks }}
         run: |
-          if [[ "$PRE_COMMIT_OUTCOME" == "success" ]]; then
+          if [[ "$PREK_OUTCOME" == "success" ]]; then
             BADGE="All linting hooks passed"
           else
             BADGE="One or more linting hooks failed"
@@ -176,11 +176,11 @@ jobs:
             echo "| shellcheck | shellcheck | ${SHELLCHECK_VER} |"
             echo "| gitleaks | gitleaks | ${GITLEAKS_VER} |"
             echo ""
-            if [[ -s /tmp/pre-commit-output.txt ]]; then
+            if [[ -s /tmp/prek-output.txt ]]; then
               echo "### Output"
               echo ""
               echo '```'
-              sed 's/\x1b\[[0-9;]*m//g' /tmp/pre-commit-output.txt
+              sed 's/\x1b\[[0-9;]*m//g' /tmp/prek-output.txt
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
