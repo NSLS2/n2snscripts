@@ -967,6 +967,23 @@ pass_through_if_set() {
     fi
 }
 
+# forward_env_by_prefix PREFIX
+#   Append a --setenv entry to BWRAP_ARGS for every exported environment
+#   variable whose name starts with PREFIX.  Uses `while IFS= read -r` over
+#   `compgen -e`, so names are never word-split.  Values are passed as-is;
+#   print_dry_run redacts names that match _is_secret_env_name.
+#
+#   Example:
+#     forward_env_by_prefix GH_TOKEN_    # GH_TOKEN_NSLS2, GH_TOKEN_PERSONAL, ...
+forward_env_by_prefix() {
+    local _prefix="$1" _key
+    while IFS= read -r _key; do
+        if [[ "${_key}" == "${_prefix}"* ]]; then
+            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+        fi
+    done < <(compgen -e)
+}
+
 # ── Path safety validation ───────────────────────────────────────
 
 # _is_prefix_of A B

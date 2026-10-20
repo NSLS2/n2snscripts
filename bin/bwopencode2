@@ -650,21 +650,10 @@ build_opencode2_env() {
         printf 'bwopencode2: dry-run: dropped host OPENCODE_* variables (not in allowlist): %s\n' "${_dropped[*]}" >&2
     fi
 
-    # GitHub CLI token passthrough (opt-in via --github-tokens)
-    # In --dry-run mode the value is replaced with REDACTED so that tokens
-    # are not printed to the terminal in the bwrap command output.
+    # GitHub CLI token passthrough (opt-in via --github-tokens).  In
+    # --dry-run, print_dry_run redacts the values (the names match *TOKEN*).
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
-        local _gh_val
-        while IFS= read -r _key; do
-            if [[ "${_key}" == GH_TOKEN_* ]]; then
-                if [[ "${DRY_RUN}" -eq 1 ]]; then
-                    _gh_val="REDACTED"
-                else
-                    _gh_val="${!_key}"
-                fi
-                BWRAP_ARGS+=(--setenv "${_key}" "${_gh_val}")
-            fi
-        done < <(compgen -e)
+        forward_env_by_prefix GH_TOKEN_
     fi
 
     # Separate XDG homes for OpenCode 2 (see build_xdg_mirror_mounts for the
