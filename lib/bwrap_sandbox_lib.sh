@@ -1355,53 +1355,104 @@ validate_extra_path() {
 #   Mount all paths accumulated in EXTRA_RO_PATHS and EXTRA_RW_PATHS.
 #   Each path is validated by validate_extra_path before mounting.
 #
-#   Read-only paths: use _mount_ro_dir_if_needed for directories
-#     (deduplication via _MOUNTED_PREFIXES); for files, emit --ro-bind
-#     directly (no dedup needed — an individual file bind never subsumes
-#     a directory tree).
+#   Binds are emitted ANCESTORS-FIRST across both modes: bwrap applies binds
+#   in order and the last one covering a mount point wins, so a path nested
+#   under another is emitted after its parent and overrides it.  This lets
+#       --rw-path DIR --ro-path DIR/sub
+#   keep DIR writable but DIR/sub read-only (and the reverse: a read-only
+#   tree with one writable subdirectory).  A path given as both --ro-path and
+#   --rw-path is rejected.
 #
-#   Read-write paths: emit --bind directly for both files and directories.
-#     For paths under $HOME, intermediate --dir entries are created first
-#     so the bind mount point exists in the tmpfs.
+#   User paths are emitted DIRECTLY, not through the _MOUNTED_PREFIXES dedup
+#   used for automatic mounts: that dedup would skip a child "covered" by a
+#   parent bind (defeating the nesting, or a read-only subdirectory of the
+#   read-write working directory), and would silently drop any path under a
+#   pre-registered prefix such as /tmp, which is a tmpfs in the sandbox.
 #
-#   Must be called AFTER build_dynamic_tool_mounts (which pre-populates
-#   _MOUNTED_PREFIXES) and AFTER build_home_tmpfs (which creates the
-#   $HOME tmpfs that intermediate --dir entries populate).
+#   Must be called AFTER the automatic mount steps (working directory, tools,
+#   system, home) so an explicit path overrides them, and AFTER
+#   build_home_tmpfs (which creates the $HOME tmpfs that intermediate --dir
+#   entries populate).
 build_extra_path_mounts() {
-    local _raw_path _canon _target
+    [[ ${#EXTRA_RO_PATHS[@]} -eq 0 && ${#EXTRA_RW_PATHS[@]} -eq 0 ]] && return 0
 
-    # ── Read-only extra paths ────────────────────────────────────
+    local _raw_path _canon _mode
+    local -A _mode_of=()
+
+    # Validate everything up front.  validate_extra_path runs in a command
+    # substitution, where its `exit 1` only leaves the subshell, so the
+    # failure is propagated explicitly.
     for _raw_path in "${EXTRA_RO_PATHS[@]+"${EXTRA_RO_PATHS[@]}"}"; do
-        _canon="$(validate_extra_path "${_raw_path}" "ro")"
-
-        if [[ -d "${_canon}" ]]; then
-            # Directories: go through the dedup helper.
-            _mount_ro_dir_if_needed "${_canon}"
-        else
-            # Files: --ro-bind directly.  Pre-create the file's parent
-            # directory chain if it lives under $HOME (the tmpfs has no
-            # subdirs yet); the file itself is the bind mount point.
-            _emit_home_intermediate_dirs "${_canon%/*}" inclusive
-            BWRAP_ARGS+=(--ro-bind "${_canon}" "${_canon}")
+        _canon="$(validate_extra_path "${_raw_path}" "ro")" || exit 1
+        _mode_of["${_canon}"]="ro"
+    done
+    for _raw_path in "${EXTRA_RW_PATHS[@]+"${EXTRA_RW_PATHS[@]}"}"; do
+        _canon="$(validate_extra_path "${_raw_path}" "rw")" || exit 1
+        if [[ "${_mode_of["${_canon}"]:-}" == "ro" ]]; then
+            echo "Error: '${_canon}' was given as both --ro-path and --rw-path." >&2
+            exit 1
         fi
+        _mode_of["${_canon}"]="rw"
     done
 
-    # ── Read-write extra paths ───────────────────────────────────
-    for _raw_path in "${EXTRA_RW_PATHS[@]+"${EXTRA_RW_PATHS[@]}"}"; do
-        _canon="$(validate_extra_path "${_raw_path}" "rw")"
+    # Ancestors first: an ancestor is a byte prefix of its descendants, so a
+    # plain LC_ALL=C sort orders it before them.
+    local -a _sorted=()
+    mapfile -t _sorted < <(printf '%s\n' "${!_mode_of[@]}" | LC_ALL=C sort)
 
-        # Pre-create the intermediate --dir chain when the path is under
-        # $HOME.  For a directory the chain includes the target itself (the
-        # subsequent --bind lands on top of that --dir); for a file the
-        # chain stops at the parent directory.
-        if [[ -d "${_canon}" ]]; then
-            _target="${_canon}"
-        else
-            _target="${_canon%/*}"
+    # Destinations of every bind emitted so far.  A path with a bound
+    # ancestor needs no intermediate --dir entries (the ancestor's host tree
+    # already contains it), and a --dir there would clobber that bind.
+    local -A _bound_dests=()
+    local _bi=0 _bflag
+    while [[ ${_bi} -lt ${#BWRAP_ARGS[@]} ]]; do
+        _bflag="${BWRAP_ARGS[${_bi}]}"
+        _bwrap_flag_arity "${_bflag}"
+        case "${_bflag}" in
+            --bind | --bind-try | --ro-bind | --ro-bind-try | --dev-bind | --dev-bind-try)
+                _bound_dests["${BWRAP_ARGS[$((_bi + 2))]}"]=1
+                ;;
+        esac
+        _bi=$((_bi + 1 + _BWRAP_FLAG_ARITY))
+    done
+
+    local _anc _has_bound_ancestor
+    for _canon in "${_sorted[@]}"; do
+        _mode="${_mode_of["${_canon}"]}"
+
+        _has_bound_ancestor=0
+        _anc="${_canon%/*}"
+        [[ -n "${_anc}" ]] || _anc="/"
+        while :; do
+            if [[ -n "${_bound_dests["${_anc}"]:-}" ]]; then
+                _has_bound_ancestor=1
+                break
+            fi
+            [[ "${_anc}" == "/" ]] && break
+            _anc="${_anc%/*}"
+            [[ -n "${_anc}" ]] || _anc="/"
+        done
+
+        # Pre-create the intermediate --dir chain under $HOME.  A read-write
+        # directory includes the target itself (the --bind lands on top of
+        # that --dir); a read-only directory is its own mount point; a file
+        # needs its parent chain.
+        if [[ ${_has_bound_ancestor} -eq 0 ]]; then
+            if [[ -d "${_canon}" && "${_mode}" == "rw" ]]; then
+                _emit_home_intermediate_dirs "${_canon}" inclusive
+            elif [[ -d "${_canon}" ]]; then
+                _emit_home_intermediate_dirs "${_canon}"
+            else
+                _emit_home_intermediate_dirs "${_canon%/*}" inclusive
+            fi
         fi
-        _emit_home_intermediate_dirs "${_target}" inclusive
 
-        BWRAP_ARGS+=(--bind "${_canon}" "${_canon}")
+        if [[ "${_mode}" == "ro" ]]; then
+            BWRAP_ARGS+=(--ro-bind "${_canon}" "${_canon}")
+        else
+            BWRAP_ARGS+=(--bind "${_canon}" "${_canon}")
+        fi
+        _bound_dests["${_canon}"]=1
     done
 }
 
@@ -1811,6 +1862,11 @@ build_workdir_mount() {
     BWRAP_ARGS+=(
         --bind "${_BIND_DIR}" "${_BIND_DIR}"
     )
+    # Register the read-write tree so a tool resolved from inside it (e.g.
+    # node_modules/.bin or .pixi/envs/*/bin on PATH) does not get an --ro-bind
+    # on top, which would make that subtree read-only (EROFS on install).
+    # build_workdir_mount runs before build_dynamic_tool_mounts everywhere.
+    _MOUNTED_PREFIXES["${_BIND_DIR}"]=1
 }
 
 # ── Git config (read-only) ──────────────────────────────────────
@@ -2356,28 +2412,31 @@ resolve_env_bin() {
 }
 
 # _bwrap_flag_arity FLAG
-#   Echo the number of value arguments that bwrap flag FLAG consumes (0, 1,
-#   or 2).  Used by print_dry_run to group flags with their values WITHOUT
+#   Set _BWRAP_FLAG_ARITY to the number of value arguments that bwrap flag
+#   FLAG consumes (0, 1, or 2).  Used to walk BWRAP_ARGS (print_dry_run,
+#   build_extra_path_mounts) grouping flags with their values WITHOUT
 #   guessing from the value's leading characters — a path value that happens
 #   to start with "--" (e.g. a user-supplied --ro-path) must not be mistaken
 #   for a new flag.  Only the flags this library actually emits are listed;
-#   the default of 1 is a safe fallback for any single-value flag.
+#   the default of 1 is a safe fallback for any single-value flag.  Sets a
+#   global rather than echoing so the walks do not fork once per argument.
+_BWRAP_FLAG_ARITY=1
 _bwrap_flag_arity() {
     case "$1" in
         --unshare-* | --share-net | --die-with-parent | --new-session | \
             --clearenv | --as-pid-1)
-            echo 0
+            _BWRAP_FLAG_ARITY=0
             ;;
         --ro-bind | --ro-bind-try | --bind | --bind-try | --dev-bind | \
             --dev-bind-try | --symlink | --setenv | \
             --file | --bind-data | --ro-bind-data)
-            echo 2
+            _BWRAP_FLAG_ARITY=2
             ;;
         --dir | --tmpfs | --proc | --dev | --unsetenv | --chdir | --hostname)
-            echo 1
+            _BWRAP_FLAG_ARITY=1
             ;;
         *)
-            echo 1
+            _BWRAP_FLAG_ARITY=1
             ;;
     esac
 }
@@ -2416,7 +2475,8 @@ print_dry_run() {
     local i=0 arg _arity _j
     while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
         arg="${BWRAP_ARGS[$i]}"
-        _arity="$(_bwrap_flag_arity "${arg}")"
+        _bwrap_flag_arity "${arg}"
+        _arity="${_BWRAP_FLAG_ARITY}"
         printf "    %s" "${arg}"
         i=$((i + 1))
         for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do

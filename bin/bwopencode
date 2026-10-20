@@ -59,6 +59,8 @@
 #                   /etc/sudoers{,.d}.
 #   --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated to
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
+#                   A nested --ro-path/--rw-path overrides the one it sits under,
+#                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 
 set -euo pipefail
 
@@ -170,6 +172,9 @@ Wrapper options (consumed before opencode sees the command line):
                   Symlinks are resolved before the safety check is applied.
   --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
                   Same blocked-path rules as --ro-path.  May be repeated.
+                  --ro-path/--rw-path may nest: a nested path overrides the one
+                  it sits under, so `--rw-path DIR --ro-path DIR/sub` keeps DIR
+                  writable but DIR/sub read-only.
   --github-tokens Forward any GH_TOKEN_* environment variables into the
                   sandbox so the agent can authenticate the gh(1) CLI.
                   Off by default.  When set, use per-command token selection:

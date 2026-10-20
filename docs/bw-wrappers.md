@@ -60,6 +60,12 @@ Every `bw*` wrapper accepts these options:
 | `--ro-path PATH` | Read-only mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 | `--rw-path PATH` | Read-write mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 
+`--ro-path` and `--rw-path` may be nested: a path nested under another
+overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
+keeps `DIR/sub` read-only (the reverse, a read-only tree with one writable
+subdirectory, works too). A path given as both `--ro-path` and `--rw-path` is
+rejected.
+
 Tool-specific options are listed in each wrapper's section below.
 
 ## Account check
