@@ -3,7 +3,6 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 #
 # The sandbox provides filesystem isolation:
@@ -11,11 +10,13 @@
 #   - Copilot home (~/.copilot or $COPILOT_HOME): tmpfs (ephemeral by default)
 #     - session-state/: bind-mounted read-write (persistent)
 #     - logs/: bind-mounted read-write (persistent)
-#     - skills/: bind-mounted read-write (user-created skill definitions)
-#     - agents/: bind-mounted read-write (user-created custom agents)
+#     - skills/, agents/: bind-mounted read-write, always created on the host
+#         (user-authored definitions; persist across sessions)
 #     - installed-plugins/: bind-mounted read-only (prevents agent from installing plugins)
 #     - config.json: COPIED into tmpfs (host auth available, changes ephemeral)
 #     - Use --init-auth to make config.json persistent (for personal machines)
+#   - Personal skills (~/.agents/skills): read-write (if present); skills
+#     symlinked in from elsewhere (e.g. a shared skills repository) work too
 #   - Copilot cache (~/.cache/copilot or $COPILOT_CACHE_HOME): read-write
 #   - GitHub CLI auth (~/.config/gh/hosts.yml): read-only (if it exists)
 #   - Git config + includes: read-only
@@ -63,6 +64,8 @@
 #                   /etc/sudoers{,.d}.
 #   --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated to
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
+#                   A nested --ro-path/--rw-path overrides the one it sits under,
+#                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 
 set -euo pipefail
 
@@ -157,7 +160,9 @@ Wrapper options (consumed before copilot sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as copilot itself.
                   Example: bwcopilot --exec bash
-                           bwcopilot --exec 'env | sort'
+                           bwcopilot --exec bash -c 'env | sort'
+                  CMD itself is split on whitespace; pass arguments that need
+                  quoting as separate words after it, as above.
   --init-auth     Persist auth tokens to host (run once on personal machines).
   --new-session   Force bwrap to call setsid(2), detaching the sandbox from the
                   controlling terminal.  This is the default on older kernels
@@ -174,6 +179,9 @@ Wrapper options (consumed before copilot sees the command line):
                   Symlinks are resolved before the safety check is applied.
   --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
                   Same blocked-path rules as --ro-path.  May be repeated.
+                  --ro-path/--rw-path may nest: a nested path overrides the one
+                  it sits under, so `--rw-path DIR --ro-path DIR/sub` keeps DIR
+                  writable but DIR/sub read-only.
   --github-tokens Forward any GH_TOKEN_* environment variables into the
                   sandbox so the agent can authenticate the gh(1) CLI.
                   Off by default.  When set, use per-command token selection:
@@ -200,7 +208,7 @@ Known limitation:
 HELP_EOF
     # Delegate to copilot --help inside the sandbox so the user sees the full
     # copilot option set in the same invocation.
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    bwrap_show_tool_help copilot
 }
 
 # ── Copilot path resolution ─────────────────────────────────────
@@ -237,8 +245,6 @@ ensure_host_dirs() {
     mkdir -p "${COPILOT_HOME_DIR}" "${COPILOT_CACHE_DIR}"
     # Create persistent subdirectories for bind-mounts
     mkdir -p "${COPILOT_SESSION_DIR}" "${COPILOT_LOGS_DIR}"
-    # Create user-writable customization directories
-    mkdir -p "${COPILOT_HOME_DIR}/skills" "${COPILOT_HOME_DIR}/agents"
 }
 
 # ── Copilot home (ephemeral tmpfs + selective persistence) ──────
@@ -254,8 +260,7 @@ ensure_host_dirs() {
 # Persistent read-write:
 #   - session-state/: per-session checkpoints, events, database
 #   - logs/: process logs
-#   - skills/: user-created skill definitions (SKILL.md files)
-#   - agents/: user-created custom agent profiles (*.agent.md files)
+#   - skills/, agents/: mounted by build_copilot_authoring_mounts
 #
 # Persistent read-only:
 #   - mcp-config.json, lsp-config.json: user preferences (if they exist)
@@ -288,30 +293,33 @@ build_copilot_home_mount() {
         fi
     done
 
-    # Bind-mount user-writable customization directories (read-write)
-    # Skills and agents are user-created files, not installed packages.
-    for _cfg in skills agents; do
-        local _path="${COPILOT_HOME_DIR}/${_cfg}"
-        if [[ -e "${_path}" ]]; then
-            BWRAP_ARGS+=(--bind "${_path}" "${_path}")
-        fi
-    done
+    # skills/ and agents/ (user-authored, read-write) are mounted by
+    # build_copilot_authoring_mounts, which runs after this function.
 
-    # Handle config.json: copy or bind depending on --init-auth
+    # Handle config.json: copy or bind depending on --init-auth.
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
     if [[ "${INIT_AUTH}" -eq 1 ]]; then
         # --init-auth: bind-mount config.json so changes persist
-        if [[ ! -f "${COPILOT_CONFIG_FILE}" ]]; then
+        if [[ ! -f "${COPILOT_CONFIG_FILE}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
             ( umask 077 && printf '{"banner": "never"}\n' > "${COPILOT_CONFIG_FILE}" )
             echo "Created ${COPILOT_CONFIG_FILE} — auth tokens will persist after this session." >&2
         fi
-        BWRAP_ARGS+=(--bind "${COPILOT_CONFIG_FILE}" "${COPILOT_CONFIG_FILE}")
+        if _persist_bind_wanted "${COPILOT_CONFIG_FILE}"; then
+            BWRAP_ARGS+=(--bind "${COPILOT_CONFIG_FILE}" "${COPILOT_CONFIG_FILE}")
+        fi
     elif [[ -f "${COPILOT_CONFIG_FILE}" ]]; then
         # Normal mode: copy config.json into tmpfs via --file
         # This makes host auth available but changes don't persist
-        local _fd
-        exec {_fd}< "${COPILOT_CONFIG_FILE}"
-        BWRAP_ARGS+=(--file "${_fd}" "${COPILOT_CONFIG_FILE}")
-        # Note: fd stays open until bwrap exec's, then it's inherited and used
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            # A real fd number could not be reproduced by copy-paste: print a
+            # placeholder for the --file mount instead.
+            BWRAP_ARGS+=(--file "<config-fd>" "${COPILOT_CONFIG_FILE}")
+        else
+            local _fd
+            exec {_fd}< "${COPILOT_CONFIG_FILE}"
+            BWRAP_ARGS+=(--file "${_fd}" "${COPILOT_CONFIG_FILE}")
+            # Note: fd stays open until bwrap exec's, then it's inherited and used
+        fi
     fi
 }
 
@@ -337,6 +345,18 @@ build_copilot_settings_mount() {
     # needed for this file bind.  This also works when source and destination
     # are the same path.
     BWRAP_ARGS+=(--ro-bind "${_settings_source}" "${_settings_file}")
+}
+
+# ── Copilot authoring directories (read-write, persistent) ─────────
+# skills/ and agents/ hold user-authored markdown definitions.  They are
+# created on the host when missing and mounted read-write so the agent can
+# create and edit them from inside the sandbox.  ~/.agents/skills is an
+# additional skills location, mounted only if it already exists.  Must run
+# AFTER build_copilot_home_mount (the home is a tmpfs that would hide them).
+build_copilot_authoring_mounts() {
+    build_authoring_dir_mounts skill "${COPILOT_HOME_DIR}/skills"
+    build_authoring_dir_mounts agent "${COPILOT_HOME_DIR}/agents"
+    build_personal_authoring_mounts skill "${_HOME}/.agents/skills"
 }
 
 # ── Copilot cache (read-write) ──────────────────────────────────
@@ -379,28 +399,12 @@ build_copilot_env() {
     pass_through_if_set COPILOT_MODEL
 
     # Pass through any COPILOT_PROVIDER_* env vars
-    local _key
-    for _key in $(compgen -e); do
-        if [[ "${_key}" == COPILOT_PROVIDER_* ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
-        fi
-    done
+    forward_env_by_prefix COPILOT_PROVIDER_
 
-    # GitHub CLI token passthrough (opt-in via --github-tokens)
-    # In --dry-run mode the value is replaced with REDACTED so that tokens
-    # are not printed to the terminal in the bwrap command output.
+    # GitHub CLI token passthrough (opt-in via --github-tokens).  In
+    # --dry-run, print_dry_run redacts the values (the names match *TOKEN*).
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
-        local _gh_val
-        while IFS= read -r _key; do
-            if [[ "${_key}" == GH_TOKEN_* ]]; then
-                if [[ "${DRY_RUN}" -eq 1 ]]; then
-                    _gh_val="REDACTED"
-                else
-                    _gh_val="${!_key}"
-                fi
-                BWRAP_ARGS+=(--setenv "${_key}" "${_gh_val}")
-            fi
-        done < <(compgen -e)
+        forward_env_by_prefix GH_TOKEN_
     fi
 }
 
@@ -411,31 +415,35 @@ build_copilot_env() {
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
-    bwrap_resolve_tool copilot "Install the standalone GitHub Copilot CLI from https://github.com/github/copilot-cli"
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
-        # show_help does exec, never returns
+        # show_help never returns
     fi
+
+    bwrap_resolve_tool copilot "Install the standalone GitHub Copilot CLI from https://github.com/github/copilot-cli"
 
     detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths
     resolve_copilot_paths
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     parse_all_git_includes
     init_sandbox_path
 
     # Build bwrap argument list
     build_base_sandbox
-    build_binary_masks
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
     build_home_tmpfs
     build_workdir_mount
     build_copilot_home_mount
+    build_copilot_authoring_mounts
     build_copilot_cache_mount
     build_gh_auth_mount
     build_git_mounts
@@ -459,6 +467,10 @@ main() {
     # Environment variables
     build_env_vars
     build_copilot_env
+
+    # Mask dangerous binaries as the very last step: a mask is hidden by any
+    # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
+    build_binary_masks
 
     # Launch
     if [[ "${DRY_RUN}" -eq 1 ]]; then

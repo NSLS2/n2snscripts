@@ -3,7 +3,7 @@
 # commit and in CI via the Lint workflow
 # (.github/workflows/lint.yml). Tool versions are pinned in
 # pixi.toml [feature.dev.dependencies] for the pixi-dispatched hooks
-# and via `rev:` for the upstream pre-commit-managed hooks.
+# and via `rev:` for the upstream prek-managed hooks.
 #
 # Linter configs live at the repository root and are auto-discovered
 # by each tool by its conventional dotfile name. The only exception is

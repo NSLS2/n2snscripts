@@ -3,7 +3,6 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 #
 # Two approved auth paths are supported (configured in ~/.codex/config.toml):
@@ -25,25 +24,30 @@
 #     - sessions/: bind-mounted read-write (for `codex resume` / `codex fork`)
 #     - log/: bind-mounted read-write (RUST_LOG / opt-in plaintext logs)
 #     - history.jsonl: bind-mounted read-write (prompt history)
-#     - config.toml: by default, copied to a per-session staging file and
-#         bind-mounted RW so Codex can persist project-trust grants for the
-#         session without touching the host file (the staging copy is removed
-#         on script exit).  With --persist-config, the host config.toml is
+#     - config.toml: by default, opened as a file descriptor and passed to
+#         bwrap via --file so Codex can persist project-trust grants for the
+#         session without touching the host file (the temp copy is unlinked
+#         immediately after opening; no cleanup needed on exit).
+#         With --persist-config, the host config.toml is
 #         bind-mounted RW so writes persist across sessions at the cost of
 #         weaker isolation.  Either the user file or the system file
 #         (/etc/codex/config.toml) is sufficient for fail-fast.
+#     - AGENTS.md: bind-mounted read-only (if it exists)
+#     - packages/: tmpfs; managed daemon package copied from the CLI on each run
+#     - app-server-daemon/settings.json: ephemeral, disables daemon auto-update
+#     - auth.json: bind-mounted read-write only if it already exists on host;
+#         --init-auth creates a {} stub for first-time ChatGPT-login setup
+#     - Everything else (tmp/, state.toml, features/, ...): tmpfs, discarded on exit
+#   - Authoring directories (~/.codex/skills, ~/.codex/prompts): read-write,
+#     always created on the host, so definitions authored in the sandbox
+#     persist; ~/.agents/skills: read-write (if present).  Skills symlinked in
+#     from elsewhere (e.g. a shared skills repository) work too
 #   - /etc/codex/config.toml: system-wide provider/defaults config (if
 #       present); bind-mounted read-only.  Codex layers user config on
 #       top of this file.
 #   - /etc/codex/requirements.toml: admin-enforced restrictions (if
 #       present); bind-mounted read-only.  Users cannot loosen these.
-#     - AGENTS.md: bind-mounted read-only (if it exists)
-#     - skills/: bind-mounted read-only (if it exists)
-#     - packages/: bind-mounted read-only (if it exists, installer cache)
-#     - auth.json: bind-mounted read-write only if it already exists on host;
-#         --init-auth creates a {} stub for first-time ChatGPT-login setup
-#     - Everything else (tmp/, state.toml, features/, ...): tmpfs, discarded on exit
-#   - Codex CLI binary + npm prefix: read-only (handled by build_dynamic_tool_mounts)
+#   - Codex CLI package (including metadata and resources): read-only
 #   - Git config + includes: read-only
 #   - Pixi cache: read-write
 #   - Pixi config: read-only
@@ -92,6 +96,8 @@
 #                   /etc/sudoers{,.d}.
 #   --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated to
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
+#                   A nested --ro-path/--rw-path overrides the one it sits under,
+#                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 
 set -euo pipefail
 
@@ -193,7 +199,9 @@ Wrapper options (consumed before codex sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as codex itself.
                   Example: bwcodex --exec bash
-                           bwcodex --exec 'env | sort'
+                           bwcodex --exec bash -c 'env | sort'
+                  CMD itself is split on whitespace; pass arguments that need
+                  quoting as separate words after it, as above.
   --init-auth     Create ~/.codex/auth.json on the host so that ChatGPT-login
                   OAuth tokens persist across sessions.  Only meaningful for the
                   BNL ITD ChatGPT subscription auth path; has no effect for
@@ -224,6 +232,9 @@ Wrapper options (consumed before codex sees the command line):
                   Symlinks are resolved before the safety check is applied.
   --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
                   Same blocked-path rules as --ro-path.  May be repeated.
+                  --ro-path/--rw-path may nest: a nested path overrides the one
+                  it sits under, so `--rw-path DIR --ro-path DIR/sub` keeps DIR
+                  writable but DIR/sub read-only.
   --github-tokens Forward any GH_TOKEN_* environment variables into the
                   sandbox so the agent can authenticate the gh(1) CLI.
                   Off by default.  When set, use per-command token selection:
@@ -243,7 +254,7 @@ Authentication:
 HELP_EOF
     # Delegate to codex --help inside the sandbox so the user sees the full
     # codex option set in the same invocation.
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    bwrap_show_tool_help codex
 }
 
 resolve_codex_paths() {
@@ -257,8 +268,9 @@ resolve_codex_paths() {
     CODEX_SESSIONS_DIR="${CODEX_HOME_DIR}/sessions"
     CODEX_LOG_DIR="${CODEX_HOME_DIR}/log"
     CODEX_SKILLS_DIR="${CODEX_HOME_DIR}/skills"
+    CODEX_PROMPTS_DIR="${CODEX_HOME_DIR}/prompts"
     CODEX_HISTORY_FILE="${CODEX_HOME_DIR}/history.jsonl"
-    CODEX_PACKAGES_DIR="${CODEX_HOME_DIR}/packages"
+    CODEX_DAEMON_SETTINGS_FILE="${CODEX_HOME_DIR}/app-server-daemon/settings.json"
 
     # Validate the user-controllable root directory once here so that all
     # sub-path mounts derived from it are implicitly covered.
@@ -290,6 +302,18 @@ check_codex_config() {
         printf '       https://docs.nsls2.bnl.gov/docs/how-to/codex.html\n' >&2
         exit 2
     fi
+}
+
+# ── Codex authoring directories (read-write, persistent) ──────────
+# skills/ and prompts/ hold user-authored markdown definitions.  They are
+# created on the host when missing and mounted read-write so the agent can
+# create and edit them from inside the sandbox.  ~/.agents/skills is an
+# additional skills location, mounted only if it already exists.  Must run
+# AFTER build_codex_home_mount (the home is a tmpfs that would hide them).
+build_codex_authoring_mounts() {
+    build_authoring_dir_mounts skill  "${CODEX_SKILLS_DIR}"
+    build_authoring_dir_mounts prompt "${CODEX_PROMPTS_DIR}"
+    build_personal_authoring_mounts skill "${_HOME}/.agents/skills"
 }
 
 # ── Managed Codex skills (read-only) ──────────────────────────────
@@ -341,22 +365,36 @@ build_codex_home_mount() {
     fi
 
     # User config.toml mount strategy (see file header):
-    #   - Default: stage a writable copy in /tmp, bind RW into sandbox.
-    #     Codex can persist project trust / other mutations for the session,
-    #     but the host ~/.codex/config.toml is never touched.  The staging
-    #     file is cleaned up on script exit via the EXIT trap.
+    #   - Default: open a temporary copy of config.toml as an fd and pass it
+    #     to bwrap via --file.  bwrap creates a plain (writable) file in the
+    #     sandbox tmpfs from the fd content, so Codex can persist project-trust
+    #     grants for the session without touching the host file.  The temp
+    #     file is unlinked immediately after the fd is opened, so no cleanup
+    #     is needed on exit — the fd holds the only reference and closes when
+    #     bwrap exec's into the tool.
     #   - --persist-config: bind host config.toml RW so writes persist.
     # If the user file does not exist (managed host using only system
     # config), skip the user mount entirely.
     if [[ -f "${CODEX_CONFIG_FILE}" ]]; then
         if [[ "${PERSIST_CONFIG}" -eq 1 ]]; then
             BWRAP_ARGS+=(--bind "${CODEX_CONFIG_FILE}" "${CODEX_CONFIG_FILE}")
+        elif [[ "${DRY_RUN}" -eq 1 ]]; then
+            # --dry-run stages nothing on the host, and a real fd number could
+            # not be reproduced by copy-paste: print a placeholder instead.
+            BWRAP_ARGS+=(--file "<config-fd>" "${CODEX_CONFIG_FILE}")
         else
-            _STAGED_CONFIG="$(mktemp --tmpdir bwcodex-config.XXXXXX.toml)"
-            cp -p "${CODEX_CONFIG_FILE}" "${_STAGED_CONFIG}"
-            chmod u+w "${_STAGED_CONFIG}"
-            trap 'rm -f "${_STAGED_CONFIG}"' EXIT INT TERM
-            BWRAP_ARGS+=(--bind "${_STAGED_CONFIG}" "${CODEX_CONFIG_FILE}")
+            local _config_fd _staged_config
+            _staged_config="$(mktemp --tmpdir bwcodex-config.XXXXXX.toml)"
+            # Plain cp (not cp -p) keeps mktemp's 0600 mode; -p would apply
+            # the source's mode (typically 0644), leaving a world-readable
+            # copy in the shared temp directory until the unlink below.
+            cp "${CODEX_CONFIG_FILE}" "${_staged_config}"
+            # Open the copy as an fd then immediately unlink it.  The kernel
+            # keeps the data alive via the open fd; the filename disappears
+            # from /tmp so there is nothing to clean up on exit or signal.
+            exec {_config_fd}< "${_staged_config}"
+            rm -f "${_staged_config}"
+            BWRAP_ARGS+=(--file "${_config_fd}" "${CODEX_CONFIG_FILE}")
         fi
     fi
 
@@ -364,23 +402,58 @@ build_codex_home_mount() {
         BWRAP_ARGS+=(--ro-bind "${CODEX_AGENTS_FILE}" "${CODEX_AGENTS_FILE}")
     fi
 
-    if [[ -d "${CODEX_SKILLS_DIR}" ]]; then
-        BWRAP_ARGS+=(--ro-bind "${CODEX_SKILLS_DIR}" "${CODEX_SKILLS_DIR}")
-    fi
-
-    if [[ -d "${CODEX_PACKAGES_DIR}" ]]; then
-        BWRAP_ARGS+=(--ro-bind "${CODEX_PACKAGES_DIR}" "${CODEX_PACKAGES_DIR}")
+    # Keep the managed daemon package in tmpfs.  The complete CLI package
+    # mounted by build_codex_bin_mount seeds it on each launch.  Disable the
+    # daemon's updater before Codex starts so it does not fetch a newer copy.
+    BWRAP_ARGS+=(--perms 0700 --dir "${CODEX_HOME_DIR}/app-server-daemon")
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        BWRAP_ARGS+=(--perms 0600 --file "<daemon-settings-fd>" "${CODEX_DAEMON_SETTINGS_FILE}")
+    else
+        local _settings_fd _staged_settings
+        _staged_settings="$(mktemp --tmpdir bwcodex-daemon-settings.XXXXXX.json)"
+        printf '{"updater":{"autoUpdateEnabled":false}}\n' > "${_staged_settings}"
+        exec {_settings_fd}< "${_staged_settings}"
+        rm -f "${_staged_settings}"
+        BWRAP_ARGS+=(--perms 0600 --file "${_settings_fd}" "${CODEX_DAEMON_SETTINGS_FILE}")
     fi
 
     # auth.json: only persist if it already exists on the host.
     # Use --init-auth on first run to bootstrap persistent ChatGPT-login auth.
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
     if [[ "${INIT_AUTH}" -eq 1 ]] && [[ ! -f "${CODEX_AUTH_FILE}" ]]; then
-        ( umask 077 && printf '{}\n' > "${CODEX_AUTH_FILE}" )
-        echo "Created ${CODEX_AUTH_FILE} — auth tokens will persist after this session." >&2
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+            ( umask 077 && printf '{}\n' > "${CODEX_AUTH_FILE}" )
+            echo "Created ${CODEX_AUTH_FILE} — auth tokens will persist after this session." >&2
+        fi
     fi
-    if [[ -f "${CODEX_AUTH_FILE}" ]]; then
+    if _persist_bind_wanted "${CODEX_AUTH_FILE}"; then
         BWRAP_ARGS+=(--bind "${CODEX_AUTH_FILE}" "${CODEX_AUTH_FILE}")
     fi
+}
+
+# ── SSL_CERT_FILE (read-only) ────────────────────────────────────
+# Codex honours SSL_CERT_FILE, but forwarding only the variable is not
+# enough: a bundle under $HOME (or anywhere else not mounted) is absent in
+# the sandbox and TLS fails.  Mount the canonical file read-only and point
+# SSL_CERT_FILE at it; refuse with a warning (and do not forward) when it
+# does not resolve to a readable file or resolves into a blocked location.
+build_ssl_cert_file_mount() {
+    [[ -n "${SSL_CERT_FILE:-}" ]] || return 0
+    local _canon
+    _canon="$(readlink -f -- "${SSL_CERT_FILE}" 2> /dev/null || true)"
+    if [[ -z "${_canon}" || ! -f "${_canon}" || ! -r "${_canon}" ]]; then
+        echo "Warning: SSL_CERT_FILE=${SSL_CERT_FILE} is not a readable file; not forwarding it." >&2
+        return 0
+    fi
+    if _bwrap_path_blocked "${_canon}"; then
+        echo "Warning: SSL_CERT_FILE=${SSL_CERT_FILE} resolves into a blocked location; not forwarding it." >&2
+        return 0
+    fi
+    # Bound even when a parent tree is already mounted (harmless there), so
+    # a file under a sandbox tmpfs such as /tmp is still provided.
+    _emit_home_intermediate_dirs "${_canon%/*}" inclusive
+    BWRAP_ARGS+=(--ro-bind "${_canon}" "${_canon}")
+    BWRAP_ARGS+=(--setenv SSL_CERT_FILE "${_canon}")
 }
 
 # ── Codex env vars ───────────────────────────────────────────────
@@ -403,54 +476,41 @@ build_codex_env() {
         pass_through_if_set OPENAI_API_KEY
     fi
 
-    # Documented Codex env vars
-    pass_through_if_set CODEX_HOME
-    pass_through_if_set CODEX_SQLITE_HOME
-    pass_through_if_set CODEX_API_KEY
-    pass_through_if_set CODEX_ACCESS_TOKEN
-    pass_through_if_set CODEX_CA_CERTIFICATE
-    pass_through_if_set SSL_CERT_FILE
+    # Non-CODEX_* vars that Codex consults.
+    build_ssl_cert_file_mount
     pass_through_if_set RUST_LOG
 
-    # Generic CODEX_* sweep so user-defined overrides flow through.
-    local _key
-    while IFS= read -r _key; do
-        if [[ "${_key}" == CODEX_* ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
-        fi
-    done < <(compgen -e)
+    # Generic CODEX_* sweep — covers CODEX_HOME, CODEX_SQLITE_HOME,
+    # CODEX_API_KEY, CODEX_ACCESS_TOKEN, CODEX_CA_CERTIFICATE, and any
+    # user-defined CODEX_* overrides in a single pass.
+    forward_env_by_prefix CODEX_
 
     # --debug wrapper flag: force verbose logging regardless of host env.
     if [[ "${DEBUG_MODE}" -eq 1 ]]; then
         BWRAP_ARGS+=(--setenv RUST_LOG "debug")
     fi
 
-    # GitHub CLI token passthrough (opt-in via --github-tokens)
-    # In --dry-run mode the value is replaced with REDACTED so that tokens
-    # are not printed to the terminal in the bwrap command output.
+    # GitHub CLI token passthrough (opt-in via --github-tokens).  In
+    # --dry-run, print_dry_run redacts the values (the names match *TOKEN*).
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
-        local _gh_val
-        while IFS= read -r _key; do
-            if [[ "${_key}" == GH_TOKEN_* ]]; then
-                if [[ "${DRY_RUN}" -eq 1 ]]; then
-                    _gh_val="REDACTED"
-                else
-                    _gh_val="${!_key}"
-                fi
-                BWRAP_ARGS+=(--setenv "${_key}" "${_gh_val}")
-            fi
-        done < <(compgen -e)
+        forward_env_by_prefix GH_TOKEN_
     fi
 }
 
-# ── Codex install dir (stub) ─────────────────────────────────────
-# Codex CLI is installed via npm at /usr/local/lib/node_modules/@openai/codex,
-# which build_dynamic_tool_mounts already covers via the npm-prefix mount.
-# This stub is kept for symmetry with bwclaude/bwopencode and as a future
-# hook for non-npm Codex installs (e.g. the standalone installer's
-# /opt/codex layout).
+# ── Complete Codex CLI package ──────────────────────────────────
+# A packaged CLI needs codex-package.json and its sibling resource dirs to
+# seed a managed app-server daemon.  The dynamic tool mount only sees the
+# binary directory for a symlink such as /usr/bin/codex ->
+# /opt/openai-codex/bin/codex.
+# Mount the entire package when its metadata is present; npm installations
+# are already covered by the dynamic npm-prefix mount.
 build_codex_bin_mount() {
-    :
+    local _real_bin _package_dir
+    _real_bin="$(readlink -f -- "${_TOOL_BIN}")"
+    _package_dir="$(dirname "$(dirname "${_real_bin}")")"
+    if [[ -f "${_package_dir}/codex-package.json" ]]; then
+        _mount_ro_dir_if_needed "${_package_dir}"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -460,26 +520,29 @@ build_codex_bin_mount() {
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
-    bwrap_resolve_tool codex
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
-        # show_help does exec, never returns
+        # show_help never returns
     fi
+
+    bwrap_resolve_tool codex
 
     detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths
     resolve_codex_paths
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     check_codex_config
     parse_all_git_includes
     init_sandbox_path
 
     # Build bwrap argument list
     build_base_sandbox
-    build_binary_masks
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
@@ -487,6 +550,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_codex_home_mount
+    build_codex_authoring_mounts
     build_git_mounts
     build_pixi_mounts
     build_ccache_mounts
@@ -500,6 +564,10 @@ main() {
     # Environment variables
     build_env_vars
     build_codex_env
+
+    # Mask dangerous binaries as the very last step: a mask is hidden by any
+    # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
+    build_binary_masks
 
     # Launch
     if [[ "${DRY_RUN}" -eq 1 ]]; then

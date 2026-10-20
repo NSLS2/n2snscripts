@@ -3,16 +3,27 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+#
+# Requires at least a minimal OpenCode config: /etc/opencode/opencode.json{,c}
+# or a user opencode.json, opencode.jsonc or config.json in ~/.config/opencode.
+# Exits 2 if neither exists.
 #
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write
-#   - OpenCode config: read-only (symlinks resolved)
+#   - OpenCode config: read-only (symlinks resolved), except the authoring
+#     directories below
+#   - Authoring directories (~/.config/opencode/{skills,agents,commands}):
+#     read-write, always created on the host, so definitions authored in the
+#     sandbox persist; skills symlinked in from elsewhere (e.g. a shared
+#     skills repository) work too
+#   - Additional skills/agents/commands locations OpenCode reads
+#     (~/.claude/{skills,agents,commands}, ~/.agents/{skills,agents}):
+#     read-write, only if they already exist
 #   - OpenCode data dir: ephemeral tmpfs with selective persistence
 #       - auth.json: persisted only if it already exists on host;
 #         otherwise created in tmpfs (discarded on exit)
-#       - Database, logs, snapshots, storage, tool-output,
+#       - Database, logs, plans, snapshots, storage, tool-output,
 #         project-dotfiles: always persisted
 #   - OpenCode cache: read-write
 #   - Git config + includes: read-only
@@ -59,6 +70,8 @@
 #                   /etc/sudoers{,.d}.
 #   --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated to
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
+#                   A nested --ro-path/--rw-path overrides the one it sits under,
+#                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 
 set -euo pipefail
 
@@ -151,7 +164,9 @@ Wrapper options (consumed before opencode sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as opencode itself.
                   Example: bwopencode --exec bash
-                           bwopencode --exec 'env | sort'
+                           bwopencode --exec bash -c 'env | sort'
+                  CMD itself is split on whitespace; pass arguments that need
+                  quoting as separate words after it, as above.
   --init-auth     Create auth.json on the host so GitHub OAuth tokens persist
                   across sessions.  Run once on a personal account; skip on
                   shared accounts (tokens will be ephemeral by default).
@@ -170,6 +185,9 @@ Wrapper options (consumed before opencode sees the command line):
                   Symlinks are resolved before the safety check is applied.
   --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
                   Same blocked-path rules as --ro-path.  May be repeated.
+                  --ro-path/--rw-path may nest: a nested path overrides the one
+                  it sits under, so `--rw-path DIR --ro-path DIR/sub` keeps DIR
+                  writable but DIR/sub read-only.
   --github-tokens Forward any GH_TOKEN_* environment variables into the
                   sandbox so the agent can authenticate the gh(1) CLI.
                   Off by default.  When set, use per-command token selection:
@@ -183,7 +201,7 @@ HELP_EOF
     # opencode option set in the same invocation.  We re-exec this script with
     # --exec so the sandbox is fully constructed; opencode --help is passed
     # as the sandbox command.
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    bwrap_show_tool_help opencode
 }
 
 resolve_opencode_paths() {
@@ -238,15 +256,35 @@ resolve_config_symlinks() {
     [[ -d "${OC_CONFIG_DIR}" ]] || return 0
 
     # The config directory itself may be (or sit under) a symlink.
-    _bwrap_canonicalize_safe "${OC_CONFIG_DIR}" "opencode config dir"
+    _bwrap_canonicalize_safe "${OC_CONFIG_DIR}" "opencode config dir" root
 
     local entry local_resolved
     for entry in "${OC_CONFIG_DIR}"/*; do
         [[ -e "${entry}" ]] || continue
+        # Authoring directories are mounted read-write by
+        # build_opencode_authoring_mounts; a read-only bind here would
+        # shadow that.
+        case "${entry##*/}" in skills | agents | commands) continue ;; esac
         _bwrap_canonicalize_safe "${entry}" "opencode config entry '${entry}'"
         local_resolved="${_BWRAP_CANON}"
         OC_CONFIG_BINDS+=("--ro-bind" "${local_resolved}" "${entry}")
     done
+}
+
+# ── OpenCode authoring directories (read-write, persistent) ──────
+# skills/, agents/ and commands/ under the OpenCode config directory hold
+# user-authored markdown definitions.  They are created on the host when
+# missing and mounted read-write so the agent can create and edit them from
+# inside the sandbox.  The Claude- and agent-compatible locations OpenCode
+# also reads are mounted read-write only if they already exist.  Must run
+# AFTER build_opencode_config_mount (which creates the config directory).
+build_opencode_authoring_mounts() {
+    build_authoring_dir_mounts skill   "${OC_CONFIG_DIR}/skills"
+    build_authoring_dir_mounts agent   "${OC_CONFIG_DIR}/agents"
+    build_authoring_dir_mounts command "${OC_CONFIG_DIR}/commands"
+    build_personal_authoring_mounts skill   "${_HOME}/.claude/skills" "${_HOME}/.agents/skills"
+    build_personal_authoring_mounts agent   "${_HOME}/.claude/agents" "${_HOME}/.agents/agents"
+    build_personal_authoring_mounts command "${_HOME}/.claude/commands"
 }
 
 # ── Managed OpenCode config and skills (read-only, highest priority) ─
@@ -306,7 +344,11 @@ build_persistent_dotdir() {
     _repo_hash="$(printf '%s' "${_GIT_ROOT}" | sha256sum)"
     _repo_hash="${_repo_hash:0:16}"
     local _persist_dir="${OC_DATA_DIR}/project-dotfiles/${_repo_hash}"
-    mkdir -p "${_persist_dir}"
+    # The host mkdir is skipped on --dry-run (no host-state changes); the
+    # bind is still emitted so the printed command matches a real run.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p "${_persist_dir}"
+    fi
 
     BWRAP_ARGS+=(
         --bind "${_persist_dir}" "${_GIT_ROOT}/.opencode"
@@ -333,7 +375,7 @@ build_opencode_config_mount() {
 # behaviour for shared accounts.  On a personal account, run with
 # --init-auth once to create the file and bootstrap persistent auth.
 #
-# Any files NOT in the persist list (e.g. mcp-auth.json, plans/)
+# Any files NOT in the persist list (e.g. mcp-auth.json)
 # will be writable inside the sandbox but discarded on exit.
 build_opencode_data_mounts() {
     BWRAP_ARGS+=(
@@ -354,12 +396,15 @@ build_opencode_data_mounts() {
 
     # auth.json: only persist if it already exists on the host.
     # Use --init-auth on first run to bootstrap persistent auth.
+    # File creation is skipped on --dry-run to keep that mode side-effect-free.
     if [[ "${INIT_AUTH}" -eq 1 ]] && [[ ! -f "${OC_AUTH_FILE}" ]]; then
-        # Use umask to ensure file is created with 0600 permissions atomically
-        ( umask 077 && printf '{}\n' > "${OC_AUTH_FILE}" )
-        echo "Created ${OC_AUTH_FILE} — auth tokens will persist after this session." >&2
+        if [[ "${DRY_RUN}" -eq 0 ]]; then
+            # Use umask to ensure file is created with 0600 permissions atomically
+            ( umask 077 && printf '{}\n' > "${OC_AUTH_FILE}" )
+            echo "Created ${OC_AUTH_FILE} — auth tokens will persist after this session." >&2
+        fi
     fi
-    if [[ -f "${OC_AUTH_FILE}" ]]; then
+    if _persist_bind_wanted "${OC_AUTH_FILE}"; then
         BWRAP_ARGS+=(--bind "${OC_AUTH_FILE}" "${OC_AUTH_FILE}")
     fi
 }
@@ -455,7 +500,7 @@ build_opencode_env() {
                 fi
             done
             if [[ "${_ok}" -eq 1 ]]; then
-                BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+                SANDBOX_ENV+=("${_key}=${!_key}")
             else
                 _dropped+=("${_key}")
             fi
@@ -466,21 +511,10 @@ build_opencode_env() {
         echo "Note: dropped OPENCODE_* env vars not on the allowlist (names only): ${_dropped[*]}" >&2
     fi
 
-    # GitHub CLI token passthrough (opt-in via --github-tokens)
-    # In --dry-run mode the value is replaced with REDACTED so that tokens
-    # are not printed to the terminal in the bwrap command output.
+    # GitHub CLI token passthrough (opt-in via --github-tokens).  In
+    # --dry-run, print_dry_run redacts the values (the names match *TOKEN*).
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
-        local _gh_val
-        while IFS= read -r _key; do
-            if [[ "${_key}" == GH_TOKEN_* ]]; then
-                if [[ "${DRY_RUN}" -eq 1 ]]; then
-                    _gh_val="REDACTED"
-                else
-                    _gh_val="${!_key}"
-                fi
-                BWRAP_ARGS+=(--setenv "${_key}" "${_gh_val}")
-            fi
-        done < <(compgen -e)
+        forward_env_by_prefix GH_TOKEN_
     fi
 }
 
@@ -491,26 +525,31 @@ build_opencode_env() {
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
-    bwrap_resolve_tool opencode
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
-        # show_help does exec, never returns
+        # show_help never returns
     fi
+
+    bwrap_resolve_tool opencode
 
     detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths
     resolve_opencode_paths
+    # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
+    require_opencode_config bwopencode "${OC_CONFIG_DIR}"
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     parse_all_git_includes
     resolve_config_symlinks
     init_sandbox_path
 
     # Build bwrap argument list
     build_base_sandbox
-    build_binary_masks
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
@@ -520,6 +559,7 @@ main() {
     build_workdir_mount
     build_persistent_dotdir
     build_opencode_config_mount
+    build_opencode_authoring_mounts
     build_opencode_data_mounts
     build_opencode_cache_mount
     build_git_mounts
@@ -534,6 +574,10 @@ main() {
     # Environment variables
     build_env_vars
     build_opencode_env
+
+    # Mask dangerous binaries as the very last step: a mask is hidden by any
+    # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
+    build_binary_masks
 
     # Launch
     if [[ "${DRY_RUN}" -eq 1 ]]; then

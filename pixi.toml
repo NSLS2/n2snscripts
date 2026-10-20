@@ -8,15 +8,15 @@ version = "0.1.0"
 
 [dependencies]
 # Runtime interpreter for azoidcapp (stdlib only; no extra packages needed).
-# Capped at <3.14 to avoid conda-forge pre-commit packaging issues with the
-# Python 3.14 free-threaded (3.14t) variant.
+# Capped at <3.14 to avoid packaging issues with the Python 3.14
+# free-threaded (3.14t) variant.
 python = ">=3.9,<3.14"
 
 [environments]
 dev = { features = ["dev"] }
 
 [feature.dev.dependencies]
-pre-commit = "*"
+prek = "*"
 # Tool versions are pinned so developer environments are deterministic
 # and stay in lockstep with the .pre-commit-config.yaml hook set
 # (both locally and in CI via the Lint workflow).
@@ -27,10 +27,7 @@ codespell = "==2.4.2"
 yamllint = "==1.38.0"
 zizmor = "==1.23.1"
 mypy = "*"
-# identify >= 2.x is required by pre-commit-shfmt v3.12+ which uses the
-# 'csh' type tag; conda-forge's pre-commit pulls an older identify.
-identify = ">=2.5"
 
 [feature.dev.tasks]
-lint = "pre-commit run --all-files"
-lint-files = "pre-commit run --files"
+lint = "prek run --all-files"
+lint-files = "prek run --files"

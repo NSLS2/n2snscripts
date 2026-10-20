@@ -16,7 +16,6 @@ option list; the tables below summarise the common surface.
 
 - `bash` >= 4.x (the wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0
-  - 0.5.0+ enables `--clearenv`
   - 0.6.3+ enables bind-over-ro-bind binary masking
 
 ## Managed system paths
@@ -46,19 +45,59 @@ read-only.
 Contribute or update skills through the deployment's documented contribution
 workflow; do not edit its deployed checkout or managed aliases directly.
 
+## Authoring directories
+
+Each wrapper mounts, read-write, the directories where its tool reads
+user-authored markdown definitions, so skills, agents, commands and prompts
+can be created and edited from inside the sandbox and persist on the host.
+The primary directories are created on the host when missing (not under
+`--dry-run`); the additional locations are mounted only when they already
+exist.
+
+| Wrapper | Primary (always created) | Additional (if present) |
+| --- | --- | --- |
+| `bwopencode` | `~/.config/opencode/{skills,agents,commands}` | `~/.claude/{skills,agents,commands}`, `~/.agents/{skills,agents}` |
+| `bwopencode2` | `~/.config/opencode2/opencode/{skills,agents,commands}` | `~/.claude/{skills,agents,commands}`, `~/.agents/{skills,agents}` |
+| `bwclaude` | `~/.claude/{skills,agents,commands}` (under `$CLAUDE_CONFIG_DIR` when that is set) | |
+| `bwcopilot` | `~/.copilot/{skills,agents}` | `~/.agents/skills` |
+| `bwcodex` | `~/.codex/{skills,prompts}` | `~/.agents/skills` |
+
+A common setup keeps skills in a separate repository and symlinks each one in
+(for example `~/.agents/skills/some-skill -> ~/src/.../skills/some-skill`).
+Each such symlink's resolved target is mounted read-write too, so the skill
+works in the sandbox and editing it edits its source repository; the rest of
+that repository is not exposed. A symlink that resolves into a blocked
+location (such as `~/.ssh`), or to a directory that contains one, is skipped
+with a warning, as is an authoring directory that does.
+
+If the authoring directory itself is a symlink (for example
+`~/.config/opencode/skills -> ~/dotfiles/skills`), its resolved target is
+mounted at the usual path, but symlinks inside it are not followed this way;
+each entry is mounted individually instead. Existing entries work, but a new
+top-level entry created in the sandbox is discarded on exit.
+
 ## Common options
 
 Every `bw*` wrapper accepts these options:
 
 | Option | Effect |
 | --- | --- |
-| `--help`, `-h` | Show wrapper help plus the underlying tool's help |
+| `--help`, `-h` | Show wrapper help, then the underlying tool's help when the tool is installed |
 | `--dry-run` | Print the `bwrap` command without executing it |
-| `--exec CMD` | Run `CMD` inside the sandbox instead of the tool |
+| `--exec CMD [ARGS...]` | Run `CMD` inside the sandbox instead of the tool. `CMD` is split on whitespace; following arguments are passed unchanged, e.g. `--exec bash -c 'env \| sort'` |
 | `--init-auth` | Persist auth credentials to the host (first-time setup; not available in `bwopencode2`) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 | `--ro-path PATH` | Read-only mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 | `--rw-path PATH` | Read-write mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
+| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+
+`--ro-path` and `--rw-path` may be nested: a path nested under another
+overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
+keeps `DIR/sub` read-only (the reverse, a read-only tree with one writable
+subdirectory, works too). A path given as both `--ro-path` and `--rw-path` is
+rejected. The masks on privileged binaries are the very last step, applied after all
+other mounts and the environment setup, so a path that covers their directory
+(for example `--ro-path /usr`) does not undo them.
 
 Tool-specific options are listed in each wrapper's section below.
 
@@ -196,10 +235,17 @@ cases.
   settings inside the sandbox. That does not expose credentials, so it is
   treated as a limitation of the sandbox, not a bug, and the include handling is
   not being extended further.
-- **`--dry-run` redacts secrets.** Every printed `--setenv NAME VALUE`
-  whose `NAME` contains (case-insensitive) `KEY`, `TOKEN`, `PASSWORD`,
-  `SECRET`, or `CREDENTIAL` is printed with the value `REDACTED`. Only the
-  printed text is redacted; the real launch passes the real values.
+- **Forwarded variables stay off the command line.** Values passed through
+  from the host (API keys, `GH_TOKEN_*`, ...) are given to `bwrap` in its
+  environment via `env -i`, not as `--setenv` arguments, so they do not
+  appear in `ps` output for the running sandbox (`/proc/<pid>/environ` is
+  readable only by you). They are visible on `env`'s own command line only
+  for the instant before it starts `bwrap`.
+- **`--dry-run` redacts secrets.** Every printed variable (on the `env -i`
+  line or as `--setenv NAME VALUE`) whose `NAME` contains (case-insensitive)
+  `KEY`, `TOKEN`, `PASSWORD`, `SECRET`, or `CREDENTIAL` is printed with the
+  value `REDACTED`. Only the printed text is redacted; the real launch passes
+  the real values.
 
 ## `bwopencode`
 
@@ -209,14 +255,17 @@ Launches [opencode](https://opencode.ai) inside a bubblewrap sandbox.
 bwopencode [bwopencode-options] [opencode arguments...]
 ```
 
-Persists database, logs, snapshots, storage, tool-output, and
+Persists database, logs, plans, snapshots, storage, tool-output, and
 project-dotfiles to the host data dir; `auth.json` is persisted only if
 it already exists on the host (use `--init-auth` once to create it for
 personal accounts).
 
-| Option | Description |
-| --- | --- |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+Requires at least a minimal OpenCode config: `/etc/opencode/opencode.json` or
+`opencode.jsonc` (deployed by ansible on managed hosts), or an `opencode.json`,
+`opencode.jsonc` or `config.json` in `~/.config/opencode`. Either is enough.
+If none exists the wrapper exits with status 2 before touching anything on the
+host (`--dry-run` and `--exec` included; `--help` is unaffected). Only the
+presence of a readable file is checked, not its content.
 
 ### `OPENCODE_*` environment allowlist
 
@@ -254,8 +303,8 @@ variables are printed to stderr. To permit another variable, add it to
 
 Launches [OpenCode 2](https://opencode.ai) (`opencode2`, npm `@opencode/cli`)
 inside a bubblewrap sandbox. It is a separate wrapper from `bwopencode`
-because OpenCode 2 uses different directories and has a background service
-that must not be reachable from the sandbox.
+because OpenCode 2 uses different directories on the host and has a background
+service that must not be reachable from the sandbox.
 
 ```text
 bwopencode2 [bwopencode2-options] [opencode2 arguments...]
@@ -264,28 +313,30 @@ bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 Requires the `opencode2` command on `PATH`, which the ansible base role
 installs.
 
-Accepts the common options above except `--init-auth`, plus `--github-tokens`
-(same behavior as `bwopencode`).
+Requires at least a minimal OpenCode config, as `bwopencode` does: the
+system-wide `/etc/opencode/opencode.json{,c}` (shared with `bwopencode`), or an
+`opencode.json`, `opencode.jsonc` or `config.json` in
+`~/.config/opencode2/opencode`. If neither exists the wrapper exits with
+status 2. The OpenCode 1 config in `~/.config/opencode` is not used.
 
-### Isolation from OpenCode 1
+Accepts the common options above except `--init-auth`.
 
-OpenCode 2 migrates the OpenCode 1 session database one way and cannot load
-OpenCode 1 plugins, so it always uses its own directories, matching the
-ansible-installed `opencode2` wrapper. Inside the sandbox the wrapper sets
-`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` to
-`~/.config/opencode2`, `~/.local/share/opencode2`, `~/.local/state/opencode2`,
-and `~/.cache/opencode2`, even if the `opencode2` on `PATH` is a plain binary.
-OpenCode 2 appends `opencode` to each, and the OpenCode 1 directories are never
-mounted.
+### Host directories and sandbox locations
 
-| Directory | Mount |
-| --- | --- |
-| `~/.config/opencode2/opencode` | read-only, symlinks resolved |
-| `~/.local/share/opencode2/opencode` | read-write, the whole directory persists |
-| `~/.cache/opencode2/opencode` | read-write (provider npm packages install here) |
-| `~/.local/state/opencode2/opencode` | not persisted (ephemeral) |
-| `<repo>/.opencode` | persistent copy under the data dir `project-dotfiles/<hash>`, so repository content cannot inject config or plugins |
-| `/etc/opencode/opencode.json{,c}`, `skills`, `agents`, `commands`, `plugins` | read-only, when present |
+On the host OpenCode 2 follows the ansible-installed `opencode2` wrapper's
+convention of separate `opencode2` directories. Inside the sandbox everything is
+mounted at the **standard** locations (the same ones `bwopencode` uses, under
+`$XDG_CONFIG_HOME` and so on), so the wrapper sets no `XDG_*` variable and git,
+pixi and ccache find their config where the shared library mounts it.
+
+| Host | Sandbox | Mount |
+| --- | --- | --- |
+| `~/.config/opencode2/opencode` | `~/.config/opencode` | read-only, symlinks resolved |
+| `~/.local/share/opencode2/opencode` | `~/.local/share/opencode` | read-write, the whole directory persists |
+| `~/.cache/opencode2/opencode` | `~/.cache/opencode` | read-write (provider npm packages install here) |
+| (none) | `~/.local/state/opencode` | not persisted (ephemeral) |
+| `<repo>/.opencode` | `<repo>/.opencode` | persistent copy under the host data dir `project-dotfiles/<hash>`, so repository content cannot inject config or plugins |
+| `/etc/opencode/opencode.json{,c}`, `skills`, `agents`, `commands`, `plugins` | same | read-only, when present |
 
 The whole data directory is bound because the OpenCode 2 layout (database with
 `-shm`/`-wal`, `log`, `repos`, `shell`, ...) is not documented. Credentials are
@@ -294,22 +345,23 @@ persists across sessions without anything like `--init-auth` (OpenCode 2's
 legacy `auth.json` is only an import source). State is not persisted, so the
 last-used model and prompt history are not remembered between sessions.
 
-Because `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` point at the opencode2 directories,
-the wrapper makes the host's `$XDG_CONFIG_HOME/git`, `pixi/config.toml`,
-`ccache` config, and `$XDG_CACHE_HOME/ccache` cache visible at the same relative
-location in the opencode2 directories so git, pixi, and ccache keep working.
-The git mirror is a symlink to the host-path mounts the shared library already
-made, not a second bind: git resolves a relative `[include] path = ../shared`
-against the directory of the config path as opened, so a bind at
-`~/.config/opencode2/git` would look for `~/.config/opencode2/shared` and
-silently skip the include, whereas through the symlink `..` resolves to the real
-parent (`~/.config`), where the include is mounted. The symlink is created only
-when at least one of the four mounted files (`allowed_signers`, `config`,
-`ignore`, `attributes`; see "Credentials and secrets handling") exists, so it
-exposes just those files, read-only: `credentials` and anything created on the
-host later are not reachable through it. If the host `~/.config/git` is itself a
-symlink the library recreates it in the sandbox and the mirror resolves through
-it. `~/.gitconfig` and other `$HOME`-relative files are unaffected.
+### Config and authoring directories
+
+A system-wide `/etc/opencode` config is mounted when present, and the user
+config in `~/.config/opencode2/opencode` is layered on it, so personal tuning
+still works on managed hosts. The `skills`, `agents` and `commands` read-write
+authoring directories (see above) live under the host config directory and are
+mounted under `~/.config/opencode`; because the host and sandbox paths differ, a
+relative symlink inside them cannot resolve and is skipped with a warning
+(absolute symlinks work).
+
+### Isolation from OpenCode 1
+
+OpenCode 2 migrates the OpenCode 1 session database one way and cannot load
+OpenCode 1 plugins, so on the host it uses its own `opencode2` config, data and
+cache directories, and the OpenCode 1 ones are never mounted, even when an
+`opencode2` directory does not exist yet (data and cache are created on first
+run).
 
 ### What is kept out of the sandbox
 
@@ -389,7 +441,22 @@ Additional options:
 | Option | Effect |
 | --- | --- |
 | `--debug` | Enable verbose debug logging: sets `ANTHROPIC_LOG=debug`, `NODE_DEBUG=http,https,tls`, and passes `--debug --verbose` to `claude` |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+
+The Claude home is `~/.claude`, or `$CLAUDE_CONFIG_DIR` when that is set on the
+host (it is then also set inside the sandbox, pointing at the same directory).
+`bwclaude` persists `logs`, `projects`, `todos`, `statsig`, `file-history`,
+`plans` (plan-mode plan files) and `sessions` there, plus `history.jsonl` and
+the state file (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`), which
+is shared with unsandboxed `claude`. Other new files under the Claude home are
+discarded on exit. The state file is not only UI state: it also holds the OAuth
+session (if any), per-project trust decisions and personal MCP server
+definitions, so a sandboxed session can change what unsandboxed `claude` trusts
+or starts. This is a known gap.
+
+`settings.json` can define hooks, `apiKeyHelper` and `env` that run outside
+the sandbox the next time `claude` is used on the host, so by default the
+sandbox only gets a throwaway copy of it. `--init-auth` bind-mounts it
+read-write (creating it if needed) along with the credentials.
 
 On shared accounts, auth is ephemeral. On a personal machine, run
 `bwclaude --init-auth` once to persist credentials.
@@ -402,12 +469,6 @@ inside a bubblewrap sandbox.
 ```text
 bwcopilot [bwcopilot-options] [copilot arguments...]
 ```
-
-Additional options:
-
-| Option | Effect |
-| --- | --- |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 On shared accounts, auth tokens are ephemeral. On a personal machine,
 run `bwcopilot --init-auth` once to persist tokens.
@@ -446,13 +507,18 @@ Two approved auth paths (configured in `~/.codex/config.toml`):
   tokens to `~/.codex/auth.json`. Run once with `--init-auth` to make
   that file persist across sandbox invocations.
 
+The wrapper keeps `~/.codex/packages` in its ephemeral Codex home. When the
+daemon starts, Codex copies its package from the system CLI, which the wrapper
+mounts read-only with its metadata and resources. An ephemeral
+`app-server-daemon/settings.json` disables automatic daemon package updates.
+The package copy is discarded when the sandbox exits.
+
 Additional options:
 
 | Option | Effect |
 | --- | --- |
 | `--debug` | Enable verbose Codex logging (sets `RUST_LOG=debug`) |
 | `--persist-config` | Bind-mount `~/.codex/config.toml` read-write into the sandbox so changes (e.g. project-trust grants) persist across sessions. Without this flag, `config.toml` is staged read-write into a per-session copy that is discarded on exit. Concurrent `--persist-config` sessions may race on writes |
-| `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 Note: Codex CLI also enforces its own inner Landlock-based sandbox for
 agent tool calls. The outer `bwrap` here is complementary — it scopes

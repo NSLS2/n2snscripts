@@ -3,32 +3,48 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 #
 # Requires the `opencode2` command (npm @opencode/cli), which the ansible base
 # role installs.  OpenCode 2 is a separate product from
-# OpenCode 1 (see bwopencode) and never shares its directories.
+# OpenCode 1 (see bwopencode) and keeps its config, data and cache apart from
+# it on the host.
+#
+# On the host the opencode2 convention separates the directories
+# (~/.config|.local/share|.cache/opencode2/opencode); inside the sandbox
+# everything is mounted at the standard locations (~/.config/opencode, ...), so
+# no XDG_* override is set.
+#
+# Requires at least a minimal OpenCode config: /etc/opencode/opencode.json{,c}
+# or a user opencode.json, opencode.jsonc or config.json in
+# ~/.config/opencode2/opencode.  Exits 2 if neither exists.
 #
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write
-#   - OpenCode 2 config (~/.config/opencode2/opencode): read-only (symlinks resolved);
-#     service.json / service-*.json (background-service settings) are not mounted
-#   - OpenCode 2 data (~/.local/share/opencode2/opencode): read-write, the
-#     whole directory persists (database incl. saved sign-in, logs, ...)
-#   - OpenCode 2 cache (~/.cache/opencode2/opencode): read-write
-#   - OpenCode 2 state (~/.local/state/opencode2/opencode): ephemeral
+#   - OpenCode 2 config (host ~/.config/opencode2/opencode, mounted at
+#     ~/.config/opencode): read-only (symlinks resolved); service.json / service-*.json
+#     (background-service settings) are not mounted
+#   - Authoring directories ({skills,agents,commands} under the host config
+#     directory, mounted under ~/.config/opencode): read-write, always created on the host, so
+#     definitions authored in the sandbox persist; skills symlinked in from
+#     elsewhere (e.g. a shared skills repository) work too
+#   - Additional skills/agents/commands locations OpenCode reads
+#     (~/.claude/{skills,agents,commands}, ~/.agents/{skills,agents}):
+#     read-write, only if they already exist
+#   - OpenCode 2 data (host ~/.local/share/opencode2/opencode, mounted at
+#     ~/.local/share/opencode): read-write, the whole directory persists
+#     (database incl. saved sign-in, logs, ...)
+#   - OpenCode 2 cache (host ~/.cache/opencode2/opencode, mounted at
+#     ~/.cache/opencode): read-write
+#   - OpenCode 2 state (~/.local/state/opencode): ephemeral
 #     (last-used model and prompt history are not remembered)
 #   - Managed config: /etc/opencode/opencode.json{,c} and
 #     /etc/opencode/{agents,commands,plugins,skills}, read-only
 #   - Project .opencode/: persistent copy kept outside the repository
-#   - XDG_{CONFIG,DATA,STATE,CACHE}_HOME point at the opencode2 directories so
-#     OpenCode 2 can never touch OpenCode 1 data (which it would migrate
-#     one way)
-#   - Git config + includes: read-only (also mirrored under the opencode2
-#     XDG config home, where git looks inside the sandbox; only the
-#     allowed_signers, config, ignore and attributes files of git/ are
-#     mounted, never credentials)
+#   - OpenCode 1's config, database and other data are never mounted
+#     (OpenCode 2 would migrate the database one way)
+#   - Git config + includes: read-only (only the allowed_signers, config,
+#     ignore and attributes files of git/ are mounted, never credentials)
 #   - OPENCODE_* env vars: only an allowlist of harmless switches is passed
 #     (see build_opencode2_env); OPENCODE_SERVER_PASSWORD etc. are dropped
 #   - Pixi cache: read-write
@@ -76,6 +92,8 @@
 #                   /etc/sudoers{,.d}.
 #   --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated to
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
+#                   A nested --ro-path/--rw-path overrides the one it sits under,
+#                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 #   --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox.
 #
 # There is no --init-auth: OpenCode 2 stores credentials in its database
@@ -167,7 +185,9 @@ Wrapper options (consumed before opencode2 sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as opencode2 itself.
                   Example: bwopencode2 --exec bash
-                           bwopencode2 --exec 'env | sort'
+                           bwopencode2 --exec bash -c 'env | sort'
+                  CMD itself is split on whitespace; pass arguments that need
+                  quoting as separate words after it, as above.
   --new-session   Force bwrap to call setsid(2), detaching the sandbox from the
                   controlling terminal.  This is the default on older kernels
                   (< 5.14); on newer kernels we omit it so that SIGWINCH (terminal
@@ -183,14 +203,19 @@ Wrapper options (consumed before opencode2 sees the command line):
                   Symlinks are resolved before the safety check is applied.
   --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
                   Same blocked-path rules as --ro-path.  May be repeated.
+                  --ro-path/--rw-path may nest: a nested path overrides the one
+                  it sits under, so `--rw-path DIR --ro-path DIR/sub` keeps DIR
+                  writable but DIR/sub read-only.
   --github-tokens Forward any GH_TOKEN_* environment variables into the
                   sandbox so the agent can authenticate the gh(1) CLI.
                   Off by default.  When set, use per-command token selection:
                     GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
                     GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
 
-OpenCode 2 data lives under ~/.config|.local/share|.local/state|.cache/opencode2
-(never the OpenCode 1 directories).  Sign-in is stored in the database in the
+On the host OpenCode 2 data lives under ~/.local/share|.cache/opencode2/opencode
+(never the OpenCode 1 directories); inside the sandbox it is mounted at the
+standard locations (~/.local/share/opencode, ...), and the config is
+~/.config/opencode2/opencode mounted at ~/.config/opencode.  Sign-in is stored in the database in the
 persistent data directory, so there is no --init-auth.
 
 Sandbox-escape guard: OpenCode 2 normally connects to a shared background
@@ -219,7 +244,7 @@ HELP_EOF
     # opencode2 option set in the same invocation.  We re-exec this script with
     # --exec so the sandbox is fully constructed; opencode2 --help is passed
     # as the sandbox command.
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    bwrap_show_tool_help opencode2
 }
 
 # ── Sandbox-escape guard (arguments) ─────────────────────────────
@@ -326,41 +351,48 @@ guard_tool_args() {
 }
 
 resolve_opencode2_paths() {
-    # Derived from the resolved $HOME, never from the (possibly overridden)
-    # XDG_* variables, so they match the ansible `opencode2` wrapper, which
-    # exports XDG_*_HOME=$HOME/.{config,local/share,local/state,cache}/opencode2.
-    # OpenCode 2 appends "opencode" to each of those.
-    OC2_XDG_CONFIG_HOME="${_HOME}/.config/opencode2"
-    OC2_XDG_DATA_HOME="${_HOME}/.local/share/opencode2"
-    OC2_XDG_STATE_HOME="${_HOME}/.local/state/opencode2"
-    OC2_XDG_CACHE_HOME="${_HOME}/.cache/opencode2"
-    OC2_CONFIG_DIR="${OC2_XDG_CONFIG_HOME}/opencode"
-    # The config directory holds service.json, which is never mounted: refuse
-    # a working directory / --ro-path / --rw-path that would bind it whole.
-    # shellcheck disable=SC2034  # read by _check_dir_contains_blocked in the library
-    EXTRA_BLOCKED_DIRS=("${OC2_CONFIG_DIR}")
-    OC2_DATA_DIR="${OC2_XDG_DATA_HOME}/opencode"
-    OC2_STATE_DIR="${OC2_XDG_STATE_HOME}/opencode"
-    OC2_CACHE_DIR="${OC2_XDG_CACHE_HOME}/opencode"
+    # Host side: the opencode2-specific directories, derived from the resolved
+    # $HOME (never from XDG_*), matching the ansible `opencode2` wrapper, which
+    # exports XDG_*_HOME=$HOME/.{config,local/share,local/state,cache}/opencode2
+    # (OpenCode 2 appends "opencode" to each).  They keep OpenCode 2 data apart
+    # from OpenCode 1 on the host.
+    OC2_CONFIG_SRC="${_HOME}/.config/opencode2/opencode"
+    OC2_DATA_SRC="${_HOME}/.local/share/opencode2/opencode"
+    OC2_CACHE_SRC="${_HOME}/.cache/opencode2/opencode"
+
+    # Sandbox side: always the standard locations, which is where OpenCode 2
+    # looks by default, so no XDG_* override is needed.  The XDG_* values are
+    # the ones the shared library resolved (the host's, or ~/.config etc.), the
+    # same way bwopencode does.  State is ephemeral at the default location.
+    OC2_CONFIG_DIR="${XDG_CONFIG_HOME}/opencode"
+    OC2_DATA_DIR="${XDG_DATA_HOME}/opencode"
+    OC2_CACHE_DIR="${XDG_CACHE_HOME}/opencode"
+    OC2_STATE_DIR="${_HOME}/.local/state/opencode"
+
+    # The opencode2 config directory holds service.json, which is never
+    # mounted: refuse a working directory / --ro-path / --rw-path that would
+    # bind it whole.
+    # shellcheck disable=SC2034  # read by _bwrap_contains_blocked in the library
+    EXTRA_BLOCKED_DIRS=("${OC2_CONFIG_SRC}")
 
     # The fixed paths cannot reach a blocked path unless $HOME itself does;
     # the checks mirror bwopencode and also catch symlinked directories.
-    _check_dir_safe "${OC2_DATA_DIR}"  "opencode2 data dir"
-    _check_dir_safe "${OC2_CACHE_DIR}" "opencode2 cache dir"
+    _check_dir_safe "${OC2_DATA_SRC}"  "opencode2 data dir"
+    _check_dir_safe "${OC2_CACHE_SRC}" "opencode2 cache dir"
 }
 
 # Ensure writable directories exist on host.  The data dir is bound whole
 # because the OpenCode 2 layout is not documented (database + -shm/-wal, log,
 # repos, shell, ...), so no file list could be kept in sync.
 ensure_host_dirs() {
-    mkdir -p "${OC2_DATA_DIR}" "${OC2_CACHE_DIR}"
+    mkdir -p "${OC2_DATA_SRC}" "${OC2_CACHE_SRC}"
 }
 
 # Resolve opencode2 config symlinks.
-# We resolve each entry in ~/.config/opencode2/opencode/ so that symlinks
-# pointing outside (e.g. into a dotfiles repo) are followed, and we
-# bind the real file at the expected path.  This avoids exposing the
-# dotfiles tree inside the sandbox.
+# We resolve each entry in the host config directory (OC2_CONFIG_SRC,
+# ~/.config/opencode2/opencode/) so that symlinks pointing outside (e.g. into
+# a dotfiles repo) are followed, and we bind the real file at the expected path
+# under OC2_CONFIG_DIR, the standard location inside the sandbox.  This avoids exposing the dotfiles tree inside the sandbox.
 #
 # Every path is canonicalized with realpath (readlink -f) and the canonical
 # result is passed through _check_path_safe before being added to
@@ -371,13 +403,13 @@ ensure_host_dirs() {
 # the unresolved name alone would hide the real target.
 resolve_config_symlinks() {
     OC2_CONFIG_BINDS=()
-    [[ -d "${OC2_CONFIG_DIR}" ]] || return 0
+    [[ -d "${OC2_CONFIG_SRC}" ]] || return 0
 
     # The config directory itself may be (or sit under) a symlink.
-    _bwrap_canonicalize_safe "${OC2_CONFIG_DIR}" "opencode2 config dir"
+    _bwrap_canonicalize_safe "${OC2_CONFIG_SRC}" "opencode2 config dir" root
 
     local entry local_resolved
-    for entry in "${OC2_CONFIG_DIR}"/*; do
+    for entry in "${OC2_CONFIG_SRC}"/*; do
         [[ -e "${entry}" ]] || continue
         # service.json (or service-<hash>.json on other channels) holds the
         # background-service settings, including `service set env KEY VALUE`
@@ -385,11 +417,33 @@ resolve_config_symlinks() {
         # file is not mounted.
         case "${entry##*/}" in
             service*.json) continue ;;
+            # Authoring directories are mounted read-write by
+            # build_opencode2_authoring_mounts; a read-only bind here would
+            # shadow that.
+            skills | agents | commands) continue ;;
         esac
         _bwrap_canonicalize_safe "${entry}" "opencode2 config entry '${entry}'"
         local_resolved="${_BWRAP_CANON}"
-        OC2_CONFIG_BINDS+=("--ro-bind" "${local_resolved}" "${entry}")
+        OC2_CONFIG_BINDS+=("--ro-bind" "${local_resolved}" "${OC2_CONFIG_DIR}/${entry##*/}")
     done
+}
+
+# ── OpenCode 2 authoring directories (read-write, persistent) ────
+# skills/, agents/ and commands/ under the OpenCode 2 config directory hold
+# user-authored markdown definitions.  They are created on the host when
+# missing and mounted read-write so the agent can create and edit them from
+# inside the sandbox.  They live under the host config directory
+# (OC2_CONFIG_SRC) and are mounted at the standard location (OC2_CONFIG_DIR).
+# The Claude- and agent-compatible locations OpenCode
+# also reads are mounted read-write only if they already exist.  Must run
+# AFTER build_opencode2_config_mount (which creates the config directory).
+build_opencode2_authoring_mounts() {
+    build_authoring_dir_mounts_from skill   "${OC2_CONFIG_SRC}/skills"   "${OC2_CONFIG_DIR}/skills"
+    build_authoring_dir_mounts_from agent   "${OC2_CONFIG_SRC}/agents"   "${OC2_CONFIG_DIR}/agents"
+    build_authoring_dir_mounts_from command "${OC2_CONFIG_SRC}/commands" "${OC2_CONFIG_DIR}/commands"
+    build_personal_authoring_mounts skill   "${_HOME}/.claude/skills" "${_HOME}/.agents/skills"
+    build_personal_authoring_mounts agent   "${_HOME}/.claude/agents" "${_HOME}/.agents/agents"
+    build_personal_authoring_mounts command "${_HOME}/.claude/commands"
 }
 
 # ── Managed OpenCode config (read-only, highest priority) ────────
@@ -422,7 +476,7 @@ build_managed_config() {
         fi
     else
         printf 'bwopencode2: warning: no /etc/opencode/opencode.json{,c} found on host.\n' >&2
-        printf '             Falling back to user config at ~/.config/opencode2/opencode/.\n' >&2
+        printf '             Falling back to user config at %s/.\n' "${OC2_CONFIG_SRC}" >&2
     fi
 }
 
@@ -453,7 +507,7 @@ build_managed_extras() {
 # repository-supplied .opencode/ content cannot inject config or plugins.
 #
 # The persistent directory is keyed by a hash of the bind dir path,
-# stored under ~/.local/share/opencode2/opencode/project-dotfiles/<hash>/.
+# stored on the host under ~/.local/share/opencode2/opencode/project-dotfiles/<hash>/.
 # Inside the sandbox, this is bind-mounted on top of <repo>/.opencode/.
 build_persistent_dotdir() {
     [[ -n "${_GIT_ROOT}" ]] || return 0
@@ -461,8 +515,12 @@ build_persistent_dotdir() {
     local _repo_hash
     _repo_hash="$(printf '%s' "${_GIT_ROOT}" | sha256sum)"
     _repo_hash="${_repo_hash:0:16}"
-    local _persist_dir="${OC2_DATA_DIR}/project-dotfiles/${_repo_hash}"
-    mkdir -p "${_persist_dir}"
+    local _persist_dir="${OC2_DATA_SRC}/project-dotfiles/${_repo_hash}"
+    # The host mkdir is skipped on --dry-run (no host-state changes); the
+    # bind is still emitted so the printed command matches a real run.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p "${_persist_dir}"
+    fi
 
     BWRAP_ARGS+=(
         --bind "${_persist_dir}" "${_GIT_ROOT}/.opencode"
@@ -486,7 +544,7 @@ build_opencode2_config_mount() {
 # undocumented.
 build_opencode2_data_mount() {
     BWRAP_ARGS+=(
-        --bind "${OC2_DATA_DIR}" "${OC2_DATA_DIR}"
+        --bind "${OC2_DATA_SRC}" "${OC2_DATA_DIR}"
     )
 }
 
@@ -494,7 +552,7 @@ build_opencode2_data_mount() {
 # Provider npm packages are installed here, so it must be writable.
 build_opencode2_cache_mount() {
     BWRAP_ARGS+=(
-        --bind "${OC2_CACHE_DIR}" "${OC2_CACHE_DIR}"
+        --bind "${OC2_CACHE_SRC}" "${OC2_CACHE_DIR}"
     )
 }
 
@@ -506,57 +564,6 @@ build_opencode2_state_dir() {
     BWRAP_ARGS+=(
         --dir "${OC2_STATE_DIR}"
     )
-}
-
-# ── XDG mirror for tools that read $XDG_CONFIG_HOME / $XDG_CACHE_HOME ─
-# Inside the sandbox XDG_CONFIG_HOME and XDG_CACHE_HOME point at the
-# opencode2 directories, so git, pixi and ccache would no longer find
-# their configuration at the host locations the shared library mounts.
-# Make whatever the host has under its XDG config/cache home visible at the
-# same relative location under the opencode2 homes.
-#
-# These are SYMLINKS to the host-path mounts the shared library already made
-# (build_git_mounts / build_pixi_mounts / build_ccache_mounts), not second
-# binds.  Why: git resolves a relative include (`path = ../shared`) against
-# the directory of the config path AS OPENED.  A bind of the git dir at
-# ~/.config/opencode2/git would make `../shared` resolve to
-# ~/.config/opencode2/shared (which does not exist) and git would silently
-# skip it.  Through a symlinked directory the kernel resolves `..` against
-# the real parent, so ~/.config/opencode2/git/../shared is the same file as
-# ~/.config/shared, where the library mounted the include.  The library
-# mounts only allowed_signers, config, ignore and attributes of the host git
-# directory (read-only, never the directory itself, so "credentials" and any
-# file created on the host later stay invisible); the symlink exposes just
-# those.  If the host git directory is itself a symlink the library recreates
-# it, so the mirror still resolves through it.  Each symlink is created only
-# when the library really mounted its target (otherwise it would dangle).
-# Must run AFTER build_home_tmpfs and the library mount builders (reads
-# _BWRAP_XDG_GIT_HAS_FILES).
-# ~/.gitconfig and other $HOME-relative files are unaffected.
-build_xdg_mirror_mounts() {
-    local _mirror_cfg="${OC2_XDG_CONFIG_HOME}"
-
-    # Skip the mirror when the host XDG dirs already ARE the opencode2 ones.
-    if [[ "${XDG_CONFIG_HOME}" != "${_mirror_cfg}" ]]; then
-        if [[ "${_BWRAP_XDG_GIT_HAS_FILES}" -eq 1 ]]; then
-            BWRAP_ARGS+=(--symlink "${XDG_CONFIG_HOME}/git" "${_mirror_cfg}/git")
-        fi
-        # build_pixi_mounts binds exactly this file at its host path.
-        if [[ -f "${XDG_CONFIG_HOME}/pixi/config.toml" ]]; then
-            BWRAP_ARGS+=(--dir "${_mirror_cfg}/pixi"
-                --symlink "${XDG_CONFIG_HOME}/pixi/config.toml" "${_mirror_cfg}/pixi/config.toml")
-        fi
-        # ccache config is only XDG-relative when the legacy ~/.ccache is absent.
-        # build_ccache_mounts binds it at its host path when it is a directory.
-        if [[ "${CCACHE_CONFIG_DIR}" == "${XDG_CONFIG_HOME}/ccache" && -d "${CCACHE_CONFIG_DIR}" ]]; then
-            BWRAP_ARGS+=(--symlink "${CCACHE_CONFIG_DIR}" "${_mirror_cfg}/ccache")
-        fi
-    fi
-    if [[ "${XDG_CACHE_HOME}" != "${OC2_XDG_CACHE_HOME}" ]]; then
-        if [[ "${CCACHE_CACHE_DIR}" == "${XDG_CACHE_HOME}/ccache" && -d "${CCACHE_CACHE_DIR}" ]]; then
-            BWRAP_ARGS+=(--symlink "${CCACHE_CACHE_DIR}" "${OC2_XDG_CACHE_HOME}/ccache")
-        fi
-    fi
 }
 
 # ── OpenCode env vars ────────────────────────────────────────────
@@ -592,10 +599,8 @@ build_opencode2_install_mount() {
     fi
 }
 
-# Must run AFTER build_env_vars: the XDG_* values set here override the
-# host pass-through from build_env_vars (bwrap --setenv: last one wins),
-# so OpenCode 2 uses its own directories even if `opencode2` on PATH is a
-# plain binary rather than the ansible wrapper.
+# Must run AFTER build_env_vars.  No XDG_* override is set: OpenCode 2 finds
+# its directories at the standard locations they are mounted at.
 build_opencode2_env() {
     # Allowlist of OPENCODE_* variables that may enter the sandbox.
     # Do NOT add anything that carries a secret, a port, a file path or a URL.
@@ -615,7 +620,7 @@ build_opencode2_env() {
     # AIFAPIM gateway config
     pass_through_if_set AIFAPIM_HOST
     # The API key is passed through unchanged; print_dry_run redacts the value
-    # of any --setenv whose name looks secret (KEY/TOKEN/PASSWORD/...).
+    # of any variable whose name looks secret (KEY/TOKEN/PASSWORD/...).
     pass_through_if_set AIFAPIM_API_KEY
 
     local _key _allowed _name
@@ -630,7 +635,7 @@ build_opencode2_env() {
             fi
         done
         if [[ "${_allowed}" -eq 1 ]]; then
-            BWRAP_ARGS+=(--setenv "${_key}" "${!_key}")
+            SANDBOX_ENV+=("${_key}=${!_key}")
         else
             _dropped+=("${_key}")
         fi
@@ -641,31 +646,11 @@ build_opencode2_env() {
         printf 'bwopencode2: dry-run: dropped host OPENCODE_* variables (not in allowlist): %s\n' "${_dropped[*]}" >&2
     fi
 
-    # GitHub CLI token passthrough (opt-in via --github-tokens)
-    # In --dry-run mode the value is replaced with REDACTED so that tokens
-    # are not printed to the terminal in the bwrap command output.
+    # GitHub CLI token passthrough (opt-in via --github-tokens).  In
+    # --dry-run, print_dry_run redacts the values (the names match *TOKEN*).
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
-        local _gh_val
-        while IFS= read -r _key; do
-            if [[ "${_key}" == GH_TOKEN_* ]]; then
-                if [[ "${DRY_RUN}" -eq 1 ]]; then
-                    _gh_val="REDACTED"
-                else
-                    _gh_val="${!_key}"
-                fi
-                BWRAP_ARGS+=(--setenv "${_key}" "${_gh_val}")
-            fi
-        done < <(compgen -e)
+        forward_env_by_prefix GH_TOKEN_
     fi
-
-    # Separate XDG homes for OpenCode 2 (see build_xdg_mirror_mounts for the
-    # git/pixi/ccache side effect).
-    BWRAP_ARGS+=(
-        --setenv XDG_CONFIG_HOME "${OC2_XDG_CONFIG_HOME}"
-        --setenv XDG_DATA_HOME "${OC2_XDG_DATA_HOME}"
-        --setenv XDG_STATE_HOME "${OC2_XDG_STATE_HOME}"
-        --setenv XDG_CACHE_HOME "${OC2_XDG_CACHE_HOME}"
-    )
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -675,12 +660,13 @@ build_opencode2_env() {
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
-    bwrap_resolve_tool opencode2 "OpenCode 2 is installed by the ansible base role."
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
-        # show_help does exec, never returns
+        # show_help never returns
     fi
+
+    bwrap_resolve_tool opencode2 "OpenCode 2 is installed by the ansible base role."
 
     # --exec runs an arbitrary command, so its arguments are not opencode2's.
     if [[ -z "${TEST_CMD}" ]]; then
@@ -691,15 +677,19 @@ main() {
     detect_kernel_capabilities
     resolve_common_paths
     resolve_opencode2_paths
+    # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
+    require_opencode_config bwopencode2 "${OC2_CONFIG_SRC}"
     detect_shell
-    ensure_host_dirs
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+    fi
     parse_all_git_includes
     resolve_config_symlinks
     init_sandbox_path
 
     # Build bwrap argument list
     build_base_sandbox
-    build_binary_masks
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
@@ -710,6 +700,7 @@ main() {
     build_workdir_mount
     build_persistent_dotdir
     build_opencode2_config_mount
+    build_opencode2_authoring_mounts
     build_opencode2_data_mount
     build_opencode2_cache_mount
     build_opencode2_state_dir
@@ -717,7 +708,6 @@ main() {
     build_pixi_mounts
     build_ccache_mounts
     build_npm_mounts
-    build_xdg_mirror_mounts
     build_user_bin_mount
     build_nsls2_mount
     build_opencode2_install_mount
@@ -727,6 +717,10 @@ main() {
     # Environment variables
     build_env_vars
     build_opencode2_env
+
+    # Mask dangerous binaries as the very last step: a mask is hidden by any
+    # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
+    build_binary_masks
 
     # Launch
     if [[ "${DRY_RUN}" -eq 1 ]]; then

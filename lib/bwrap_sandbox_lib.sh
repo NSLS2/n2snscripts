@@ -29,7 +29,6 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   - 0.4.0: base functionality
-#   - 0.5.0+: --clearenv (fallback: manual --unsetenv for each host var)
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 
 # Guard against double-sourcing.
@@ -78,9 +77,13 @@ _NPM_PREFIX_RESOLVED=0
 # Sandbox environment
 SANDBOX_PATH=""
 SANDBOX_SHELL=""
+# NAME=VALUE entries for variables forwarded from the host (pass_through_if_set,
+# forward_env_by_prefix) and other values that may be secret.  They are given
+# to bwrap through `env -i` (see launch_sandbox) rather than as --setenv
+# arguments, so they never appear on bwrap's command line.
+SANDBOX_ENV=()
 
 # bwrap capability flags (set by detect_bwrap_capabilities)
-HAS_CLEARENV=0
 HAS_BIND_OVER_RO=0
 
 # Kernel capability flags (set by detect_kernel_capabilities)
@@ -143,14 +146,20 @@ declare -A _GIT_LINK_STATUS=()
 # sandbox as a plain directory (see _bwrap_git_recreate_link).
 declare -A _GIT_LINK_CONFLICT=()
 
-# Set to 1 by build_git_mounts when at least one file of
-# ${XDG_CONFIG_HOME}/git was mounted (launchers may point symlinks at the
-# directory; it is only guaranteed to resolve in the sandbox in that case).
-_BWRAP_XDG_GIT_HAS_FILES=0
-
 # Working directory state (set by build_workdir_mount)
 _BIND_DIR=""
 _GIT_ROOT=""
+
+# Common paths (set by resolve_common_paths).  _HOME is the logical $HOME;
+# _HOME_CANON is its readlink -f form.  They differ when home is reached
+# through a symlink (NFS/automount), and the $HOME-or-ancestor check must
+# consult both because candidate paths are canonicalized before it runs.
+# _PWD is the physical (pwd -P) working directory.  _USER is $USER, which can
+# be unset under `set -u` (cron/CI), with a fallback to bwrap_account_name.
+_HOME=""
+_HOME_CANON=""
+_PWD=""
+_USER=""
 
 # ═══════════════════════════════════════════════════════════════════
 # Shared helper functions
@@ -172,17 +181,11 @@ _version_ge() {
 # grepping --help.
 #
 # Version history:
-#   0.5.0 - added --clearenv
 #   0.6.3 - bind over ro-bind works (can mask binaries inside /usr)
 detect_bwrap_capabilities() {
     local _bwrap_ver
     _bwrap_ver="$(bwrap --version)"
     _bwrap_ver="${_bwrap_ver##* }"            # "bubblewrap 0.11.0" -> "0.11.0"
-
-    # --clearenv: Start with an empty environment (added in 0.5.0)
-    # Fallback: manually unset all host env vars with --unsetenv
-    HAS_CLEARENV=0
-    if _version_ge "${_bwrap_ver}" "0.5.0"; then HAS_CLEARENV=1; fi
 
     # Bind over ro-bind: ability to bind-mount on top of a read-only bind
     # mount (e.g., masking /usr/bin/ssh after --ro-bind /usr /usr).
@@ -509,6 +512,22 @@ _bwrap_symlink_is_restricted() {
     done
 }
 
+# bwrap_show_tool_help NAME
+#   Finish a launcher's --help after its own text has been printed.  When the
+#   tool NAME is usable, re-exec the launcher as `--exec "NAME --help"` so the
+#   tool's own help comes from inside the fully built sandbox.  Otherwise say
+#   so and exit 0: the wrapper help must not depend on the tool being
+#   installed.  Never returns.
+bwrap_show_tool_help() {
+    local _name="$1" _bin
+    _bin="$(bwrap_find_tool "${_name}" 2> /dev/null || true)"
+    if [[ -n "${_bin}" && -x "${_bin}" ]]; then
+        exec "$0" --exec "${_bin} --help"
+    fi
+    echo "('${_name}' is not available here, so its own --help is not shown.)"
+    exit 0
+}
+
 # bwrap_resolve_tool NAME [NOT_FOUND_HINT]
 #   Resolve the agent binary NAME for a launcher, setting _TOOL_BIN and
 #   _TOOL_CMD (TEST_CMD, split into words, overrides the command).  When NAME
@@ -568,23 +587,76 @@ bwrap_resolve_tool() {
     exit 1
 }
 
+# _persist_bind_wanted PATH
+#   True if PATH exists, or under --dry-run --init-auth: there a real run
+#   would have created the stub file and bound it, so the bind is emitted for
+#   an accurate dry-run even though the stub was not created.
+_persist_bind_wanted() {
+    [[ -e "$1" ]] || { [[ "${INIT_AUTH:-0}" -eq 1 ]] && [[ "${DRY_RUN}" -eq 1 ]]; }
+}
+
+# _expand_leading_tilde VALUE
+#   Print VALUE with only a LEADING tilde expanded:
+#     "~" / "~/path"        -> $HOME / $HOME/path
+#     "~user" / "~user/p"   -> that user's home (getent passwd) [+ /p]
+#     anything else         -> VALUE unchanged
+#   Returns 1 (printing nothing) when a ~user reference cannot be resolved.
+#   A blind ${VALUE/#\~/${_HOME}} substitution turns "~alice/foo" into
+#   "${HOME}alice/foo", silently corrupting the path.
+_expand_leading_tilde() {
+    local value="$1" _rest _user _subpath="" _uhome
+    # The patterns match a literal leading tilde (SC2088 false positive).
+    # shellcheck disable=SC2088
+    case "${value}" in
+        "~")
+            printf '%s' "${_HOME}"
+            ;;
+        "~/"*)
+            printf '%s' "${_HOME}/${value#\~/}"
+            ;;
+        "~"*)
+            _rest="${value#\~}"
+            _user="${_rest%%/*}"
+            [[ "${_rest}" == */* ]] && _subpath="/${_rest#*/}"
+            _uhome="$(getent passwd "${_user}" 2> /dev/null | cut -d: -f6)"
+            [[ -n "${_uhome}" ]] || return 1
+            printf '%s' "${_uhome}${_subpath}"
+            ;;
+        *)
+            printf '%s' "${value}"
+            ;;
+    esac
+}
+
 # ── Dynamic mount helpers ────────────────────────────────────────
 # _MOUNTED_PREFIXES: tracks directory trees already covered by a bwrap
 # bind so we never emit duplicate (or redundant sub-path) mounts.
 # Keys are canonical paths; value is always 1.
 # Pre-populated with unconditional mounts in build_dynamic_tool_mounts.
 
-# _get_npm_prefix
-#   Echo the npm global prefix (`npm prefix -g`), caching the result so the
-#   subprocess is forked at most once per run even when several symlinked
-#   tools are resolved.  Echoes the empty string if npm is not installed or
-#   the lookup fails.
-_get_npm_prefix() {
-    if [[ "${_NPM_PREFIX_RESOLVED}" -eq 0 ]]; then
+# _resolve_npm_prefix
+#   Set _NPM_PREFIX to the npm global prefix (`npm prefix -g`), forking npm
+#   at most once per run; empty if npm is absent or the lookup fails.
+#   Must NOT be called inside $(...): the cache globals would be set in the
+#   subshell and lost, so npm would run again on every lookup.  Callers invoke
+#   it directly and then read ${_NPM_PREFIX}.
+#   `npm prefix -g` writes a log under $npm_config_cache/_logs (default
+#   ~/.npm/_logs); the cache is pointed at a throwaway directory so no run,
+#   including --dry-run, leaves that behind on the host.
+_resolve_npm_prefix() {
+    [[ "${_NPM_PREFIX_RESOLVED}" -eq 1 ]] && return 0
+    _NPM_PREFIX_RESOLVED=1
+    _NPM_PREFIX=""
+    command -v npm > /dev/null 2>&1 || return 0
+
+    local _npm_tmp
+    _npm_tmp="$(mktemp -d 2> /dev/null || true)"
+    if [[ -n "${_npm_tmp}" ]]; then
+        _NPM_PREFIX="$(npm_config_cache="${_npm_tmp}" npm prefix -g 2> /dev/null || true)"
+        rm -rf -- "${_npm_tmp}"
+    else
         _NPM_PREFIX="$(npm prefix -g 2> /dev/null || true)"
-        _NPM_PREFIX_RESOLVED=1
     fi
-    printf '%s' "${_NPM_PREFIX}"
 }
 
 # _emit_home_intermediate_dirs DIR [MODE]
@@ -602,9 +674,18 @@ _get_npm_prefix() {
 #                  file bind, or a read-write directory bind point).
 _emit_home_intermediate_dirs() {
     local dir="$1" mode="${2:-ancestors}"
-    [[ "${dir}" == "${_HOME}"/* ]] || return 0
-    local _rel="${dir#"${_HOME}"/}"
-    local _accum="${_HOME}"
+    # A canonicalized bind target can sit under _HOME_CANON rather than the
+    # logical _HOME when home is symlinked; match against both.
+    local _home_base
+    if [[ "${dir}" == "${_HOME}"/* ]]; then
+        _home_base="${_HOME}"
+    elif [[ -n "${_HOME_CANON}" && "${dir}" == "${_HOME_CANON}"/* ]]; then
+        _home_base="${_HOME_CANON}"
+    else
+        return 0
+    fi
+    local _rel="${dir#"${_home_base}"/}"
+    local _accum="${_home_base}"
     local _parts _i _last
     IFS='/' read -ra _parts <<< "${_rel}"
     if [[ "${mode}" == "inclusive" ]]; then
@@ -624,9 +705,10 @@ _emit_home_intermediate_dirs() {
 #   actually emitted, DIR is added to _MOUNTED_PREFIXES so future calls
 #   with the same path or a sub-path are no-ops.
 #   Handles intermediate --dir entries for paths under $HOME.
-#   Calls _check_path_safe before emitting any mount — aborts if DIR
+#   Calls _check_bind_safe before emitting any mount — aborts if DIR
 #   resolves into a blocked path (e.g. a tool binary that symlinks into
-#   ~/.ssh or a misconfigured npm prefix pointing at $HOME).
+#   ~/.ssh or a misconfigured npm prefix pointing at $HOME) or contains one
+#   (e.g. an on-PATH ~/.config holding ~/.config/gh).
 _mount_ro_dir_if_needed() {
     local dir="$1"
     [[ -d "${dir}" ]] || return 0
@@ -644,10 +726,14 @@ _mount_ro_dir_if_needed() {
         [[ -z "${check}" ]] && check="/"
     done
 
-    # Safety check before emitting the mount.  DIR is already a real
-    # directory path (callers pass dirname() of a resolved binary or a
-    # known path), so no additional readlink -f is needed.
-    _check_path_safe "${dir}" "dynamic mount"
+    # Safety check before emitting the mount, judged on the canonical target:
+    # DIR can be a symlinked on-PATH directory (e.g. ~/bin2 -> ~/.ssh) and
+    # bwrap follows the symlink when binding.  DIR itself is still the mount
+    # point, so the tool stays reachable at the path it is invoked by.
+    local _dir_canon
+    _dir_canon="$(readlink -f -- "${dir}" 2> /dev/null || true)"
+    [[ -n "${_dir_canon}" ]] || _dir_canon="${dir}"
+    _check_bind_safe "${_dir_canon}" "dynamic mount"
 
     # Create intermediate --dir entries for paths under $HOME (the
     # tmpfs $HOME has no subdirectories yet).  DIR is the bind mount point,
@@ -680,9 +766,14 @@ resolve_and_mount_tool() {
 
     if [[ -L "${bin_path}" ]]; then
         real_path="$(readlink -f "${bin_path}")"
-        npm_prefix="$(_get_npm_prefix)"
+        _resolve_npm_prefix
+        npm_prefix="${_NPM_PREFIX}"
         if [[ -n "${npm_prefix}" ]] && [[ "${real_path}" == "${npm_prefix}"/* ]]; then
-            # npm-installed: mount the whole prefix so lib/node_modules is reachable.
+            # npm-installed: mount the whole prefix so lib/node_modules is
+            # reachable.  Also mount the on-PATH directory holding the symlink
+            # (e.g. ~/.local/bin/claude -> npm prefix): otherwise the path the
+            # tool is invoked by does not exist inside the sandbox.
+            _mount_ro_dir_if_needed "${cmd_dir}"
             _mount_npm_global_prefix "${npm_prefix}"
             return 0
         fi
@@ -705,7 +796,8 @@ resolve_and_mount_tool() {
 _mount_npm_global_prefix() {
     local npm_prefix="${1:-}"
     if [[ -z "${npm_prefix}" ]]; then
-        npm_prefix="$(_get_npm_prefix)"
+        _resolve_npm_prefix
+        npm_prefix="${_NPM_PREFIX}"
     fi
     [[ -n "${npm_prefix}" ]] && [[ -d "${npm_prefix}" ]] || return 0
 
@@ -713,7 +805,7 @@ _mount_npm_global_prefix() {
     # are resolved (npm itself may return a non-canonical path on some systems).
     local npm_prefix_canon
     npm_prefix_canon="$(readlink -f "${npm_prefix}" 2> /dev/null || echo "${npm_prefix}")"
-    _check_path_safe "${npm_prefix_canon}" "npm global prefix"
+    _check_bind_safe "${npm_prefix_canon}" "npm global prefix"
 
     _mount_ro_dir_if_needed "${npm_prefix_canon}"
     _EXTRA_PATH_DIRS+=("${npm_prefix_canon}/bin")
@@ -791,7 +883,26 @@ parse_git_includes() {
     # Extract path values from [include] and [includeIf "..."] sections.
     # Matches lines like:  path = /some/path  or  path = ~/relative
     # Pure bash — no grep/sed/xargs subprocesses.
+    #
+    # `path` is only an include directive inside an include section: git's
+    # parser is section-scoped, and a `path =` key elsewhere (for example
+    # [difftool "x"] path = ...) must not be mounted, nor abort the launcher
+    # when it points into a blocked location.  Section names are
+    # case-insensitive; a key may follow the header on the same line.
+    local _section_re='^[[:space:]]*\[[[:space:]]*([A-Za-z0-9.-]+)([[:space:]]+"([^"\\]|\\.)*")?[[:space:]]*\](.*)$'
+    local _section_name in_include=0
     while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ${_section_re} ]]; then
+            _section_name="${BASH_REMATCH[1],,}"
+            line="${BASH_REMATCH[4]}"
+            if [[ "${_section_name}" == "include" || "${_section_name}" == "includeif" ]]; then
+                in_include=1
+            else
+                in_include=0
+            fi
+        fi
+        [[ "${in_include}" -eq 1 ]] || continue
+
         # git variable names are case-insensitive.  The value is decoded the
         # way git does (quotes, escapes, trailing comments) before anything is
         # derived from it; an undecodable value is skipped.
@@ -800,8 +911,9 @@ parse_git_includes() {
         local path_val="${_BWRAP_GIT_VALUE}"
         [[ -z "${path_val}" ]] && continue
 
-        # Resolve ~/ prefix
-        path_val="${path_val/#\~/${_HOME}}"
+        # Expand a leading ~ or ~user (git does both); skip the include when
+        # ~user cannot be resolved rather than corrupting the path.
+        path_val="$(_expand_leading_tilde "${path_val}")" || continue
 
         # Resolve relative paths (relative to the config file's directory)
         if [[ "${path_val}" != /* ]]; then
@@ -856,12 +968,34 @@ parse_all_git_includes() {
 
 # ── Env var passthrough helper ───────────────────────────────────
 
+# pass_through_if_set NAME
+#   Forward the host variable NAME into the sandbox when it is non-empty.  The
+#   value goes into SANDBOX_ENV (bwrap's environment), not onto bwrap's command
+#   line.  A later `--setenv NAME` in BWRAP_ARGS still overrides it.
 pass_through_if_set() {
     local var_name="$1"
     local var_val="${!var_name:-}"
     if [[ -n "${var_val}" ]]; then
-        BWRAP_ARGS+=(--setenv "${var_name}" "${var_val}")
+        SANDBOX_ENV+=("${var_name}=${var_val}")
     fi
+}
+
+# forward_env_by_prefix PREFIX
+#   Forward every exported environment variable whose name starts with PREFIX
+#   (as NAME=VALUE entries in SANDBOX_ENV, like pass_through_if_set).  Uses
+#   `while IFS= read -r` over `compgen -e`, so names are never word-split.
+#   Values are passed as-is; print_dry_run redacts names that match
+#   _is_secret_env_name.
+#
+#   Example:
+#     forward_env_by_prefix GH_TOKEN_    # GH_TOKEN_NSLS2, GH_TOKEN_PERSONAL, ...
+forward_env_by_prefix() {
+    local _prefix="$1" _key
+    while IFS= read -r _key; do
+        if [[ "${_key}" == "${_prefix}"* ]]; then
+            SANDBOX_ENV+=("${_key}=${!_key}")
+        fi
+    done < <(compgen -e)
 }
 
 # ── Path safety validation ───────────────────────────────────────
@@ -953,8 +1087,11 @@ _bwrap_path_blocked() {
 
     # Reject if canon IS $HOME or is a directory that contains $HOME
     # (i.e. /, /home, the username's parent dir, etc.).
-    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.
-    if _is_prefix_of "${canon}" "${_HOME}"; then
+    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.  The
+    # canonical home is checked too: with a symlinked home (/home/u ->
+    # /nfs/home/u) a canonical candidate /nfs/home/u is not a prefix of _HOME.
+    if _is_prefix_of "${canon}" "${_HOME}" ||
+        { [[ -n "${_HOME_CANON}" ]] && _is_prefix_of "${canon}" "${_HOME_CANON}"; }; then
         _BWRAP_BLOCKED_KIND="home"
         return 0
     fi
@@ -974,6 +1111,10 @@ _bwrap_path_blocked() {
 # _check_path_safe CANON CONTEXT
 #   Assert that the already-resolved canonical path CANON is safe to mount
 #   into the sandbox.  Exits 1 with a descriptive error if it is not.
+#
+#   This only asks whether CANON is itself blocked.  Callers that bind a path
+#   into the sandbox should use _check_bind_safe, which also refuses a
+#   directory that CONTAINS a blocked location.
 #
 #   CANON   : absolute, symlink-free path (output of readlink -f).
 #   CONTEXT : short label used in error messages, e.g. "--ro-path",
@@ -1052,28 +1193,57 @@ _check_path_safe() {
 # deliberately never mounted.  Existing paths only.
 EXTRA_BLOCKED_DIRS=()
 
-# _check_dir_contains_blocked CANON CONTEXT
-#   Companion of _check_path_safe for a directory that is bound WHOLE (working
-#   directory or git root, --ro-path, --rw-path): exit 1 when the canonical
-#   directory CANON is, or is an ancestor of, a blocked location that exists
-#   on disk (anything in the blocked list, a symlink's target included, or an
-#   EXTRA_BLOCKED_DIRS entry).  Binding such a directory would expose the
-#   blocked location through the parent mount (e.g. running from ~/.config
-#   would bind ~/.config/gh read-write).  Blocked locations that do not exist
-#   are ignored.  Call AFTER _check_path_safe (which reports $HOME, its
-#   ancestors and paths inside a blocked tree first).
-_check_dir_contains_blocked() {
-    local canon="$1" context="$2" _b _t
+# _bwrap_contains_blocked CANON
+#   Return 0 (true) when the canonical path CANON is, or is an ancestor of, a
+#   blocked location that exists on disk (anything in the blocked list, a
+#   symlink's target included, or an EXTRA_BLOCKED_DIRS entry); the offending
+#   entry is left in _BWRAP_CONTAINED_BLOCKED.  Blocked locations that do not
+#   exist are ignored.  Binding such a directory would expose the blocked
+#   location through the parent mount (e.g. running from ~/.config would bind
+#   ~/.config/gh read-write).  Does NOT check whether CANON itself is inside a
+#   blocked tree: use _bwrap_bind_blocked or _check_bind_safe for that.
+_bwrap_contains_blocked() {
+    local canon="$1" _b _t
+    _BWRAP_CONTAINED_BLOCKED=""
     _bwrap_load_blocked_prefixes
     for _b in "${_BWRAP_BLOCKED_LIST[@]}" "${EXTRA_BLOCKED_DIRS[@]+"${EXTRA_BLOCKED_DIRS[@]}"}"; do
         [[ -n "${_b}" ]] || continue
         [[ -e "${_b}" || -L "${_b}" ]] || continue
         _t="$(readlink -f -- "${_b}" 2> /dev/null || true)"
         if _is_prefix_of "${canon}" "${_b}" || { [[ -n "${_t}" ]] && _is_prefix_of "${canon}" "${_t}"; }; then
-            echo "Error: ${context} '${canon}' contains the blocked path '${_b}'. Refusing to mount." >&2
-            exit 1
+            _BWRAP_CONTAINED_BLOCKED="${_b}"
+            return 0
         fi
     done
+    return 1
+}
+
+# _bwrap_bind_blocked CANON
+#   Non-exiting safety check for a path about to be bind-mounted: return 0
+#   (true) when CANON is blocked (_bwrap_path_blocked) OR contains a blocked
+#   location (_bwrap_contains_blocked).  Use where an unsafe candidate is
+#   skipped with a warning instead of aborting the launcher.
+_bwrap_bind_blocked() {
+    _bwrap_path_blocked "$1" || _bwrap_contains_blocked "$1"
+}
+
+# _check_bind_safe CANON CONTEXT
+#   The safety check for ANY path about to be bind-mounted: exit 1 with an
+#   error when CANON is blocked (see _check_path_safe) or, for a directory
+#   bound whole, contains a blocked location.  Use this at every bind-mount
+#   site rather than _check_path_safe alone, which does not notice a
+#   directory that contains a blocked path.
+#
+#   _check_path_safe on its own is for paths that are validated but not bound
+#   whole: a tool-home directory that only has selected subpaths mounted
+#   (see _check_dir_safe), or a symlink target about to be resolved.
+_check_bind_safe() {
+    local canon="$1" context="$2"
+    _check_path_safe "${canon}" "${context}"
+    if _bwrap_contains_blocked "${canon}"; then
+        echo "Error: ${context} '${canon}' contains the blocked path '${_BWRAP_CONTAINED_BLOCKED}'. Refusing to mount." >&2
+        exit 1
+    fi
 }
 
 # _check_dir_safe PATH CONTEXT
@@ -1102,20 +1272,29 @@ _check_dir_safe() {
 
 # _bwrap_canonicalize_safe PATH CONTEXT
 #   Canonicalize PATH with readlink -f (falls back to PATH itself when
-#   readlink fails or PATH does not exist) and run _check_path_safe on the
+#   readlink fails or PATH does not exist) and run _check_bind_safe on the
 #   canonical result.  ALWAYS canonicalizes, so a symlinked parent directory
 #   cannot hide a blocked target (bwrap's --ro-bind follows the symlink and
 #   would mount the real file).
 #
+#   Pass "root" as MODE for a directory that is validated but NOT bound whole
+#   (a tool-home directory that only has selected subpaths mounted): then only
+#   _check_path_safe runs, as a contained blocked location is not exposed.
+#
 #   The canonical path is returned in the global _BWRAP_CANON, NOT on stdout:
-#   _check_path_safe calls exit 1, and inside $(...) that would only leave
-#   the subshell and let the launcher carry on.
+#   the checks call exit 1, and inside $(...) that would only leave the
+#   subshell and let the launcher carry on.
 _bwrap_canonicalize_safe() {
     local path="$1"
     local context="$2"
+    local mode="${3:-bind}"
     _BWRAP_CANON="$(readlink -f "${path}" 2> /dev/null || true)"
     [[ -n "${_BWRAP_CANON}" ]] || _BWRAP_CANON="${path}"
-    _check_path_safe "${_BWRAP_CANON}" "${context}"
+    if [[ "${mode}" == "root" ]]; then
+        _check_path_safe "${_BWRAP_CANON}" "${context}"
+    else
+        _check_bind_safe "${_BWRAP_CANON}" "${context}"
+    fi
 }
 
 # _bwrap_include_visible_path RAW
@@ -1216,15 +1395,20 @@ _bwrap_include_lexical_path() {
 #   On failure: prints an error to stderr and exits 1.
 #
 #   Steps:
-#     1. Expand leading ~/ then resolve to canonical path via readlink -f.
+#     1. Expand a leading ~ or ~user, then resolve to a canonical path via
+#        readlink -f.
 #     2. Verify the path exists on the host.
 #     3. Delegate safety checks to _check_path_safe.
 validate_extra_path() {
     local raw_path="$1"
     local mode="$2"
 
-    # Expand a leading ~/ to $HOME (readlink -f won't do this for us).
-    local expanded_path="${raw_path/#\~/${_HOME}}"
+    # Expand a leading ~ or ~user (readlink -f won't do this for us).
+    local expanded_path
+    if ! expanded_path="$(_expand_leading_tilde "${raw_path}")"; then
+        echo "Error: --${mode}-path '${raw_path}': cannot resolve the '~user' home directory." >&2
+        exit 1
+    fi
 
     # Resolve to canonical path (follows symlinks, removes . and ..).
     local canon
@@ -1237,10 +1421,7 @@ validate_extra_path() {
     fi
 
     # ── Safety check ─────────────────────────────────────────────
-    _check_path_safe "${canon}" "--${mode}-path"
-    if [[ -d "${canon}" ]]; then
-        _check_dir_contains_blocked "${canon}" "--${mode}-path"
-    fi
+    _check_bind_safe "${canon}" "--${mode}-path"
 
     # All checks passed — return the canonical path.
     echo "${canon}"
@@ -1252,53 +1433,111 @@ validate_extra_path() {
 #   Mount all paths accumulated in EXTRA_RO_PATHS and EXTRA_RW_PATHS.
 #   Each path is validated by validate_extra_path before mounting.
 #
-#   Read-only paths: use _mount_ro_dir_if_needed for directories
-#     (deduplication via _MOUNTED_PREFIXES); for files, emit --ro-bind
-#     directly (no dedup needed — an individual file bind never subsumes
-#     a directory tree).
+#   Binds are emitted ANCESTORS-FIRST across both modes: bwrap applies binds
+#   in order and the last one covering a mount point wins, so a path nested
+#   under another is emitted after its parent and overrides it.  This lets
+#       --rw-path DIR --ro-path DIR/sub
+#   keep DIR writable but DIR/sub read-only (and the reverse: a read-only
+#   tree with one writable subdirectory).  A path given as both --ro-path and
+#   --rw-path is rejected.
 #
-#   Read-write paths: emit --bind directly for both files and directories.
-#     For paths under $HOME, intermediate --dir entries are created first
-#     so the bind mount point exists in the tmpfs.
+#   User paths are emitted DIRECTLY, not through the _MOUNTED_PREFIXES dedup
+#   used for automatic mounts: that dedup would skip a child "covered" by a
+#   parent bind (defeating the nesting, or a read-only subdirectory of the
+#   read-write working directory), and would silently drop any path under a
+#   pre-registered prefix such as /tmp, which is a tmpfs in the sandbox.
 #
-#   Must be called AFTER build_dynamic_tool_mounts (which pre-populates
-#   _MOUNTED_PREFIXES) and AFTER build_home_tmpfs (which creates the
-#   $HOME tmpfs that intermediate --dir entries populate).
+#   Must be called AFTER the automatic mount steps (working directory, tools,
+#   system, home) so an explicit path overrides them, and AFTER
+#   build_home_tmpfs (which creates the $HOME tmpfs that intermediate --dir
+#   entries populate).
 build_extra_path_mounts() {
-    local _raw_path _canon _target
+    # Guarded expansion (not ${#arr[@]}): empty-array expansions are fragile
+    # under `set -u` on bash < 4.4.
+    [[ -z "${EXTRA_RO_PATHS[*]+x}${EXTRA_RW_PATHS[*]+x}" ]] && return 0
 
-    # ── Read-only extra paths ────────────────────────────────────
+    local _raw_path _canon _mode
+    local -A _mode_of=()
+
+    # Validate everything up front.  validate_extra_path runs in a command
+    # substitution, where its `exit 1` only leaves the subshell, so the
+    # failure is propagated explicitly.
     for _raw_path in "${EXTRA_RO_PATHS[@]+"${EXTRA_RO_PATHS[@]}"}"; do
-        _canon="$(validate_extra_path "${_raw_path}" "ro")"
-
-        if [[ -d "${_canon}" ]]; then
-            # Directories: go through the dedup helper.
-            _mount_ro_dir_if_needed "${_canon}"
-        else
-            # Files: --ro-bind directly.  Pre-create the file's parent
-            # directory chain if it lives under $HOME (the tmpfs has no
-            # subdirs yet); the file itself is the bind mount point.
-            _emit_home_intermediate_dirs "${_canon%/*}" inclusive
-            BWRAP_ARGS+=(--ro-bind "${_canon}" "${_canon}")
+        _canon="$(validate_extra_path "${_raw_path}" "ro")" || exit 1
+        _mode_of["${_canon}"]="ro"
+    done
+    for _raw_path in "${EXTRA_RW_PATHS[@]+"${EXTRA_RW_PATHS[@]}"}"; do
+        _canon="$(validate_extra_path "${_raw_path}" "rw")" || exit 1
+        if [[ "${_mode_of["${_canon}"]:-}" == "ro" ]]; then
+            echo "Error: '${_canon}' was given as both --ro-path and --rw-path." >&2
+            exit 1
         fi
+        _mode_of["${_canon}"]="rw"
     done
 
-    # ── Read-write extra paths ───────────────────────────────────
-    for _raw_path in "${EXTRA_RW_PATHS[@]+"${EXTRA_RW_PATHS[@]}"}"; do
-        _canon="$(validate_extra_path "${_raw_path}" "rw")"
+    # Ancestors first: an ancestor is a byte prefix of its descendants, so a
+    # plain LC_ALL=C sort orders it before them.  NUL-delimited end to end so a
+    # path containing a newline stays one entry (mapfile -d needs bash 4.4, so
+    # read in a loop).
+    local -a _sorted=()
+    local _sorted_path
+    while IFS= read -r -d '' _sorted_path; do
+        _sorted+=("${_sorted_path}")
+    done < <(printf '%s\0' "${!_mode_of[@]}" | LC_ALL=C sort -z)
 
-        # Pre-create the intermediate --dir chain when the path is under
-        # $HOME.  For a directory the chain includes the target itself (the
-        # subsequent --bind lands on top of that --dir); for a file the
-        # chain stops at the parent directory.
-        if [[ -d "${_canon}" ]]; then
-            _target="${_canon}"
-        else
-            _target="${_canon%/*}"
+    # Destinations of every bind emitted so far.  A path with a bound
+    # ancestor needs no intermediate --dir entries (the ancestor's host tree
+    # already contains it), and a --dir there would clobber that bind.
+    local -A _bound_dests=()
+    local _bi=0 _bflag
+    while [[ ${_bi} -lt ${#BWRAP_ARGS[@]} ]]; do
+        _bflag="${BWRAP_ARGS[${_bi}]}"
+        _bwrap_flag_arity "${_bflag}"
+        case "${_bflag}" in
+            --bind | --bind-try | --ro-bind | --ro-bind-try | --dev-bind | --dev-bind-try)
+                _bound_dests["${BWRAP_ARGS[$((_bi + 2))]}"]=1
+                ;;
+        esac
+        _bi=$((_bi + 1 + _BWRAP_FLAG_ARITY))
+    done
+
+    local _anc _has_bound_ancestor
+    for _canon in "${_sorted[@]}"; do
+        _mode="${_mode_of["${_canon}"]}"
+
+        _has_bound_ancestor=0
+        _anc="${_canon%/*}"
+        [[ -n "${_anc}" ]] || _anc="/"
+        while :; do
+            if [[ -n "${_bound_dests["${_anc}"]:-}" ]]; then
+                _has_bound_ancestor=1
+                break
+            fi
+            [[ "${_anc}" == "/" ]] && break
+            _anc="${_anc%/*}"
+            [[ -n "${_anc}" ]] || _anc="/"
+        done
+
+        # Pre-create the intermediate --dir chain under $HOME.  A read-write
+        # directory includes the target itself (the --bind lands on top of
+        # that --dir); a read-only directory is its own mount point; a file
+        # needs its parent chain.
+        if [[ ${_has_bound_ancestor} -eq 0 ]]; then
+            if [[ -d "${_canon}" && "${_mode}" == "rw" ]]; then
+                _emit_home_intermediate_dirs "${_canon}" inclusive
+            elif [[ -d "${_canon}" ]]; then
+                _emit_home_intermediate_dirs "${_canon}"
+            else
+                _emit_home_intermediate_dirs "${_canon%/*}" inclusive
+            fi
         fi
-        _emit_home_intermediate_dirs "${_target}" inclusive
 
-        BWRAP_ARGS+=(--bind "${_canon}" "${_canon}")
+        if [[ "${_mode}" == "ro" ]]; then
+            BWRAP_ARGS+=(--ro-bind "${_canon}" "${_canon}")
+        else
+            BWRAP_ARGS+=(--bind "${_canon}" "${_canon}")
+        fi
+        _bound_dests["${_canon}"]=1
     done
 }
 
@@ -1306,7 +1545,14 @@ build_extra_path_mounts() {
 
 resolve_common_paths() {
     _HOME="${HOME}"
-    _PWD="${PWD}"
+    _HOME_CANON="$(readlink -f -- "${HOME}" 2> /dev/null || true)"
+    [[ -n "${_HOME_CANON}" ]] || _HOME_CANON="${HOME}"
+    # Physical working directory, so PWD in the sandbox agrees with the
+    # canonical working-directory bind (git rev-parse also returns physical
+    # paths).
+    _PWD="$(pwd -P 2> /dev/null || true)"
+    [[ -n "${_PWD}" ]] || _PWD="${PWD}"
+    _USER="${USER:-$(bwrap_account_name)}"
 
     # XDG defaults
     XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_HOME}/.config}"
@@ -1366,9 +1612,23 @@ init_sandbox_path() {
 }
 
 # Append dynamically-discovered bin directories to SANDBOX_PATH.
+# Deduplicates: the same dir can be recorded more than once (e.g. an npm bin
+# dir added both as a tool's on-PATH dir and as the npm prefix's bin/), and a
+# dir already present in the base SANDBOX_PATH need not be appended again.
 finalize_sandbox_path() {
     local _extra_dir
+    declare -A _path_seen=()
+    # Seed with the base PATH entries so we don't re-append them.
+    local _base_dir
+    local -a _base_dirs=()
+    IFS=':' read -ra _base_dirs <<< "${SANDBOX_PATH}"
+    for _base_dir in "${_base_dirs[@]}"; do
+        [[ -n "${_base_dir}" ]] && _path_seen["${_base_dir}"]=1
+    done
     for _extra_dir in "${_EXTRA_PATH_DIRS[@]+"${_EXTRA_PATH_DIRS[@]}"}"; do
+        [[ -z "${_extra_dir}" ]] && continue
+        [[ -n "${_path_seen["${_extra_dir}"]:-}" ]] && continue
+        _path_seen["${_extra_dir}"]=1
         SANDBOX_PATH="${SANDBOX_PATH}:${_extra_dir}"
     done
 }
@@ -1462,6 +1722,12 @@ build_base_sandbox() {
 # an existing read-only bind mount.  On older versions, we skip masking
 # entirely (the binaries remain accessible inside the sandbox).
 #
+# Must be the very last step of every launcher, after every other mount
+# (user --ro-path / --rw-path included) and after the environment builders,
+# some of which add binds (bwcodex binds SSL_CERT_FILE): a bind that covers a
+# masked binary or its directory (e.g. --ro-path /usr or /usr/bin) emitted
+# afterwards would hide the mask.
+#
 # Categories:
 #   SSH           – lateral movement via remote shell / file transfer
 #   Network       – arbitrary TCP/UDP connections, reverse shells
@@ -1486,38 +1752,51 @@ build_binary_masks() {
         # Namespace / sandbox escape
         nsenter unshare chroot
     )
-    # On merged-/usr systems /bin, /sbin, /usr/bin, /usr/sbin all point to the
-    # same directory.  Multiple prefixes therefore resolve to the same realpath,
-    # which would emit duplicate --ro-bind /dev/null <path> flags.  Track which
-    # real paths have already been masked and skip repeats.
-    declare -A _MASKED_REAL_SEEN=()
-    local _bin _prefix _candidate _real
-    for _bin in "${_MASKED_BINS[@]}"; do
-        # Search well-known prefixes covering RHEL, Debian, and Arch layouts.
-        for _prefix in /usr/bin /usr/sbin /usr/lib/openssh /usr/libexec/openssh \
-                       /bin /sbin; do
-            _candidate="${_prefix}/${_bin}"
-            # -e follows symlinks: true only if the full chain resolves to a
-            # real file.  Broken alternatives entries (dangling symlinks) are
-            # skipped, which is correct — there is no binary to mask.
-            [[ -e "${_candidate}" ]] || continue
+    # Canonicalize + dedupe the search prefixes once.  On merged-/usr systems
+    # /bin, /sbin, /usr/bin, /usr/sbin resolve to the same directory; collapsing
+    # them here avoids re-checking (and re-resolving) the same candidate under
+    # several aliases.  Search prefixes cover RHEL, Debian, and Arch layouts.
+    declare -A _prefix_seen=()
+    local -a _canon_prefixes=()
+    local _p _pc
+    for _p in /usr/bin /usr/sbin /usr/lib/openssh /usr/libexec/openssh /bin /sbin; do
+        [[ -d "${_p}" ]] || continue
+        _pc="$(readlink -f "${_p}" 2> /dev/null || printf '%s' "${_p}")"
+        [[ -n "${_prefix_seen["${_pc}"]:-}" ]] && continue
+        _prefix_seen["${_pc}"]=1
+        _canon_prefixes+=("${_pc}")
+    done
+    [[ ${#_canon_prefixes[@]} -gt 0 ]] || return 0
 
-            # On RHEL/Debian the binary is often a symlink:
-            #   /usr/bin/nc -> /etc/alternatives/nc -> /usr/bin/ncat
-            # bwrap processes --ro-bind arguments in order.  At the point this
-            # bind is applied, /etc/alternatives has not yet been mounted in the
-            # sandbox, so bwrap cannot resolve the intermediate symlink and
-            # reports "Can't create file at /usr/bin/nc".
-            #
-            # Fix: resolve to the canonical (symlink-free) path on the host and
-            # use *that* as the bwrap destination.  The real file is always
-            # directly accessible under /usr once --ro-bind /usr /usr is applied.
-            _real="$(realpath "${_candidate}")"
-            [[ -n "${_MASKED_REAL_SEEN[${_real}]:-}" ]] && continue
-            _MASKED_REAL_SEEN["${_real}"]=1
-            BWRAP_ARGS+=(--ro-bind /dev/null "${_real}")
+    # Collect every existing candidate binary across the unique prefixes.
+    # -e follows symlinks: true only if the full chain resolves to a real file,
+    # so dangling alternatives entries are skipped (correct — nothing to mask).
+    local -a _candidates=()
+    local _bin _candidate
+    for _bin in "${_MASKED_BINS[@]}"; do
+        for _pc in "${_canon_prefixes[@]}"; do
+            _candidate="${_pc}/${_bin}"
+            [[ -e "${_candidate}" ]] && _candidates+=("${_candidate}")
         done
     done
+    [[ ${#_candidates[@]} -gt 0 ]] || return 0
+
+    # On RHEL/Debian the binary is often a symlink:
+    #   /usr/bin/nc -> /etc/alternatives/nc -> /usr/bin/ncat
+    # bwrap processes --ro-bind arguments in order; at the point the bind is
+    # applied /etc/alternatives is not yet mounted, so bwrap cannot resolve the
+    # intermediate symlink ("Can't create file at /usr/bin/nc").  Resolve every
+    # candidate to its canonical, symlink-free path (always reachable under /usr
+    # once --ro-bind /usr /usr is applied) and mask *that*.  A single readlink
+    # -f fork resolves all candidates at once (was one realpath fork each).
+    declare -A _masked_real_seen=()
+    local _real
+    while IFS= read -r _real; do
+        [[ -n "${_real}" ]] || continue
+        [[ -n "${_masked_real_seen["${_real}"]:-}" ]] && continue
+        _masked_real_seen["${_real}"]=1
+        BWRAP_ARGS+=(--ro-bind /dev/null "${_real}")
+    done < <(readlink -f "${_candidates[@]}")
 }
 
 build_proc_dev_tmp() {
@@ -1606,6 +1885,32 @@ build_etc_mounts() {
     )
 }
 
+# ── OpenCode config requirement ───────────────────────────────────
+# require_opencode_config WRAPPER USER_CONFIG_DIR
+#   Exit 2 unless at least a minimal OpenCode config exists: a system-wide
+#   /etc/opencode/opencode.json{,c} (deployed by ansible on managed hosts) or
+#   a user opencode.json, opencode.jsonc or config.json in USER_CONFIG_DIR.
+#   Either is sufficient; OpenCode layers the user config under the managed
+#   one.  Without any, OpenCode starts with no provider or model and fails
+#   with a confusing error of its own.  Only the files' presence is checked,
+#   not their content.  OPENCODE_CONFIG* is not forwarded into the sandbox,
+#   so it is no substitute.
+require_opencode_config() {
+    local _wrapper="$1" _user_dir="$2" _f
+    for _f in /etc/opencode/opencode.json /etc/opencode/opencode.jsonc; do
+        [[ -f "${_f}" && -r "${_f}" ]] && return 0
+    done
+    for _f in opencode.json opencode.jsonc config.json; do
+        [[ -f "${_user_dir}/${_f}" && -r "${_user_dir}/${_f}" ]] && return 0
+    done
+    printf 'Error: %s needs at least a minimal OpenCode config to run.\n' "${_wrapper}" >&2
+    printf '       No config was found in either place:\n' >&2
+    printf '         /etc/opencode/opencode.json or opencode.jsonc  (system-wide; deployed by ansible)\n' >&2
+    printf '         %s/opencode.json, opencode.jsonc or config.json  (user)\n' "${_user_dir}" >&2
+    printf '       Create at least one.\n' >&2
+    exit 2
+}
+
 # ── Managed system paths (read-only) ──────────────────────────────
 # Bind a fixed, administrator-provided path only when it exists.  Resolve
 # aliases before binding: the source can be an /etc symlink into the managed
@@ -1649,20 +1954,20 @@ build_workdir_mount() {
         _BIND_DIR="${_GIT_ROOT}"
     fi
 
+    # Canonicalize before the safety checks.  pwd -P and git rev-parse already
+    # return physical paths, but resolving once more guarantees a symlinked
+    # working directory (e.g. a symlink into ~/.ssh) cannot reach
+    # _check_path_safe in its logical form.
+    local _bind_canon
+    _bind_canon="$(readlink -f -- "${_BIND_DIR}" 2> /dev/null || true)"
+    [[ -n "${_bind_canon}" ]] && _BIND_DIR="${_bind_canon}"
+
     # Guard: reject dangerous working / git-root directories via the same
     # rules applied to --ro-path / --rw-path.  This catches $HOME itself,
     # ancestors of $HOME (/home, /), /root, ~/.ssh, and all other blocked
-    # prefixes.  _BIND_DIR comes from git rev-parse or $PWD — both are
-    # already canonical paths, so no readlink -f step is needed here.
-    _check_path_safe "${_BIND_DIR}" "working directory"
-
-    # A directory that CONTAINS a blocked location (e.g. ~/.config with
-    # ~/.config/gh) is refused too: the whole tree is bound read-write.  The
-    # check runs on the canonical path.
-    local _bind_canon
-    _bind_canon="$(readlink -f -- "${_BIND_DIR}" 2> /dev/null || true)"
-    [[ -n "${_bind_canon}" ]] || _bind_canon="${_BIND_DIR}"
-    _check_dir_contains_blocked "${_bind_canon}" "working directory"
+    # prefixes, and a directory that CONTAINS a blocked location (e.g.
+    # ~/.config with ~/.config/gh): the whole tree is bound read-write.
+    _check_bind_safe "${_BIND_DIR}" "working directory"
 
     # If the bind dir is under HOME, create intermediate directories in the
     # tmpfs so the bind mount point is reachable.  _BIND_DIR is itself the
@@ -1671,6 +1976,11 @@ build_workdir_mount() {
     BWRAP_ARGS+=(
         --bind "${_BIND_DIR}" "${_BIND_DIR}"
     )
+    # Register the read-write tree so a tool resolved from inside it (e.g.
+    # node_modules/.bin or .pixi/envs/*/bin on PATH) does not get an --ro-bind
+    # on top, which would make that subtree read-only (EROFS on install).
+    # build_workdir_mount runs before build_dynamic_tool_mounts everywhere.
+    _MOUNTED_PREFIXES["${_BIND_DIR}"]=1
 }
 
 # ── Git config (read-only) ──────────────────────────────────────
@@ -1806,11 +2116,9 @@ _bwrap_git_recreate_link() {
 #   with a warning; a dangling symlink is skipped silently.  When the
 #   directory is itself a symlink it is recreated as one and the files are
 #   mounted at its real target, so ".." in includes resolves as on the host.
-#   Sets _BWRAP_XDG_GIT_HAS_FILES=1 when at least one file was mounted.
 _bwrap_mount_xdg_git_files() {
     local gdir="${XDG_CONFIG_HOME}/git" gdir_real dest_dir name f f_real
     local -a names=() reals=()
-    _BWRAP_XDG_GIT_HAS_FILES=0
     [[ -d "${gdir}" ]] || return 0
     gdir_real="$(readlink -f -- "${gdir}" 2> /dev/null || true)"
     [[ -n "${gdir_real}" ]] || return 0
@@ -1845,7 +2153,6 @@ _bwrap_mount_xdg_git_files() {
     for _k in "${!names[@]}"; do
         BWRAP_ARGS+=(--ro-bind "${reals[${_k}]}" "${dest_dir}/${names[${_k}]}")
     done
-    _BWRAP_XDG_GIT_HAS_FILES=1
 }
 
 # _bwrap_git_lexical_mount RAW INC_PATH
@@ -2054,6 +2361,181 @@ build_user_bin_mount() {
     fi
 }
 
+# ── Authoring directories (read-write, persistent) ──────────────
+# The tools let users author reusable definitions (skills, agents, commands,
+# prompts) as plain markdown under their config/home directory, and the agent
+# is expected to be able to create and edit them from inside the sandbox.  The
+# tool's home/config directory is a tmpfs, so each such directory must be
+# bind-mounted read-write from its real host location to survive the session.
+#
+# _path_visible_from_host PATH
+#   Return 0 when PATH already shows its host contents in the sandbox given
+#   the mounts emitted so far, i.e. the LAST mount in BWRAP_ARGS covering PATH
+#   (at PATH or an ancestor) is an identity bind (source == destination).  A
+#   registered ancestor in _MOUNTED_PREFIXES is not enough: a later tmpfs (a
+#   tool home such as CODEX_HOME=$PWD/.codex inside the working directory) or
+#   a bind from a different source hides what an earlier bind exposed.
+_path_visible_from_host() {
+    local _path="$1" _i=0 _flag _src _dest _visible=0
+    while [[ ${_i} -lt ${#BWRAP_ARGS[@]} ]]; do
+        _flag="${BWRAP_ARGS[${_i}]}"
+        _bwrap_flag_arity "${_flag}"
+        case "${_flag}" in
+            --tmpfs)
+                _dest="${BWRAP_ARGS[$((_i + 1))]}"
+                _is_prefix_of "${_dest}" "${_path}" && _visible=0
+                ;;
+            --bind | --ro-bind | --bind-try | --ro-bind-try | --dev-bind | --dev-bind-try)
+                _src="${BWRAP_ARGS[$((_i + 1))]}"
+                _dest="${BWRAP_ARGS[$((_i + 2))]}"
+                if _is_prefix_of "${_dest}" "${_path}"; then
+                    if [[ "${_src}" == "${_dest}" ]]; then
+                        _visible=1
+                    else
+                        _visible=0
+                    fi
+                fi
+                ;;
+        esac
+        _i=$((_i + 1 + _BWRAP_FLAG_ARITY))
+    done
+    [[ ${_visible} -eq 1 ]]
+}
+
+# _mount_authoring_dir DIR CREATE KIND [SRC]
+#   Mount DIR read-write.  CREATE=1 creates it on the host first (skipped
+#   under --dry-run, which must not mutate host state) so a first-time user
+#   can author into it; CREATE=0 mounts it only when it already exists.  KIND
+#   is the word used in warnings (e.g. "skill").
+#
+#   SRC is the host directory to mount at DIR, for when the tool looks in one
+#   place and the files live in another (default: DIR itself).  CREATE and the
+#   existence test apply to SRC.
+#
+#   The directory is resolved with readlink -f and bound whole at its logical
+#   path, so entries created inside the sandbox persist on the host.  An
+#   entry that is a symlink (a common layout symlinks each skill in from a
+#   separate repository) would dangle, since that repository is not
+#   otherwise mounted, so each symlink's resolved target is also bound
+#   read-write at its own path.  Only that target is exposed, not the
+#   repository around it.  A target that resolves into a blocked location, or
+#   is a directory containing one, is skipped with a warning.  With a
+#   distinct SRC a RELATIVE symlink would resolve against DIR inside the
+#   sandbox rather than against SRC, so it is skipped with a warning.
+#
+#   bwrap cannot bind over a symlink inside a bound directory, so when DIR
+#   itself is reached through a symlink (its resolved path differs from DIR)
+#   the symlink targets are not bound this way.  That case falls back to
+#   binding each entry individually, at its logical path, over a tmpfs
+#   directory: existing entries work, but one created inside the sandbox is
+#   discarded on exit.
+#
+#   A DIR that resolves into a blocked location, contains one, or is already
+#   covered by an earlier bind (e.g. inside the working directory) is left
+#   alone.  Must be called AFTER the tool's own home mount: that mount may be
+#   a tmpfs that would hide a directory bound underneath it.
+_mount_authoring_dir() {
+    local _dir="$1" _create="$2" _kind="$3" _src="${4:-$1}"
+    local _canon _entry _real _link
+
+    if [[ ! -e "${_src}" ]]; then
+        [[ "${_create}" -eq 1 ]] || return 0
+    elif [[ ! -d "${_src}" ]]; then
+        return 0
+    fi
+
+    # -m, not -f: a directory about to be created may have missing parents
+    # too (a fresh ~/.config/opencode), and -f yields nothing for those.
+    _canon="$(readlink -m -- "${_src}" 2> /dev/null || true)"
+    [[ -n "${_canon}" ]] || return 0
+    if _bwrap_bind_blocked "${_canon}"; then
+        echo "Warning: ${_kind} directory '${_src}' resolves into or contains a blocked location (${_canon}); not mounted." >&2
+        return 0
+    fi
+    if [[ "${_src}" == "${_dir}" ]]; then
+        _path_visible_from_host "${_dir}" && return 0
+    fi
+
+    if [[ "${_create}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p -- "${_canon}"
+    fi
+
+    _emit_home_intermediate_dirs "${_dir}" inclusive
+
+    if [[ "${_src}" == "${_dir}" && "${_canon}" != "${_dir}" ]]; then
+        [[ -d "${_canon}" ]] || return 0
+        for _entry in "${_dir}"/* "${_dir}"/.[!.]* "${_dir}"/..?*; do
+            [[ -e "${_entry}" ]] || continue
+            _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
+            [[ -n "${_real}" ]] || continue
+            if _bwrap_bind_blocked "${_real}"; then
+                echo "Warning: ${_kind} '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
+                continue
+            fi
+            BWRAP_ARGS+=(--bind "${_real}" "${_entry}")
+        done
+        _MOUNTED_PREFIXES["${_dir}"]=1
+        return 0
+    fi
+
+    BWRAP_ARGS+=(--bind "${_canon}" "${_dir}")
+    _MOUNTED_PREFIXES["${_dir}"]=1
+
+    [[ -d "${_canon}" ]] || return 0
+    for _entry in "${_canon}"/* "${_canon}"/.[!.]* "${_canon}"/..?*; do
+        [[ -L "${_entry}" ]] || continue
+        _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
+        [[ -n "${_real}" && -e "${_real}" ]] || continue
+        if [[ "${_src}" != "${_dir}" ]]; then
+            _link="$(readlink -- "${_entry}" 2> /dev/null || true)"
+            if [[ "${_link}" != /* ]]; then
+                echo "Warning: ${_kind} '${_entry}' is a relative symlink and would not resolve at '${_dir}'; not mounted." >&2
+                continue
+            fi
+        fi
+        _path_visible_from_host "${_real}" && continue
+        if _bwrap_bind_blocked "${_real}"; then
+            echo "Warning: ${_kind} '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
+            continue
+        fi
+        _emit_home_intermediate_dirs "${_real}"
+        BWRAP_ARGS+=(--bind "${_real}" "${_real}")
+        _MOUNTED_PREFIXES["${_real}"]=1
+    done
+}
+
+# build_authoring_dir_mounts KIND DIR...
+#   Mount each DIR read-write, creating it on the host when missing so
+#   authoring works out of the box.  Use for the tool's own (primary)
+#   location of each kind of definition.  KIND is "skill", "agent",
+#   "command" or "prompt".
+build_authoring_dir_mounts() {
+    local _kind="$1" _dir
+    shift
+    for _dir in "$@"; do
+        _mount_authoring_dir "${_dir}" 1 "${_kind}"
+    done
+}
+
+# build_authoring_dir_mounts_from KIND SRC DEST
+#   Like build_authoring_dir_mounts for one directory, but mount the host
+#   directory SRC (created when missing) at DEST, where the tool looks.
+build_authoring_dir_mounts_from() {
+    _mount_authoring_dir "$3" 1 "$1" "$2"
+}
+
+# build_personal_authoring_mounts KIND DIR...
+#   Mount additional locations the tool also reads (e.g. ~/.claude/skills or
+#   ~/.agents/skills) read-write.  Missing directories are skipped, not
+#   created.
+build_personal_authoring_mounts() {
+    local _kind="$1" _dir
+    shift
+    for _dir in "$@"; do
+        _mount_authoring_dir "${_dir}" 0 "${_kind}"
+    done
+}
+
 # ── NSLS-II software (read-only) ────────────────────────────────
 # Only bind if the directory exists on the host system.
 build_nsls2_mount() {
@@ -2075,6 +2557,7 @@ build_dynamic_tool_mounts() {
             /usr /bin /sbin /lib /lib64 \
             /proc /dev /tmp \
             "${PIXI_HOME_DIR}" \
+            "${_HOME}/bin" \
             /nsls2/software/bin; do
         [[ -e "${_preloaded}" ]] && _MOUNTED_PREFIXES["${_preloaded}"]=1
     done
@@ -2097,38 +2580,17 @@ build_dynamic_tool_mounts() {
 }
 
 # ── Environment variables ────────────────────────────────────────
-# Start from a clean environment and only pass through what we need.
+# The sandbox environment is exactly bwrap's environment, which
+# launch_sandbox builds from scratch with `env -i` (a few base variables plus
+# SANDBOX_ENV), so no host variable reaches it unless passed through here.
+# bwrap runs WITHOUT --clearenv so that environment is handed to the sandbox;
+# the --setenv entries below are applied on top of it and take precedence.
 build_env_vars() {
-    if [[ "${HAS_CLEARENV}" -eq 1 ]]; then
-        BWRAP_ARGS+=(--clearenv)
-    else
-        # Fallback for bwrap < 0.5.0: manually unset all host env vars.
-        # We use compgen -e to list all exported vars and unset each one.
-        # Note: we already exec with env -i, but --unsetenv ensures any
-        # vars inherited through other means are also cleared.
-        #
-        # Read line-by-line (not `for x in $(...)`) so names are not
-        # word-split on IFS, and skip anything that is not a portable
-        # shell identifier — bash exports function definitions under names
-        # like `BASH_FUNC_module%%`, which would become invalid --unsetenv
-        # arguments.
-        #
-        # On HPC login nodes the exported-var count can reach the hundreds;
-        # each becomes a separate --unsetenv pair, so this path can produce
-        # a long bwrap command line.  That is unavoidable here and harmless
-        # (well under ARG_MAX); the modern --clearenv path above avoids it.
-        local _envvar
-        while IFS= read -r _envvar; do
-            [[ "${_envvar}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-            BWRAP_ARGS+=(--unsetenv "${_envvar}")
-        done < <(compgen -e)
-    fi
-
     # Always set
     BWRAP_ARGS+=(
         --setenv HOME "${_HOME}"
-        --setenv USER "${USER}"
-        --setenv LOGNAME "${USER}"
+        --setenv USER "${_USER}"
+        --setenv LOGNAME "${_USER}"
         --setenv SHELL "${SANDBOX_SHELL}"
         --setenv PATH "${SANDBOX_PATH}"
         --setenv PWD "${_PWD}"
@@ -2215,28 +2677,31 @@ resolve_env_bin() {
 }
 
 # _bwrap_flag_arity FLAG
-#   Echo the number of value arguments that bwrap flag FLAG consumes (0, 1,
-#   or 2).  Used by print_dry_run to group flags with their values WITHOUT
+#   Set _BWRAP_FLAG_ARITY to the number of value arguments that bwrap flag
+#   FLAG consumes (0, 1, or 2).  Used to walk BWRAP_ARGS (print_dry_run,
+#   build_extra_path_mounts) grouping flags with their values WITHOUT
 #   guessing from the value's leading characters — a path value that happens
 #   to start with "--" (e.g. a user-supplied --ro-path) must not be mistaken
 #   for a new flag.  Only the flags this library actually emits are listed;
-#   the default of 1 is a safe fallback for any single-value flag.
+#   the default of 1 is a safe fallback for any single-value flag.  Sets a
+#   global rather than echoing so the walks do not fork once per argument.
+_BWRAP_FLAG_ARITY=1
 _bwrap_flag_arity() {
     case "$1" in
         --unshare-* | --share-net | --die-with-parent | --new-session | \
             --clearenv | --as-pid-1)
-            echo 0
+            _BWRAP_FLAG_ARITY=0
             ;;
         --ro-bind | --ro-bind-try | --bind | --bind-try | --dev-bind | \
             --dev-bind-try | --symlink | --setenv | \
             --file | --bind-data | --ro-bind-data)
-            echo 2
+            _BWRAP_FLAG_ARITY=2
             ;;
         --dir | --tmpfs | --proc | --dev | --unsetenv | --chdir | --hostname)
-            echo 1
+            _BWRAP_FLAG_ARITY=1
             ;;
         *)
-            echo 1
+            _BWRAP_FLAG_ARITY=1
             ;;
     esac
 }
@@ -2259,24 +2724,36 @@ print_dry_run() {
     _ENV_BIN="$(resolve_env_bin)"
 
     # Mirror the exact invocation used by launch_sandbox:
-    #   exec <env_bin> -i <vars> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
+    #   exec <env_bin> -i <base vars> <SANDBOX_ENV> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
+    # Values of secret-looking variables (_is_secret_env_name) are printed as
+    # REDACTED, on the env line and in --setenv; only the printed text changes.
     printf "exec %s -i \\\\\n" "${_ENV_BIN}"
     printf "  HOME=%q \\\\\n"    "${_HOME}"
-    printf "  USER=%q \\\\\n"    "${USER}"
-    printf "  LOGNAME=%q \\\\\n" "${USER}"
+    printf "  USER=%q \\\\\n"    "${_USER}"
+    printf "  LOGNAME=%q \\\\\n" "${_USER}"
     printf "  PATH=%q \\\\\n"    "/usr/bin:/bin"
-    printf "  LANG=%q \\\\\n"    "${LANG:-C.UTF-8}"
-    printf "  LC_CTYPE=%q \\\\\n" "${LC_CTYPE:-C.UTF-8}"
+    local _entry _name
+    for _entry in ${SANDBOX_ENV[@]+"${SANDBOX_ENV[@]}"}; do
+        _name="${_entry%%=*}"
+        if _is_secret_env_name "${_name}"; then
+            printf "  %s='REDACTED' \\\\\n" "${_name}"
+        else
+            printf "  %s=%q \\\\\n" "${_name}" "${_entry#*=}"
+        fi
+    done
     printf "  %s \\\\\n" "${_BWRAP_BIN}"
 
     # Print bwrap arguments one flag-plus-values per line.  Each flag's
     # value count comes from _bwrap_flag_arity, so a value beginning with
     # "--" is grouped with its flag instead of being misread as a new flag.
+    # Values are %q-quoted so a path containing a quote, space or other
+    # special character still yields a valid, pasteable command.
     local i=0 arg _arity _j
     while [[ $i -lt ${#BWRAP_ARGS[@]} ]]; do
         arg="${BWRAP_ARGS[$i]}"
-        _arity="$(_bwrap_flag_arity "${arg}")"
-        printf "    %s" "${arg}"
+        _bwrap_flag_arity "${arg}"
+        _arity="${_BWRAP_FLAG_ARITY}"
+        printf "    %q" "${arg}"
         i=$((i + 1))
         for ((_j = 0; _j < _arity && i < ${#BWRAP_ARGS[@]}; _j++)); do
             # Redact the VALUE of secret-looking --setenv variables (only the
@@ -2285,7 +2762,7 @@ print_dry_run() {
                 _is_secret_env_name "${BWRAP_ARGS[$((i - 1))]}"; then
                 printf " 'REDACTED'"
             else
-                printf " '%s'" "${BWRAP_ARGS[$i]}"
+                printf " %q" "${BWRAP_ARGS[$i]}"
             fi
             i=$((i + 1))
         done
@@ -2303,6 +2780,12 @@ print_dry_run() {
 # Launch bwrap itself with a scrubbed environment so /proc/1/environ
 # does not leak host variables (SSH_AUTH_SOCK, DBUS_SESSION_BUS_ADDRESS, etc.).
 #
+# Forwarded values (SANDBOX_ENV, which includes API keys and tokens) travel in
+# bwrap's environment, not on its command line: /proc/<pid>/cmdline of the
+# long-running bwrap process is readable by every local user (`ps`), while
+# /proc/<pid>/environ is readable only by its owner.  They are on `env`'s own
+# command line only for the instant before it execs bwrap.
+#
 # `env` is resolved via resolve_env_bin (prefers /usr/bin/env) rather than
 # via PATH lookup at exec time — this prevents a user shell script named
 # "env" earlier on PATH from hijacking the launch.  See resolve_env_bin.
@@ -2313,10 +2796,9 @@ launch_sandbox() {
 
     exec "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
-        USER="${USER}" \
-        LOGNAME="${USER}" \
+        USER="${_USER}" \
+        LOGNAME="${_USER}" \
         PATH="/usr/bin:/bin" \
-        LANG="${LANG:-C.UTF-8}" \
-        LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
+        ${SANDBOX_ENV[@]+"${SANDBOX_ENV[@]}"} \
         "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
 }

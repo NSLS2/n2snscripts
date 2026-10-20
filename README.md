@@ -68,7 +68,6 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 
 - `bash` >= 4.x (the `bw*` wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0 for the `bw*` wrappers
-  - 0.5.0+ enables `--clearenv`
   - 0.6.3+ enables bind-over-ro-bind binary masking
 - `gpg(1)` for `gpg-passwd.sh`
 - `openssl(1)` for `pemdecompose`
@@ -92,11 +91,13 @@ Common wrapper options:
 
 | Option | Effect |
 | --- | --- |
-| `--help`, `-h` | Show wrapper help plus the underlying tool's help |
+| `--help`, `-h` | Show wrapper help, then the underlying tool's help when the tool is installed |
 | `--dry-run` | Print the `bwrap` command without executing it |
-| `--exec CMD` | Run `CMD` inside the sandbox instead of the tool |
+| `--exec CMD [ARGS...]` | Run `CMD` inside the sandbox instead of the tool. `CMD` is split on whitespace; following arguments are passed unchanged, e.g. `--exec bash -c 'env \| sort'` |
 | `--init-auth` | Persist auth credentials to the host (first-time setup) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
+| `--ro-path PATH`, `--rw-path PATH` | Mount an existing path read-only / read-write (may be repeated and nested) |
+| `--github-tokens` | Forward `GH_TOKEN_*` variables so `gh` can authenticate inside the sandbox (off by default) |
 
 `bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
 persists in its data directory), always runs OpenCode 2 with `--standalone`
