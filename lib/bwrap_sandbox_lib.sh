@@ -1457,7 +1457,9 @@ validate_extra_path() {
 #   build_home_tmpfs (which creates the $HOME tmpfs that intermediate --dir
 #   entries populate).
 build_extra_path_mounts() {
-    [[ ${#EXTRA_RO_PATHS[@]} -eq 0 && ${#EXTRA_RW_PATHS[@]} -eq 0 ]] && return 0
+    # Guarded expansion (not ${#arr[@]}): empty-array expansions are fragile
+    # under `set -u` on bash < 4.4.
+    [[ -z "${EXTRA_RO_PATHS[*]+x}${EXTRA_RW_PATHS[*]+x}" ]] && return 0
 
     local _raw_path _canon _mode
     local -A _mode_of=()
