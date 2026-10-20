@@ -5,6 +5,10 @@
 #   - 0.4.0: base functionality
 #   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
 #
+# Requires at least a minimal OpenCode config: /etc/opencode/opencode.json{,c}
+# or a user opencode.json, opencode.jsonc or config.json in ~/.config/opencode.
+# Exits 2 if neither exists.
+#
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write
 #   - OpenCode config: read-only (symlinks resolved), except the authoring
@@ -533,6 +537,8 @@ main() {
     detect_kernel_capabilities
     resolve_common_paths
     resolve_opencode_paths
+    # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
+    require_opencode_config bwopencode "${OC_CONFIG_DIR}"
     detect_shell
     # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
     if [[ "${DRY_RUN}" -eq 0 ]]; then

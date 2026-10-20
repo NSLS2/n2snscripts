@@ -1888,6 +1888,32 @@ build_etc_mounts() {
     )
 }
 
+# ── OpenCode config requirement ───────────────────────────────────
+# require_opencode_config WRAPPER USER_CONFIG_DIR
+#   Exit 2 unless at least a minimal OpenCode config exists: a system-wide
+#   /etc/opencode/opencode.json{,c} (deployed by ansible on managed hosts) or
+#   a user opencode.json, opencode.jsonc or config.json in USER_CONFIG_DIR.
+#   Either is sufficient; OpenCode layers the user config under the managed
+#   one.  Without any, OpenCode starts with no provider or model and fails
+#   with a confusing error of its own.  Only the files' presence is checked,
+#   not their content.  OPENCODE_CONFIG* is not forwarded into the sandbox,
+#   so it is no substitute.
+require_opencode_config() {
+    local _wrapper="$1" _user_dir="$2" _f
+    for _f in /etc/opencode/opencode.json /etc/opencode/opencode.jsonc; do
+        [[ -f "${_f}" && -r "${_f}" ]] && return 0
+    done
+    for _f in opencode.json opencode.jsonc config.json; do
+        [[ -f "${_user_dir}/${_f}" && -r "${_user_dir}/${_f}" ]] && return 0
+    done
+    printf 'Error: %s needs at least a minimal OpenCode config to run.\n' "${_wrapper}" >&2
+    printf '       No config was found in either place:\n' >&2
+    printf '         /etc/opencode/opencode.json or opencode.jsonc  (system-wide; deployed by ansible)\n' >&2
+    printf '         %s/opencode.json, opencode.jsonc or config.json  (user)\n' "${_user_dir}" >&2
+    printf '       Create at least one.\n' >&2
+    exit 2
+}
+
 # ── Managed system paths (read-only) ──────────────────────────────
 # Bind a fixed, administrator-provided path only when it exists.  Resolve
 # aliases before binding: the source can be an /etc symlink into the managed

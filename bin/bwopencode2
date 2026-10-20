@@ -9,6 +9,10 @@
 # role installs.  OpenCode 2 is a separate product from
 # OpenCode 1 (see bwopencode) and never shares its directories.
 #
+# Requires at least a minimal OpenCode config: /etc/opencode/opencode.json{,c}
+# or a user opencode.json, opencode.jsonc or config.json in
+# ~/.config/opencode2/opencode.  Exits 2 if neither exists.
+#
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write
 #   - OpenCode 2 config (~/.config/opencode2/opencode): read-only (symlinks resolved);
@@ -719,6 +723,8 @@ main() {
     detect_kernel_capabilities
     resolve_common_paths
     resolve_opencode2_paths
+    # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
+    require_opencode_config bwopencode2 "${OC2_CONFIG_DIR}"
     detect_shell
     # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
     if [[ "${DRY_RUN}" -eq 0 ]]; then
