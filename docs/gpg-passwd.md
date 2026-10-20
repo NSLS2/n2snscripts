@@ -4,9 +4,11 @@ Shell library providing `decrypt_env_file`, a helper for sourcing
 GPG-encrypted environment files into the current shell. Sourced, not
 executed.
 
-**Requires bash >= 4.3. Not zsh-safe.** The required-variable check uses a
-`local -n` nameref, which does not exist in zsh and needs bash 4.3 or newer.
-Source this only from bash callers.
+**Works in both bash and zsh**, so it can be sourced from a `~/.bashrc` or a
+`~/.zshrc`. The required-variable check reads each variable by `eval`
+indirection rather than a bash-only `local -n` nameref; the name is validated
+first (see [Required-variable names](#required-variable-names)), so the `eval`
+cannot inject code.
 
 ## Usage
 
@@ -35,9 +37,10 @@ The trailing `|| rc=$?` both captures the code and suppresses `set -e`.
 
 ### Required-variable names
 
-Required-variable names passed to `decrypt_env_file` must not begin with
-`__gpgpw_`; that prefix is reserved for the function's own locals and such a
-name is rejected with return code `2`.
+Required-variable names passed to `decrypt_env_file` must be plain shell
+identifiers (letters, digits and underscores, not starting with a digit) and
+must not begin with `__gpgpw_`; that prefix is reserved for the function's own
+locals. Any other name is rejected with return code `2`.
 
 ## Behaviour
 
@@ -52,7 +55,7 @@ name is rejected with return code `2`.
 | --- | --- |
 | `0` | Success |
 | `0` (with warning) | File is missing — no decrypt attempted |
-| `2` | A required variable is still empty after decrypt |
+| `2` | A required variable is still empty after decrypt, or a required-variable name is invalid or reserved |
 | `3` | `gpg` failed (bad passphrase, malformed file, etc.) |
 | `4` | `eval` of decrypted content failed (syntax error or failing command) |
 
