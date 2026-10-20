@@ -1481,9 +1481,14 @@ build_extra_path_mounts() {
     done
 
     # Ancestors first: an ancestor is a byte prefix of its descendants, so a
-    # plain LC_ALL=C sort orders it before them.
+    # plain LC_ALL=C sort orders it before them.  NUL-delimited end to end so a
+    # path containing a newline stays one entry (mapfile -d needs bash 4.4, so
+    # read in a loop).
     local -a _sorted=()
-    mapfile -t _sorted < <(printf '%s\n' "${!_mode_of[@]}" | LC_ALL=C sort)
+    local _sorted_path
+    while IFS= read -r -d '' _sorted_path; do
+        _sorted+=("${_sorted_path}")
+    done < <(printf '%s\0' "${!_mode_of[@]}" | LC_ALL=C sort -z)
 
     # Destinations of every bind emitted so far.  A path with a bound
     # ancestor needs no intermediate --dir entries (the ancestor's host tree
