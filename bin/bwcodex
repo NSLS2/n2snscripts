@@ -408,6 +408,31 @@ build_codex_home_mount() {
     fi
 }
 
+# ── SSL_CERT_FILE (read-only) ────────────────────────────────────
+# Codex honours SSL_CERT_FILE, but forwarding only the variable is not
+# enough: a bundle under $HOME (or anywhere else not mounted) is absent in
+# the sandbox and TLS fails.  Mount the canonical file read-only and point
+# SSL_CERT_FILE at it; refuse with a warning (and do not forward) when it
+# does not resolve to a readable file or resolves into a blocked location.
+build_ssl_cert_file_mount() {
+    [[ -n "${SSL_CERT_FILE:-}" ]] || return 0
+    local _canon
+    _canon="$(readlink -f -- "${SSL_CERT_FILE}" 2> /dev/null || true)"
+    if [[ -z "${_canon}" || ! -f "${_canon}" || ! -r "${_canon}" ]]; then
+        echo "Warning: SSL_CERT_FILE=${SSL_CERT_FILE} is not a readable file; not forwarding it." >&2
+        return 0
+    fi
+    if _bwrap_path_blocked "${_canon}"; then
+        echo "Warning: SSL_CERT_FILE=${SSL_CERT_FILE} resolves into a blocked location; not forwarding it." >&2
+        return 0
+    fi
+    # Bound even when a parent tree is already mounted (harmless there), so
+    # a file under a sandbox tmpfs such as /tmp is still provided.
+    _emit_home_intermediate_dirs "${_canon%/*}" inclusive
+    BWRAP_ARGS+=(--ro-bind "${_canon}" "${_canon}")
+    BWRAP_ARGS+=(--setenv SSL_CERT_FILE "${_canon}")
+}
+
 # ── Codex env vars ───────────────────────────────────────────────
 # Pass through AIFAPIM_* (Hermes routing) and the documented Codex
 # env vars; default OPENAI_API_KEY to "dummy" if unset so the Codex
@@ -429,7 +454,7 @@ build_codex_env() {
     fi
 
     # Non-CODEX_* vars that Codex consults.
-    pass_through_if_set SSL_CERT_FILE
+    build_ssl_cert_file_mount
     pass_through_if_set RUST_LOG
 
     # Generic CODEX_* sweep — covers CODEX_HOME, CODEX_SQLITE_HOME,
