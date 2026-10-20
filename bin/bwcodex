@@ -426,16 +426,13 @@ build_codex_env() {
         pass_through_if_set OPENAI_API_KEY
     fi
 
-    # Documented Codex env vars
-    pass_through_if_set CODEX_HOME
-    pass_through_if_set CODEX_SQLITE_HOME
-    pass_through_if_set CODEX_API_KEY
-    pass_through_if_set CODEX_ACCESS_TOKEN
-    pass_through_if_set CODEX_CA_CERTIFICATE
+    # Non-CODEX_* vars that Codex consults.
     pass_through_if_set SSL_CERT_FILE
     pass_through_if_set RUST_LOG
 
-    # Generic CODEX_* sweep so user-defined overrides flow through.
+    # Generic CODEX_* sweep — covers CODEX_HOME, CODEX_SQLITE_HOME,
+    # CODEX_API_KEY, CODEX_ACCESS_TOKEN, CODEX_CA_CERTIFICATE, and any
+    # user-defined CODEX_* overrides in a single pass.
     local _key
     while IFS= read -r _key; do
         if [[ "${_key}" == CODEX_* ]]; then

@@ -293,13 +293,14 @@ build_copilot_home_mount() {
         fi
     done
 
-    # Bind-mount user-writable customization directories (read-write)
+    # Bind-mount user-writable customization directories (read-write).
     # Skills and agents are user-created files, not installed packages.
-    for _cfg in skills agents; do
-        local _path="${COPILOT_HOME_DIR}/${_cfg}"
-        if [[ -e "${_path}" ]]; then
-            BWRAP_ARGS+=(--bind "${_path}" "${_path}")
-        fi
+    # ensure_host_dirs always creates both directories, so no existence
+    # check is needed (on --dry-run the directories may not exist yet,
+    # but the bind args are still emitted for accurate dry-run output).
+    local _cust_dir
+    for _cust_dir in skills agents; do
+        BWRAP_ARGS+=(--bind "${COPILOT_HOME_DIR}/${_cust_dir}" "${COPILOT_HOME_DIR}/${_cust_dir}")
     done
 
     # Handle config.json: copy or bind depending on --init-auth.
