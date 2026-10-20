@@ -12,7 +12,7 @@
 #   - OpenCode data dir: ephemeral tmpfs with selective persistence
 #       - auth.json: persisted only if it already exists on host;
 #         otherwise created in tmpfs (discarded on exit)
-#       - Database, logs, snapshots, storage, tool-output,
+#       - Database, logs, plans, snapshots, storage, tool-output,
 #         project-dotfiles: always persisted
 #   - OpenCode cache: read-write
 #   - Git config + includes: read-only
@@ -342,7 +342,7 @@ build_opencode_config_mount() {
 # behaviour for shared accounts.  On a personal account, run with
 # --init-auth once to create the file and bootstrap persistent auth.
 #
-# Any files NOT in the persist list (e.g. mcp-auth.json, plans/)
+# Any files NOT in the persist list (e.g. mcp-auth.json)
 # will be writable inside the sandbox but discarded on exit.
 build_opencode_data_mounts() {
     BWRAP_ARGS+=(

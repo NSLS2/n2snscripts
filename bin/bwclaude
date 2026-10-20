@@ -15,6 +15,7 @@
 #     - statsig/: bind-mounted read-write (persistent)
 #     - file-history/: bind-mounted read-write (per-file edit history for undo/restore)
 #     - sessions/: bind-mounted read-write (session metadata for --continue)
+#     - plans/: bind-mounted read-write (plan-mode plan files)
 #     - history.jsonl: bind-mounted read-write (prompt history across sessions)
 #     - .last-cleanup: bind-mounted read-write (throttles Claude's cleanup runs)
 #     - settings.json: bind-mounted read-write (if it exists; --init-auth creates a stub)
@@ -270,7 +271,7 @@ build_claude_home_mount() {
 
     # Persistent read-write directories
     local _subdir
-    for _subdir in logs projects todos statsig file-history sessions; do
+    for _subdir in logs projects todos statsig file-history plans sessions; do
         BWRAP_ARGS+=(--bind "${CLAUDE_HOME_DIR}/${_subdir}" "${CLAUDE_HOME_DIR}/${_subdir}")
     done
 

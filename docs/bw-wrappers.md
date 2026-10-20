@@ -215,7 +215,7 @@ Launches [opencode](https://opencode.ai) inside a bubblewrap sandbox.
 bwopencode [bwopencode-options] [opencode arguments...]
 ```
 
-Persists database, logs, snapshots, storage, tool-output, and
+Persists database, logs, plans, snapshots, storage, tool-output, and
 project-dotfiles to the host data dir; `auth.json` is persisted only if
 it already exists on the host (use `--init-auth` once to create it for
 personal accounts).
@@ -396,6 +396,11 @@ Additional options:
 | --- | --- |
 | `--debug` | Enable verbose debug logging: sets `ANTHROPIC_LOG=debug`, `NODE_DEBUG=http,https,tls`, and passes `--debug --verbose` to `claude` |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+
+Persists `logs`, `projects`, `todos`, `statsig`, `file-history`, `plans`
+(plan-mode plan files) and `sessions` under `~/.claude`, plus
+`history.jsonl` and `~/.claude.json`. Other new files under `~/.claude` are
+discarded on exit.
 
 On shared accounts, auth is ephemeral. On a personal machine, run
 `bwclaude --init-auth` once to persist credentials.
