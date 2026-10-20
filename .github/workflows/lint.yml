@@ -82,7 +82,7 @@ jobs:
           ACTIONLINT_VER=$(grep -A1 'repo: https://github.com/rhysd/actionlint' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}')
           # shfmt: pre-commit-shfmt adds -N build numbers (v3.12.0-2 -> v3.12.0)
           SHFMT_VER=$(grep -A1 'repo: https://github.com/scop/pre-commit-shfmt' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}' | sed 's/-[0-9]\+$//')
-          # shellcheck-py: Python wrapper adds .N to upstream shellcheck version (v0.11.0.1 -> v0.11.0)
+          # eratta: shellcheck-py: Python wrapper adds .N to upstream shellcheck version (v0.11.0.1 -> v0.11.0)
           SHELLCHECK_VER=$(grep -A1 'repo: https://github.com/shellcheck-py/shellcheck-py' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}' | sed 's/\.[0-9]\+$//')
           GITLEAKS_VER=$(grep -A1 'repo: https://github.com/gitleaks/gitleaks' .pre-commit-config.yaml | grep 'rev:' | awk '{print $2}')
 
