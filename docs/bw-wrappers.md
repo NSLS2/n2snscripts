@@ -45,29 +45,36 @@ read-only.
 Contribute or update skills through the deployment's documented contribution
 workflow; do not edit its deployed checkout or managed aliases directly.
 
-## Personal skills directories
+## Authoring directories
 
-Each wrapper also mounts, read-write and only when they exist, the personal
-skills directories its tool reads:
+Each wrapper mounts, read-write, the directories where its tool reads
+user-authored markdown definitions, so skills, agents, commands and prompts
+can be created and edited from inside the sandbox and persist on the host.
+The primary directories are created on the host when missing (not under
+`--dry-run`); the additional locations are mounted only when they already
+exist.
 
-| Wrapper | Personal skills directories |
-| --- | --- |
-| `bwopencode` | `~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills` |
-| `bwopencode2` | `~/.config/opencode2/opencode/skills`, `~/.claude/skills`, `~/.agents/skills` |
-| `bwclaude` | `~/.claude/skills` (`$CLAUDE_CONFIG_DIR/skills` when that is set) |
-| `bwcopilot` | `~/.agents/skills`; `~/.copilot/skills` is mounted read-write with the Copilot home |
-| `bwcodex` | `~/.codex/skills`, `~/.agents/skills` |
+| Wrapper | Primary (always created) | Additional (if present) |
+| --- | --- | --- |
+| `bwopencode` | `~/.config/opencode/{skills,agents,commands}` | `~/.claude/{skills,agents,commands}`, `~/.agents/{skills,agents}` |
+| `bwopencode2` | `~/.config/opencode2/opencode/{skills,agents,commands}` | `~/.claude/{skills,agents,commands}`, `~/.agents/{skills,agents}` |
+| `bwclaude` | `~/.claude/{skills,agents,commands}` (under `$CLAUDE_CONFIG_DIR` when that is set) | |
+| `bwcopilot` | `~/.copilot/{skills,agents}` | `~/.agents/skills` |
+| `bwcodex` | `~/.codex/{skills,prompts}` | `~/.agents/skills` |
 
-Each directory is scanned one level deep and every entry (one skill) is
-resolved with `readlink -f` and mounted at its usual path. A common setup keeps
-skills in a separate repository and symlinks each one in (for example
-`~/.agents/skills/some-skill -> ~/src/.../skills/some-skill`); that repository
-does not have to be mounted for the skill to work in the sandbox. An entry that
-resolves into a blocked location (such as `~/.ssh`), or is a directory that
-contains one, is skipped with a warning. Existing skills can be edited from
-inside the sandbox (for a symlinked skill, that edits its source repository),
-but a new top-level skill created there is discarded on exit, and skills added
-on the host while a sandbox is running do not appear in it.
+A common setup keeps skills in a separate repository and symlinks each one in
+(for example `~/.agents/skills/some-skill -> ~/src/.../skills/some-skill`).
+Each such symlink's resolved target is mounted read-write too, so the skill
+works in the sandbox and editing it edits its source repository; the rest of
+that repository is not exposed. A symlink that resolves into a blocked
+location (such as `~/.ssh`), or to a directory that contains one, is skipped
+with a warning, as is an authoring directory that does.
+
+If the authoring directory itself is a symlink (for example
+`~/.config/opencode/skills -> ~/dotfiles/skills`), its resolved target is
+mounted at the usual path, but symlinks inside it are not followed this way;
+each entry is mounted individually instead. Existing entries work, but a new
+top-level entry created in the sandbox is discarded on exit.
 
 ## Common options
 

@@ -2293,59 +2293,138 @@ build_user_bin_mount() {
     fi
 }
 
-# ── Personal skills directories (read-write) ────────────────────
-# build_personal_skills_mounts DIR...
-#   Make the user's personal skills directories (the ones the tool reads,
-#   e.g. ~/.claude/skills or ~/.agents/skills) available read-write, so the
-#   agent can update existing skills.  Missing directories are skipped.
+# ── Authoring directories (read-write, persistent) ──────────────
+# The tools let users author reusable definitions (skills, agents, commands,
+# prompts) as plain markdown under their config/home directory, and the agent
+# is expected to be able to create and edit them from inside the sandbox.  The
+# tool's home/config directory is a tmpfs, so each such directory must be
+# bind-mounted read-write from its real host location to survive the session.
 #
-#   Each DIR is scanned one level deep and every entry (one skill) is
-#   resolved with readlink -f and bound at its logical path, instead of
-#   binding DIR as one unit.  A common layout keeps the skills in a separate
-#   repository and symlinks each one in (~/.agents/skills/x -> ~/src/.../x);
-#   that repository is not otherwise mounted, so binding DIR whole would
-#   leave every such skill dangling.  An entry that resolves into a blocked
-#   location, or is a directory containing one, is skipped with a warning.
-#   A DIR already covered by an earlier bind (e.g. inside the working
-#   directory) is left alone.  Only the existing entries are host-backed: a
-#   new top-level skill created inside the sandbox lands on the tmpfs and is
+# _path_already_mounted PATH
+#   Return 0 when PATH, or one of its ancestors, is already registered in
+#   _MOUNTED_PREFIXES.
+_path_already_mounted() {
+    local _check="$1"
+    while :; do
+        [[ -n "${_MOUNTED_PREFIXES["${_check}"]:-}" ]] && return 0
+        [[ "${_check}" == "/" ]] && return 1
+        _check="${_check%/*}"
+        [[ -n "${_check}" ]] || _check="/"
+    done
+}
+
+# _mount_authoring_dir DIR CREATE KIND
+#   Mount DIR read-write.  CREATE=1 creates it on the host first (skipped
+#   under --dry-run, which must not mutate host state) so a first-time user
+#   can author into it; CREATE=0 mounts it only when it already exists.  KIND
+#   is the word used in warnings (e.g. "skill").
+#
+#   The directory is resolved with readlink -f and bound whole at its logical
+#   path, so entries created inside the sandbox persist on the host.  An
+#   entry that is a symlink (a common layout symlinks each skill in from a
+#   separate repository) would dangle, since that repository is not
+#   otherwise mounted, so each symlink's resolved target is also bound
+#   read-write at its own path.  Only that target is exposed, not the
+#   repository around it.  A target that resolves into a blocked location, or
+#   is a directory containing one, is skipped with a warning.
+#
+#   bwrap cannot bind over a symlink inside a bound directory, so when DIR
+#   itself is reached through a symlink (its resolved path differs from DIR)
+#   the symlink targets are not bound this way.  That case falls back to
+#   binding each entry individually, at its logical path, over a tmpfs
+#   directory: existing entries work, but one created inside the sandbox is
 #   discarded on exit.
 #
-#   Must be called AFTER the tool's own home mount: that mount may be a tmpfs
-#   that would hide a skills directory bound underneath it.
-build_personal_skills_mounts() {
-    local _dir _entry _real _check _covered
-    for _dir in "$@"; do
-        [[ -d "${_dir}" ]] || continue
+#   A DIR that resolves into a blocked location, contains one, or is already
+#   covered by an earlier bind (e.g. inside the working directory) is left
+#   alone.  Must be called AFTER the tool's own home mount: that mount may be
+#   a tmpfs that would hide a directory bound underneath it.
+_mount_authoring_dir() {
+    local _dir="$1" _create="$2" _kind="$3"
+    local _canon _entry _real
 
-        _covered=0
-        _check="${_dir}"
-        while :; do
-            if [[ -n "${_MOUNTED_PREFIXES["${_check}"]:-}" ]]; then
-                _covered=1
-                break
-            fi
-            [[ "${_check}" == "/" ]] && break
-            _check="${_check%/*}"
-            [[ -n "${_check}" ]] || _check="/"
-        done
-        [[ "${_covered}" -eq 0 ]] || continue
+    if [[ ! -e "${_dir}" ]]; then
+        [[ "${_create}" -eq 1 ]] || return 0
+    elif [[ ! -d "${_dir}" ]]; then
+        return 0
+    fi
 
-        _emit_home_intermediate_dirs "${_dir}" inclusive
+    _canon="$(readlink -f -- "${_dir}" 2> /dev/null || true)"
+    [[ -n "${_canon}" ]] || return 0
+    # _check_dir_contains_blocked exits on a hit, so it runs in a subshell
+    # here to skip the directory instead of aborting the launch.
+    if _bwrap_path_blocked "${_canon}" ||
+        ! (_check_dir_contains_blocked "${_canon}" "${_kind} directory") 2> /dev/null; then
+        echo "Warning: ${_kind} directory '${_dir}' resolves into or contains a blocked location (${_canon}); not mounted." >&2
+        return 0
+    fi
+    _path_already_mounted "${_dir}" && return 0
+
+    if [[ "${_create}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p -- "${_canon}"
+    fi
+
+    _emit_home_intermediate_dirs "${_dir}" inclusive
+
+    if [[ "${_canon}" != "${_dir}" ]]; then
+        [[ -d "${_canon}" ]] || return 0
         for _entry in "${_dir}"/*; do
             [[ -e "${_entry}" ]] || continue
             _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
             [[ -n "${_real}" ]] || continue
-            # _check_dir_contains_blocked exits on a hit, so it runs in a
-            # subshell here to skip the entry instead of aborting the launch.
             if _bwrap_path_blocked "${_real}" ||
-                { [[ -d "${_real}" ]] && ! (_check_dir_contains_blocked "${_real}" "skill") 2> /dev/null; }; then
-                echo "Warning: skill '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
+                { [[ -d "${_real}" ]] && ! (_check_dir_contains_blocked "${_real}" "${_kind}") 2> /dev/null; }; then
+                echo "Warning: ${_kind} '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
                 continue
             fi
             BWRAP_ARGS+=(--bind "${_real}" "${_entry}")
         done
         _MOUNTED_PREFIXES["${_dir}"]=1
+        return 0
+    fi
+
+    BWRAP_ARGS+=(--bind "${_canon}" "${_dir}")
+    _MOUNTED_PREFIXES["${_dir}"]=1
+
+    [[ -d "${_dir}" ]] || return 0
+    for _entry in "${_dir}"/*; do
+        [[ -L "${_entry}" ]] || continue
+        _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
+        [[ -n "${_real}" && -e "${_real}" ]] || continue
+        _path_already_mounted "${_real}" && continue
+        if _bwrap_path_blocked "${_real}" ||
+            { [[ -d "${_real}" ]] && ! (_check_dir_contains_blocked "${_real}" "${_kind}") 2> /dev/null; }; then
+            echo "Warning: ${_kind} '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
+            continue
+        fi
+        _emit_home_intermediate_dirs "${_real}"
+        BWRAP_ARGS+=(--bind "${_real}" "${_real}")
+        _MOUNTED_PREFIXES["${_real}"]=1
+    done
+}
+
+# build_authoring_dir_mounts KIND DIR...
+#   Mount each DIR read-write, creating it on the host when missing so
+#   authoring works out of the box.  Use for the tool's own (primary)
+#   location of each kind of definition.  KIND is "skill", "agent",
+#   "command" or "prompt".
+build_authoring_dir_mounts() {
+    local _kind="$1" _dir
+    shift
+    for _dir in "$@"; do
+        _mount_authoring_dir "${_dir}" 1 "${_kind}"
+    done
+}
+
+# build_personal_authoring_mounts KIND DIR...
+#   Mount additional locations the tool also reads (e.g. ~/.claude/skills or
+#   ~/.agents/skills) read-write.  Missing directories are skipped, not
+#   created.
+build_personal_authoring_mounts() {
+    local _kind="$1" _dir
+    shift
+    for _dir in "$@"; do
+        _mount_authoring_dir "${_dir}" 0 "${_kind}"
     done
 }
 

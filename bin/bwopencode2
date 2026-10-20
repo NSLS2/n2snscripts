@@ -13,10 +13,13 @@
 #   - Current directory: read-write
 #   - OpenCode 2 config (~/.config/opencode2/opencode): read-only (symlinks resolved);
 #     service.json / service-*.json (background-service settings) are not mounted
-#   - Personal skills (~/.config/opencode2/opencode/skills, ~/.claude/skills,
-#     ~/.agents/skills): read-write (if present); each skill is resolved
-#     individually, so skills symlinked in from elsewhere (e.g. a shared
+#   - Authoring directories (~/.config/opencode2/opencode/{skills,agents,commands}):
+#     read-write, always created on the host, so definitions authored in the
+#     sandbox persist; skills symlinked in from elsewhere (e.g. a shared
 #     skills repository) work too
+#   - Additional skills/agents/commands locations OpenCode reads
+#     (~/.claude/{skills,agents,commands}, ~/.agents/{skills,agents}):
+#     read-write, only if they already exist
 #   - OpenCode 2 data (~/.local/share/opencode2/opencode): read-write, the
 #     whole directory persists (database incl. saved sign-in, logs, ...)
 #   - OpenCode 2 cache (~/.cache/opencode2/opencode): read-write
@@ -395,14 +398,31 @@ resolve_config_symlinks() {
         # file is not mounted.
         case "${entry##*/}" in
             service*.json) continue ;;
-            # Personal skills are mounted by build_personal_skills_mounts, one
-            # skill at a time, so symlinked skills resolve in the sandbox.
-            skills) continue ;;
+            # Authoring directories are mounted read-write by
+            # build_opencode2_authoring_mounts; a read-only bind here would
+            # shadow that.
+            skills | agents | commands) continue ;;
         esac
         _bwrap_canonicalize_safe "${entry}" "opencode2 config entry '${entry}'"
         local_resolved="${_BWRAP_CANON}"
         OC2_CONFIG_BINDS+=("--ro-bind" "${local_resolved}" "${entry}")
     done
+}
+
+# ── OpenCode 2 authoring directories (read-write, persistent) ────
+# skills/, agents/ and commands/ under the OpenCode 2 config directory hold
+# user-authored markdown definitions.  They are created on the host when
+# missing and mounted read-write so the agent can create and edit them from
+# inside the sandbox.  The Claude- and agent-compatible locations OpenCode
+# also reads are mounted read-write only if they already exist.  Must run
+# AFTER build_opencode2_config_mount (which creates the config directory).
+build_opencode2_authoring_mounts() {
+    build_authoring_dir_mounts skill   "${OC2_CONFIG_DIR}/skills"
+    build_authoring_dir_mounts agent   "${OC2_CONFIG_DIR}/agents"
+    build_authoring_dir_mounts command "${OC2_CONFIG_DIR}/commands"
+    build_personal_authoring_mounts skill   "${_HOME}/.claude/skills" "${_HOME}/.agents/skills"
+    build_personal_authoring_mounts agent   "${_HOME}/.claude/agents" "${_HOME}/.agents/agents"
+    build_personal_authoring_mounts command "${_HOME}/.claude/commands"
 }
 
 # ── Managed OpenCode config (read-only, highest priority) ────────
@@ -721,7 +741,7 @@ main() {
     build_workdir_mount
     build_persistent_dotdir
     build_opencode2_config_mount
-    build_personal_skills_mounts "${OC2_CONFIG_DIR}/skills" "${_HOME}/.claude/skills" "${_HOME}/.agents/skills"
+    build_opencode2_authoring_mounts
     build_opencode2_data_mount
     build_opencode2_cache_mount
     build_opencode2_state_dir

@@ -38,8 +38,9 @@
 #     - auth.json: bind-mounted read-write only if it already exists on host;
 #         --init-auth creates a {} stub for first-time ChatGPT-login setup
 #     - Everything else (tmp/, state.toml, features/, ...): tmpfs, discarded on exit
-#   - Personal skills (~/.codex/skills, ~/.agents/skills): read-write (if
-#     present); each skill is resolved individually, so skills symlinked in
+#   - Authoring directories (~/.codex/skills, ~/.codex/prompts): read-write,
+#     always created on the host, so definitions authored in the sandbox
+#     persist; ~/.agents/skills: read-write (if present).  Skills symlinked in
 #     from elsewhere (e.g. a shared skills repository) work too
 #   - /etc/codex/config.toml: system-wide provider/defaults config (if
 #       present); bind-mounted read-only.  Codex layers user config on
@@ -267,6 +268,7 @@ resolve_codex_paths() {
     CODEX_SESSIONS_DIR="${CODEX_HOME_DIR}/sessions"
     CODEX_LOG_DIR="${CODEX_HOME_DIR}/log"
     CODEX_SKILLS_DIR="${CODEX_HOME_DIR}/skills"
+    CODEX_PROMPTS_DIR="${CODEX_HOME_DIR}/prompts"
     CODEX_HISTORY_FILE="${CODEX_HOME_DIR}/history.jsonl"
     CODEX_DAEMON_SETTINGS_FILE="${CODEX_HOME_DIR}/app-server-daemon/settings.json"
 
@@ -300,6 +302,18 @@ check_codex_config() {
         printf '       https://docs.nsls2.bnl.gov/docs/how-to/codex.html\n' >&2
         exit 2
     fi
+}
+
+# ── Codex authoring directories (read-write, persistent) ──────────
+# skills/ and prompts/ hold user-authored markdown definitions.  They are
+# created on the host when missing and mounted read-write so the agent can
+# create and edit them from inside the sandbox.  ~/.agents/skills is an
+# additional skills location, mounted only if it already exists.  Must run
+# AFTER build_codex_home_mount (the home is a tmpfs that would hide them).
+build_codex_authoring_mounts() {
+    build_authoring_dir_mounts skill  "${CODEX_SKILLS_DIR}"
+    build_authoring_dir_mounts prompt "${CODEX_PROMPTS_DIR}"
+    build_personal_authoring_mounts skill "${_HOME}/.agents/skills"
 }
 
 # ── Managed Codex skills (read-only) ──────────────────────────────
@@ -537,7 +551,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_codex_home_mount
-    build_personal_skills_mounts "${CODEX_SKILLS_DIR}" "${_HOME}/.agents/skills"
+    build_codex_authoring_mounts
     build_git_mounts
     build_pixi_mounts
     build_ccache_mounts

@@ -10,15 +10,13 @@
 #   - Copilot home (~/.copilot or $COPILOT_HOME): tmpfs (ephemeral by default)
 #     - session-state/: bind-mounted read-write (persistent)
 #     - logs/: bind-mounted read-write (persistent)
-#     - skills/: bind-mounted read-write (user-created skill definitions)
-#     - agents/: bind-mounted read-write (user-created custom agents)
+#     - skills/, agents/: bind-mounted read-write, always created on the host
+#         (user-authored definitions; persist across sessions)
 #     - installed-plugins/: bind-mounted read-only (prevents agent from installing plugins)
 #     - config.json: COPIED into tmpfs (host auth available, changes ephemeral)
 #     - Use --init-auth to make config.json persistent (for personal machines)
-#   - Personal skills (~/.agents/skills): read-write (if present); each skill
-#     is resolved individually, so skills symlinked in from elsewhere (e.g. a
-#     shared skills repository) work too (~/.copilot/skills is the skills/
-#     bind above)
+#   - Personal skills (~/.agents/skills): read-write (if present); skills
+#     symlinked in from elsewhere (e.g. a shared skills repository) work too
 #   - Copilot cache (~/.cache/copilot or $COPILOT_CACHE_HOME): read-write
 #   - GitHub CLI auth (~/.config/gh/hosts.yml): read-only (if it exists)
 #   - Git config + includes: read-only
@@ -247,8 +245,6 @@ ensure_host_dirs() {
     mkdir -p "${COPILOT_HOME_DIR}" "${COPILOT_CACHE_DIR}"
     # Create persistent subdirectories for bind-mounts
     mkdir -p "${COPILOT_SESSION_DIR}" "${COPILOT_LOGS_DIR}"
-    # Create user-writable customization directories
-    mkdir -p "${COPILOT_HOME_DIR}/skills" "${COPILOT_HOME_DIR}/agents"
 }
 
 # ── Copilot home (ephemeral tmpfs + selective persistence) ──────
@@ -264,8 +260,7 @@ ensure_host_dirs() {
 # Persistent read-write:
 #   - session-state/: per-session checkpoints, events, database
 #   - logs/: process logs
-#   - skills/: user-created skill definitions (SKILL.md files)
-#   - agents/: user-created custom agent profiles (*.agent.md files)
+#   - skills/, agents/: mounted by build_copilot_authoring_mounts
 #
 # Persistent read-only:
 #   - mcp-config.json, lsp-config.json: user preferences (if they exist)
@@ -298,15 +293,8 @@ build_copilot_home_mount() {
         fi
     done
 
-    # Bind-mount user-writable customization directories (read-write).
-    # Skills and agents are user-created files, not installed packages.
-    # ensure_host_dirs always creates both directories, so no existence
-    # check is needed (on --dry-run the directories may not exist yet,
-    # but the bind args are still emitted for accurate dry-run output).
-    local _cust_dir
-    for _cust_dir in skills agents; do
-        BWRAP_ARGS+=(--bind "${COPILOT_HOME_DIR}/${_cust_dir}" "${COPILOT_HOME_DIR}/${_cust_dir}")
-    done
+    # skills/ and agents/ (user-authored, read-write) are mounted by
+    # build_copilot_authoring_mounts, which runs after this function.
 
     # Handle config.json: copy or bind depending on --init-auth.
     # File creation is skipped on --dry-run to keep that mode side-effect-free.
@@ -357,6 +345,18 @@ build_copilot_settings_mount() {
     # needed for this file bind.  This also works when source and destination
     # are the same path.
     BWRAP_ARGS+=(--ro-bind "${_settings_source}" "${_settings_file}")
+}
+
+# ── Copilot authoring directories (read-write, persistent) ─────────
+# skills/ and agents/ hold user-authored markdown definitions.  They are
+# created on the host when missing and mounted read-write so the agent can
+# create and edit them from inside the sandbox.  ~/.agents/skills is an
+# additional skills location, mounted only if it already exists.  Must run
+# AFTER build_copilot_home_mount (the home is a tmpfs that would hide them).
+build_copilot_authoring_mounts() {
+    build_authoring_dir_mounts skill "${COPILOT_HOME_DIR}/skills"
+    build_authoring_dir_mounts agent "${COPILOT_HOME_DIR}/agents"
+    build_personal_authoring_mounts skill "${_HOME}/.agents/skills"
 }
 
 # ── Copilot cache (read-write) ──────────────────────────────────
@@ -444,7 +444,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_copilot_home_mount
-    build_personal_skills_mounts "${_HOME}/.agents/skills"
+    build_copilot_authoring_mounts
     build_copilot_cache_mount
     build_gh_auth_mount
     build_git_mounts

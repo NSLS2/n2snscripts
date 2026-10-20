@@ -28,9 +28,10 @@
 #     the OAuth session (if any), per-project trust decisions and personal MCP
 #     server definitions.  KNOWN GAP: a session can add an MCP server or a trust
 #     decision here that unsandboxed claude will honour later.
-#   - Personal skills (~/.claude/skills, or $CLAUDE_CONFIG_DIR/skills):
-#     read-write (if present); each skill is resolved individually, so skills
-#     symlinked in from elsewhere (e.g. a shared skills repository) work too
+#   - Authoring directories (skills/, agents/, commands/ under the Claude home):
+#     read-write, always created on the host, so definitions authored in the
+#     sandbox persist; skills symlinked in from elsewhere (e.g. a shared skills
+#     repository) work too
 #   - Claude cache ($XDG_CACHE_HOME/claude, default ~/.cache/claude): read-write
 #   - Git config + includes: read-only
 #   - Pixi cache: read-write
@@ -367,6 +368,17 @@ build_claude_home_mount() {
     fi
 }
 
+# ── Claude authoring directories (read-write, persistent) ────────
+# skills/, agents/ and commands/ hold user-authored markdown definitions.
+# They are created on the host when missing and mounted read-write so the
+# agent can create and edit them from inside the sandbox.  Must run AFTER
+# build_claude_home_mount (the home is a tmpfs that would hide them).
+build_claude_authoring_mounts() {
+    build_authoring_dir_mounts skill   "${CLAUDE_HOME_DIR}/skills"
+    build_authoring_dir_mounts agent   "${CLAUDE_HOME_DIR}/agents"
+    build_authoring_dir_mounts command "${CLAUDE_HOME_DIR}/commands"
+}
+
 # ── Claude cache (read-write) ────────────────────────────────────
 build_claude_cache_mount() {
     BWRAP_ARGS+=(--bind "${CLAUDE_CACHE_DIR}" "${CLAUDE_CACHE_DIR}")
@@ -534,7 +546,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_claude_home_mount
-    build_personal_skills_mounts "${CLAUDE_HOME_DIR}/skills"
+    build_claude_authoring_mounts
     build_claude_cache_mount
     build_git_mounts
     build_pixi_mounts
