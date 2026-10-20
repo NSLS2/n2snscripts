@@ -579,23 +579,68 @@ bwrap_resolve_tool() {
     exit 1
 }
 
+# _expand_leading_tilde VALUE
+#   Print VALUE with only a LEADING tilde expanded:
+#     "~" / "~/path"        -> $HOME / $HOME/path
+#     "~user" / "~user/p"   -> that user's home (getent passwd) [+ /p]
+#     anything else         -> VALUE unchanged
+#   Returns 1 (printing nothing) when a ~user reference cannot be resolved.
+#   A blind ${VALUE/#\~/${_HOME}} substitution turns "~alice/foo" into
+#   "${HOME}alice/foo", silently corrupting the path.
+_expand_leading_tilde() {
+    local value="$1" _rest _user _subpath="" _uhome
+    # The patterns match a literal leading tilde (SC2088 false positive).
+    # shellcheck disable=SC2088
+    case "${value}" in
+        "~")
+            printf '%s' "${_HOME}"
+            ;;
+        "~/"*)
+            printf '%s' "${_HOME}/${value#\~/}"
+            ;;
+        "~"*)
+            _rest="${value#\~}"
+            _user="${_rest%%/*}"
+            [[ "${_rest}" == */* ]] && _subpath="/${_rest#*/}"
+            _uhome="$(getent passwd "${_user}" 2> /dev/null | cut -d: -f6)"
+            [[ -n "${_uhome}" ]] || return 1
+            printf '%s' "${_uhome}${_subpath}"
+            ;;
+        *)
+            printf '%s' "${value}"
+            ;;
+    esac
+}
+
 # ── Dynamic mount helpers ────────────────────────────────────────
 # _MOUNTED_PREFIXES: tracks directory trees already covered by a bwrap
 # bind so we never emit duplicate (or redundant sub-path) mounts.
 # Keys are canonical paths; value is always 1.
 # Pre-populated with unconditional mounts in build_dynamic_tool_mounts.
 
-# _get_npm_prefix
-#   Echo the npm global prefix (`npm prefix -g`), caching the result so the
-#   subprocess is forked at most once per run even when several symlinked
-#   tools are resolved.  Echoes the empty string if npm is not installed or
-#   the lookup fails.
-_get_npm_prefix() {
-    if [[ "${_NPM_PREFIX_RESOLVED}" -eq 0 ]]; then
+# _resolve_npm_prefix
+#   Set _NPM_PREFIX to the npm global prefix (`npm prefix -g`), forking npm
+#   at most once per run; empty if npm is absent or the lookup fails.
+#   Must NOT be called inside $(...): the cache globals would be set in the
+#   subshell and lost, so npm would run again on every lookup.  Callers invoke
+#   it directly and then read ${_NPM_PREFIX}.
+#   `npm prefix -g` writes a log under $npm_config_cache/_logs (default
+#   ~/.npm/_logs); the cache is pointed at a throwaway directory so no run,
+#   including --dry-run, leaves that behind on the host.
+_resolve_npm_prefix() {
+    [[ "${_NPM_PREFIX_RESOLVED}" -eq 1 ]] && return 0
+    _NPM_PREFIX_RESOLVED=1
+    _NPM_PREFIX=""
+    command -v npm > /dev/null 2>&1 || return 0
+
+    local _npm_tmp
+    _npm_tmp="$(mktemp -d 2> /dev/null || true)"
+    if [[ -n "${_npm_tmp}" ]]; then
+        _NPM_PREFIX="$(npm_config_cache="${_npm_tmp}" npm prefix -g 2> /dev/null || true)"
+        rm -rf -- "${_npm_tmp}"
+    else
         _NPM_PREFIX="$(npm prefix -g 2> /dev/null || true)"
-        _NPM_PREFIX_RESOLVED=1
     fi
-    printf '%s' "${_NPM_PREFIX}"
 }
 
 # _emit_home_intermediate_dirs DIR [MODE]
@@ -704,9 +749,14 @@ resolve_and_mount_tool() {
 
     if [[ -L "${bin_path}" ]]; then
         real_path="$(readlink -f "${bin_path}")"
-        npm_prefix="$(_get_npm_prefix)"
+        _resolve_npm_prefix
+        npm_prefix="${_NPM_PREFIX}"
         if [[ -n "${npm_prefix}" ]] && [[ "${real_path}" == "${npm_prefix}"/* ]]; then
-            # npm-installed: mount the whole prefix so lib/node_modules is reachable.
+            # npm-installed: mount the whole prefix so lib/node_modules is
+            # reachable.  Also mount the on-PATH directory holding the symlink
+            # (e.g. ~/.local/bin/claude -> npm prefix): otherwise the path the
+            # tool is invoked by does not exist inside the sandbox.
+            _mount_ro_dir_if_needed "${cmd_dir}"
             _mount_npm_global_prefix "${npm_prefix}"
             return 0
         fi
@@ -729,7 +779,8 @@ resolve_and_mount_tool() {
 _mount_npm_global_prefix() {
     local npm_prefix="${1:-}"
     if [[ -z "${npm_prefix}" ]]; then
-        npm_prefix="$(_get_npm_prefix)"
+        _resolve_npm_prefix
+        npm_prefix="${_NPM_PREFIX}"
     fi
     [[ -n "${npm_prefix}" ]] && [[ -d "${npm_prefix}" ]] || return 0
 
@@ -815,7 +866,26 @@ parse_git_includes() {
     # Extract path values from [include] and [includeIf "..."] sections.
     # Matches lines like:  path = /some/path  or  path = ~/relative
     # Pure bash — no grep/sed/xargs subprocesses.
+    #
+    # `path` is only an include directive inside an include section: git's
+    # parser is section-scoped, and a `path =` key elsewhere (for example
+    # [difftool "x"] path = ...) must not be mounted, nor abort the launcher
+    # when it points into a blocked location.  Section names are
+    # case-insensitive; a key may follow the header on the same line.
+    local _section_re='^[[:space:]]*\[[[:space:]]*([A-Za-z0-9.-]+)([[:space:]]+"([^"\\]|\\.)*")?[[:space:]]*\](.*)$'
+    local _section_name in_include=0
     while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ${_section_re} ]]; then
+            _section_name="${BASH_REMATCH[1],,}"
+            line="${BASH_REMATCH[4]}"
+            if [[ "${_section_name}" == "include" || "${_section_name}" == "includeif" ]]; then
+                in_include=1
+            else
+                in_include=0
+            fi
+        fi
+        [[ "${in_include}" -eq 1 ]] || continue
+
         # git variable names are case-insensitive.  The value is decoded the
         # way git does (quotes, escapes, trailing comments) before anything is
         # derived from it; an undecodable value is skipped.
@@ -824,8 +894,9 @@ parse_git_includes() {
         local path_val="${_BWRAP_GIT_VALUE}"
         [[ -z "${path_val}" ]] && continue
 
-        # Resolve ~/ prefix
-        path_val="${path_val/#\~/${_HOME}}"
+        # Expand a leading ~ or ~user (git does both); skip the include when
+        # ~user cannot be resolved rather than corrupting the path.
+        path_val="$(_expand_leading_tilde "${path_val}")" || continue
 
         # Resolve relative paths (relative to the config file's directory)
         if [[ "${path_val}" != /* ]]; then
@@ -1243,15 +1314,20 @@ _bwrap_include_lexical_path() {
 #   On failure: prints an error to stderr and exits 1.
 #
 #   Steps:
-#     1. Expand leading ~/ then resolve to canonical path via readlink -f.
+#     1. Expand a leading ~ or ~user, then resolve to a canonical path via
+#        readlink -f.
 #     2. Verify the path exists on the host.
 #     3. Delegate safety checks to _check_path_safe.
 validate_extra_path() {
     local raw_path="$1"
     local mode="$2"
 
-    # Expand a leading ~/ to $HOME (readlink -f won't do this for us).
-    local expanded_path="${raw_path/#\~/${_HOME}}"
+    # Expand a leading ~ or ~user (readlink -f won't do this for us).
+    local expanded_path
+    if ! expanded_path="$(_expand_leading_tilde "${raw_path}")"; then
+        echo "Error: --${mode}-path '${raw_path}': cannot resolve the '~user' home directory." >&2
+        exit 1
+    fi
 
     # Resolve to canonical path (follows symlinks, removes . and ..).
     local canon
