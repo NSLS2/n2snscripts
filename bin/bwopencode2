@@ -730,7 +730,6 @@ main() {
 
     # Build bwrap argument list
     build_base_sandbox
-    build_binary_masks
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
@@ -755,6 +754,10 @@ main() {
     build_opencode2_install_mount
     build_dynamic_tool_mounts
     build_extra_path_mounts
+
+    # Mask dangerous binaries last: an earlier mask is hidden by any later
+    # bind that covers it (e.g. --ro-path /usr or /usr/bin).
+    build_binary_masks
 
     # Environment variables
     build_env_vars

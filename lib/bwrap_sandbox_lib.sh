@@ -1722,6 +1722,10 @@ build_base_sandbox() {
 # an existing read-only bind mount.  On older versions, we skip masking
 # entirely (the binaries remain accessible inside the sandbox).
 #
+# Must be called AFTER every other mount step, including user --ro-path /
+# --rw-path: a bind that covers a masked binary's directory (e.g. --ro-path
+# /usr or /usr/bin) emitted afterwards would hide the mask.
+#
 # Categories:
 #   SSH           – lateral movement via remote shell / file transfer
 #   Network       – arbitrary TCP/UDP connections, reverse shells
