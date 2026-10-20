@@ -152,6 +152,17 @@ _BWRAP_XDG_GIT_HAS_FILES=0
 _BIND_DIR=""
 _GIT_ROOT=""
 
+# Common paths (set by resolve_common_paths).  _HOME is the logical $HOME;
+# _HOME_CANON is its readlink -f form.  They differ when home is reached
+# through a symlink (NFS/automount), and the $HOME-or-ancestor check must
+# consult both because candidate paths are canonicalized before it runs.
+# _PWD is the physical (pwd -P) working directory.  _USER is $USER, which can
+# be unset under `set -u` (cron/CI), with a fallback to bwrap_account_name.
+_HOME=""
+_HOME_CANON=""
+_PWD=""
+_USER=""
+
 # ═══════════════════════════════════════════════════════════════════
 # Shared helper functions
 # ═══════════════════════════════════════════════════════════════════
@@ -602,9 +613,18 @@ _get_npm_prefix() {
 #                  file bind, or a read-write directory bind point).
 _emit_home_intermediate_dirs() {
     local dir="$1" mode="${2:-ancestors}"
-    [[ "${dir}" == "${_HOME}"/* ]] || return 0
-    local _rel="${dir#"${_HOME}"/}"
-    local _accum="${_HOME}"
+    # A canonicalized bind target can sit under _HOME_CANON rather than the
+    # logical _HOME when home is symlinked; match against both.
+    local _home_base
+    if [[ "${dir}" == "${_HOME}"/* ]]; then
+        _home_base="${_HOME}"
+    elif [[ -n "${_HOME_CANON}" && "${dir}" == "${_HOME_CANON}"/* ]]; then
+        _home_base="${_HOME_CANON}"
+    else
+        return 0
+    fi
+    local _rel="${dir#"${_home_base}"/}"
+    local _accum="${_home_base}"
     local _parts _i _last
     IFS='/' read -ra _parts <<< "${_rel}"
     if [[ "${mode}" == "inclusive" ]]; then
@@ -644,10 +664,14 @@ _mount_ro_dir_if_needed() {
         [[ -z "${check}" ]] && check="/"
     done
 
-    # Safety check before emitting the mount.  DIR is already a real
-    # directory path (callers pass dirname() of a resolved binary or a
-    # known path), so no additional readlink -f is needed.
-    _check_path_safe "${dir}" "dynamic mount"
+    # Safety check before emitting the mount, judged on the canonical target:
+    # DIR can be a symlinked on-PATH directory (e.g. ~/bin2 -> ~/.ssh) and
+    # bwrap follows the symlink when binding.  DIR itself is still the mount
+    # point, so the tool stays reachable at the path it is invoked by.
+    local _dir_canon
+    _dir_canon="$(readlink -f -- "${dir}" 2> /dev/null || true)"
+    [[ -n "${_dir_canon}" ]] || _dir_canon="${dir}"
+    _check_path_safe "${_dir_canon}" "dynamic mount"
 
     # Create intermediate --dir entries for paths under $HOME (the
     # tmpfs $HOME has no subdirectories yet).  DIR is the bind mount point,
@@ -953,8 +977,11 @@ _bwrap_path_blocked() {
 
     # Reject if canon IS $HOME or is a directory that contains $HOME
     # (i.e. /, /home, the username's parent dir, etc.).
-    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.
-    if _is_prefix_of "${canon}" "${_HOME}"; then
+    # "_is_prefix_of canon _HOME" means: canon is a prefix of _HOME.  The
+    # canonical home is checked too: with a symlinked home (/home/u ->
+    # /nfs/home/u) a canonical candidate /nfs/home/u is not a prefix of _HOME.
+    if _is_prefix_of "${canon}" "${_HOME}" ||
+        { [[ -n "${_HOME_CANON}" ]] && _is_prefix_of "${canon}" "${_HOME_CANON}"; }; then
         _BWRAP_BLOCKED_KIND="home"
         return 0
     fi
@@ -1306,7 +1333,14 @@ build_extra_path_mounts() {
 
 resolve_common_paths() {
     _HOME="${HOME}"
-    _PWD="${PWD}"
+    _HOME_CANON="$(readlink -f -- "${HOME}" 2> /dev/null || true)"
+    [[ -n "${_HOME_CANON}" ]] || _HOME_CANON="${HOME}"
+    # Physical working directory, so PWD in the sandbox agrees with the
+    # canonical working-directory bind (git rev-parse also returns physical
+    # paths).
+    _PWD="$(pwd -P 2> /dev/null || true)"
+    [[ -n "${_PWD}" ]] || _PWD="${PWD}"
+    _USER="${USER:-$(bwrap_account_name)}"
 
     # XDG defaults
     XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${_HOME}/.config}"
@@ -1676,20 +1710,23 @@ build_workdir_mount() {
         _BIND_DIR="${_GIT_ROOT}"
     fi
 
+    # Canonicalize before the safety checks.  pwd -P and git rev-parse already
+    # return physical paths, but resolving once more guarantees a symlinked
+    # working directory (e.g. a symlink into ~/.ssh) cannot reach
+    # _check_path_safe in its logical form.
+    local _bind_canon
+    _bind_canon="$(readlink -f -- "${_BIND_DIR}" 2> /dev/null || true)"
+    [[ -n "${_bind_canon}" ]] && _BIND_DIR="${_bind_canon}"
+
     # Guard: reject dangerous working / git-root directories via the same
     # rules applied to --ro-path / --rw-path.  This catches $HOME itself,
     # ancestors of $HOME (/home, /), /root, ~/.ssh, and all other blocked
-    # prefixes.  _BIND_DIR comes from git rev-parse or $PWD — both are
-    # already canonical paths, so no readlink -f step is needed here.
+    # prefixes.
     _check_path_safe "${_BIND_DIR}" "working directory"
 
     # A directory that CONTAINS a blocked location (e.g. ~/.config with
-    # ~/.config/gh) is refused too: the whole tree is bound read-write.  The
-    # check runs on the canonical path.
-    local _bind_canon
-    _bind_canon="$(readlink -f -- "${_BIND_DIR}" 2> /dev/null || true)"
-    [[ -n "${_bind_canon}" ]] || _bind_canon="${_BIND_DIR}"
-    _check_dir_contains_blocked "${_bind_canon}" "working directory"
+    # ~/.config/gh) is refused too: the whole tree is bound read-write.
+    _check_dir_contains_blocked "${_BIND_DIR}" "working directory"
 
     # If the bind dir is under HOME, create intermediate directories in the
     # tmpfs so the bind mount point is reachable.  _BIND_DIR is itself the
@@ -2155,8 +2192,8 @@ build_env_vars() {
     # Always set
     BWRAP_ARGS+=(
         --setenv HOME "${_HOME}"
-        --setenv USER "${USER}"
-        --setenv LOGNAME "${USER}"
+        --setenv USER "${_USER}"
+        --setenv LOGNAME "${_USER}"
         --setenv SHELL "${SANDBOX_SHELL}"
         --setenv PATH "${SANDBOX_PATH}"
         --setenv PWD "${_PWD}"
@@ -2290,8 +2327,8 @@ print_dry_run() {
     #   exec <env_bin> -i <vars> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
     printf "exec %s -i \\\\\n" "${_ENV_BIN}"
     printf "  HOME=%q \\\\\n"    "${_HOME}"
-    printf "  USER=%q \\\\\n"    "${USER}"
-    printf "  LOGNAME=%q \\\\\n" "${USER}"
+    printf "  USER=%q \\\\\n"    "${_USER}"
+    printf "  LOGNAME=%q \\\\\n" "${_USER}"
     printf "  PATH=%q \\\\\n"    "/usr/bin:/bin"
     printf "  LANG=%q \\\\\n"    "${LANG:-C.UTF-8}"
     printf "  LC_CTYPE=%q \\\\\n" "${LC_CTYPE:-C.UTF-8}"
@@ -2341,8 +2378,8 @@ launch_sandbox() {
 
     exec "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
-        USER="${USER}" \
-        LOGNAME="${USER}" \
+        USER="${_USER}" \
+        LOGNAME="${_USER}" \
         PATH="/usr/bin:/bin" \
         LANG="${LANG:-C.UTF-8}" \
         LC_CTYPE="${LC_CTYPE:-C.UTF-8}" \
