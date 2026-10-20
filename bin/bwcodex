@@ -32,17 +32,19 @@
 #         bind-mounted RW so writes persist across sessions at the cost of
 #         weaker isolation.  Either the user file or the system file
 #         (/etc/codex/config.toml) is sufficient for fail-fast.
+#     - AGENTS.md: bind-mounted read-only (if it exists)
+#     - packages/: bind-mounted read-only (if it exists, installer cache)
+#     - auth.json: bind-mounted read-write only if it already exists on host;
+#         --init-auth creates a {} stub for first-time ChatGPT-login setup
+#     - Everything else (tmp/, state.toml, features/, ...): tmpfs, discarded on exit
+#   - Personal skills (~/.codex/skills, ~/.agents/skills): read-write (if
+#     present); each skill is resolved individually, so skills symlinked in
+#     from elsewhere (e.g. a shared skills repository) work too
 #   - /etc/codex/config.toml: system-wide provider/defaults config (if
 #       present); bind-mounted read-only.  Codex layers user config on
 #       top of this file.
 #   - /etc/codex/requirements.toml: admin-enforced restrictions (if
 #       present); bind-mounted read-only.  Users cannot loosen these.
-#     - AGENTS.md: bind-mounted read-only (if it exists)
-#     - skills/: bind-mounted read-only (if it exists)
-#     - packages/: bind-mounted read-only (if it exists, installer cache)
-#     - auth.json: bind-mounted read-write only if it already exists on host;
-#         --init-auth creates a {} stub for first-time ChatGPT-login setup
-#     - Everything else (tmp/, state.toml, features/, ...): tmpfs, discarded on exit
 #   - Codex CLI binary + npm prefix: read-only (handled by build_dynamic_tool_mounts)
 #   - Git config + includes: read-only
 #   - Pixi cache: read-write
@@ -385,10 +387,6 @@ build_codex_home_mount() {
         BWRAP_ARGS+=(--ro-bind "${CODEX_AGENTS_FILE}" "${CODEX_AGENTS_FILE}")
     fi
 
-    if [[ -d "${CODEX_SKILLS_DIR}" ]]; then
-        BWRAP_ARGS+=(--ro-bind "${CODEX_SKILLS_DIR}" "${CODEX_SKILLS_DIR}")
-    fi
-
     if [[ -d "${CODEX_PACKAGES_DIR}" ]]; then
         BWRAP_ARGS+=(--ro-bind "${CODEX_PACKAGES_DIR}" "${CODEX_PACKAGES_DIR}")
     fi
@@ -521,6 +519,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_codex_home_mount
+    build_personal_skills_mounts "${CODEX_SKILLS_DIR}" "${_HOME}/.agents/skills"
     build_git_mounts
     build_pixi_mounts
     build_ccache_mounts

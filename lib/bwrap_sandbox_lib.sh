@@ -2293,6 +2293,62 @@ build_user_bin_mount() {
     fi
 }
 
+# ── Personal skills directories (read-write) ────────────────────
+# build_personal_skills_mounts DIR...
+#   Make the user's personal skills directories (the ones the tool reads,
+#   e.g. ~/.claude/skills or ~/.agents/skills) available read-write, so the
+#   agent can update existing skills.  Missing directories are skipped.
+#
+#   Each DIR is scanned one level deep and every entry (one skill) is
+#   resolved with readlink -f and bound at its logical path, instead of
+#   binding DIR as one unit.  A common layout keeps the skills in a separate
+#   repository and symlinks each one in (~/.agents/skills/x -> ~/src/.../x);
+#   that repository is not otherwise mounted, so binding DIR whole would
+#   leave every such skill dangling.  An entry that resolves into a blocked
+#   location, or is a directory containing one, is skipped with a warning.
+#   A DIR already covered by an earlier bind (e.g. inside the working
+#   directory) is left alone.  Only the existing entries are host-backed: a
+#   new top-level skill created inside the sandbox lands on the tmpfs and is
+#   discarded on exit.
+#
+#   Must be called AFTER the tool's own home mount: that mount may be a tmpfs
+#   that would hide a skills directory bound underneath it.
+build_personal_skills_mounts() {
+    local _dir _entry _real _check _covered
+    for _dir in "$@"; do
+        [[ -d "${_dir}" ]] || continue
+
+        _covered=0
+        _check="${_dir}"
+        while :; do
+            if [[ -n "${_MOUNTED_PREFIXES["${_check}"]:-}" ]]; then
+                _covered=1
+                break
+            fi
+            [[ "${_check}" == "/" ]] && break
+            _check="${_check%/*}"
+            [[ -n "${_check}" ]] || _check="/"
+        done
+        [[ "${_covered}" -eq 0 ]] || continue
+
+        _emit_home_intermediate_dirs "${_dir}" inclusive
+        for _entry in "${_dir}"/*; do
+            [[ -e "${_entry}" ]] || continue
+            _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
+            [[ -n "${_real}" ]] || continue
+            # _check_dir_contains_blocked exits on a hit, so it runs in a
+            # subshell here to skip the entry instead of aborting the launch.
+            if _bwrap_path_blocked "${_real}" ||
+                { [[ -d "${_real}" ]] && ! (_check_dir_contains_blocked "${_real}" "skill") 2> /dev/null; }; then
+                echo "Warning: skill '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
+                continue
+            fi
+            BWRAP_ARGS+=(--bind "${_real}" "${_entry}")
+        done
+        _MOUNTED_PREFIXES["${_dir}"]=1
+    done
+}
+
 # ── NSLS-II software (read-only) ────────────────────────────────
 # Only bind if the directory exists on the host system.
 build_nsls2_mount() {

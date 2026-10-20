@@ -13,6 +13,10 @@
 #   - Current directory: read-write
 #   - OpenCode 2 config (~/.config/opencode2/opencode): read-only (symlinks resolved);
 #     service.json / service-*.json (background-service settings) are not mounted
+#   - Personal skills (~/.config/opencode2/opencode/skills, ~/.claude/skills,
+#     ~/.agents/skills): read-write (if present); each skill is resolved
+#     individually, so skills symlinked in from elsewhere (e.g. a shared
+#     skills repository) work too
 #   - OpenCode 2 data (~/.local/share/opencode2/opencode): read-write, the
 #     whole directory persists (database incl. saved sign-in, logs, ...)
 #   - OpenCode 2 cache (~/.cache/opencode2/opencode): read-write
@@ -391,6 +395,9 @@ resolve_config_symlinks() {
         # file is not mounted.
         case "${entry##*/}" in
             service*.json) continue ;;
+            # Personal skills are mounted by build_personal_skills_mounts, one
+            # skill at a time, so symlinked skills resolve in the sandbox.
+            skills) continue ;;
         esac
         _bwrap_canonicalize_safe "${entry}" "opencode2 config entry '${entry}'"
         local_resolved="${_BWRAP_CANON}"
@@ -714,6 +721,7 @@ main() {
     build_workdir_mount
     build_persistent_dotdir
     build_opencode2_config_mount
+    build_personal_skills_mounts "${OC2_CONFIG_DIR}/skills" "${_HOME}/.claude/skills" "${_HOME}/.agents/skills"
     build_opencode2_data_mount
     build_opencode2_cache_mount
     build_opencode2_state_dir

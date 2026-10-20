@@ -8,6 +8,10 @@
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write
 #   - OpenCode config: read-only (symlinks resolved)
+#   - Personal skills (~/.config/opencode/skills, ~/.claude/skills,
+#     ~/.agents/skills): read-write (if present); each skill is resolved
+#     individually, so skills symlinked in from elsewhere (e.g. a shared
+#     skills repository) work too
 #   - OpenCode data dir: ephemeral tmpfs with selective persistence
 #       - auth.json: persisted only if it already exists on host;
 #         otherwise created in tmpfs (discarded on exit)
@@ -249,6 +253,9 @@ resolve_config_symlinks() {
     local entry local_resolved
     for entry in "${OC_CONFIG_DIR}"/*; do
         [[ -e "${entry}" ]] || continue
+        # Personal skills are mounted by build_personal_skills_mounts, one
+        # skill at a time, so symlinked skills resolve in the sandbox.
+        [[ "${entry##*/}" == skills ]] && continue
         _bwrap_canonicalize_safe "${entry}" "opencode config entry '${entry}'"
         local_resolved="${_BWRAP_CANON}"
         OC_CONFIG_BINDS+=("--ro-bind" "${local_resolved}" "${entry}")
@@ -526,6 +533,7 @@ main() {
     build_workdir_mount
     build_persistent_dotdir
     build_opencode_config_mount
+    build_personal_skills_mounts "${OC_CONFIG_DIR}/skills" "${_HOME}/.claude/skills" "${_HOME}/.agents/skills"
     build_opencode_data_mounts
     build_opencode_cache_mount
     build_git_mounts

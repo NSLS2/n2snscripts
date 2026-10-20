@@ -15,6 +15,10 @@
 #     - installed-plugins/: bind-mounted read-only (prevents agent from installing plugins)
 #     - config.json: COPIED into tmpfs (host auth available, changes ephemeral)
 #     - Use --init-auth to make config.json persistent (for personal machines)
+#   - Personal skills (~/.agents/skills): read-write (if present); each skill
+#     is resolved individually, so skills symlinked in from elsewhere (e.g. a
+#     shared skills repository) work too (~/.copilot/skills is the skills/
+#     bind above)
 #   - Copilot cache (~/.cache/copilot or $COPILOT_CACHE_HOME): read-write
 #   - GitHub CLI auth (~/.config/gh/hosts.yml): read-only (if it exists)
 #   - Git config + includes: read-only
@@ -440,6 +444,7 @@ main() {
     build_home_tmpfs
     build_workdir_mount
     build_copilot_home_mount
+    build_personal_skills_mounts "${_HOME}/.agents/skills"
     build_copilot_cache_mount
     build_gh_auth_mount
     build_git_mounts

@@ -45,6 +45,30 @@ read-only.
 Contribute or update skills through the deployment's documented contribution
 workflow; do not edit its deployed checkout or managed aliases directly.
 
+## Personal skills directories
+
+Each wrapper also mounts, read-write and only when they exist, the personal
+skills directories its tool reads:
+
+| Wrapper | Personal skills directories |
+| --- | --- |
+| `bwopencode` | `~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills` |
+| `bwopencode2` | `~/.config/opencode2/opencode/skills`, `~/.claude/skills`, `~/.agents/skills` |
+| `bwclaude` | `~/.claude/skills` (`$CLAUDE_CONFIG_DIR/skills` when that is set) |
+| `bwcopilot` | `~/.agents/skills`; `~/.copilot/skills` is mounted read-write with the Copilot home |
+| `bwcodex` | `~/.codex/skills`, `~/.agents/skills` |
+
+Each directory is scanned one level deep and every entry (one skill) is
+resolved with `readlink -f` and mounted at its usual path. A common setup keeps
+skills in a separate repository and symlinks each one in (for example
+`~/.agents/skills/some-skill -> ~/src/.../skills/some-skill`); that repository
+does not have to be mounted for the skill to work in the sandbox. An entry that
+resolves into a blocked location (such as `~/.ssh`), or is a directory that
+contains one, is skipped with a warning. Existing skills can be edited from
+inside the sandbox (for a symlinked skill, that edits its source repository),
+but a new top-level skill created there is discarded on exit, and skills added
+on the host while a sandbox is running do not appear in it.
+
 ## Common options
 
 Every `bw*` wrapper accepts these options:
