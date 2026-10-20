@@ -2348,17 +2348,38 @@ build_user_bin_mount() {
 # tool's home/config directory is a tmpfs, so each such directory must be
 # bind-mounted read-write from its real host location to survive the session.
 #
-# _path_already_mounted PATH
-#   Return 0 when PATH, or one of its ancestors, is already registered in
-#   _MOUNTED_PREFIXES.
-_path_already_mounted() {
-    local _check="$1"
-    while :; do
-        [[ -n "${_MOUNTED_PREFIXES["${_check}"]:-}" ]] && return 0
-        [[ "${_check}" == "/" ]] && return 1
-        _check="${_check%/*}"
-        [[ -n "${_check}" ]] || _check="/"
+# _path_visible_from_host PATH
+#   Return 0 when PATH already shows its host contents in the sandbox given
+#   the mounts emitted so far, i.e. the LAST mount in BWRAP_ARGS covering PATH
+#   (at PATH or an ancestor) is an identity bind (source == destination).  A
+#   registered ancestor in _MOUNTED_PREFIXES is not enough: a later tmpfs (a
+#   tool home such as CODEX_HOME=$PWD/.codex inside the working directory) or
+#   a bind from a different source hides what an earlier bind exposed.
+_path_visible_from_host() {
+    local _path="$1" _i=0 _flag _src _dest _visible=0
+    while [[ ${_i} -lt ${#BWRAP_ARGS[@]} ]]; do
+        _flag="${BWRAP_ARGS[${_i}]}"
+        _bwrap_flag_arity "${_flag}"
+        case "${_flag}" in
+            --tmpfs)
+                _dest="${BWRAP_ARGS[$((_i + 1))]}"
+                _is_prefix_of "${_dest}" "${_path}" && _visible=0
+                ;;
+            --bind | --ro-bind | --bind-try | --ro-bind-try | --dev-bind | --dev-bind-try)
+                _src="${BWRAP_ARGS[$((_i + 1))]}"
+                _dest="${BWRAP_ARGS[$((_i + 2))]}"
+                if _is_prefix_of "${_dest}" "${_path}"; then
+                    if [[ "${_src}" == "${_dest}" ]]; then
+                        _visible=1
+                    else
+                        _visible=0
+                    fi
+                fi
+                ;;
+        esac
+        _i=$((_i + 1 + _BWRAP_FLAG_ARITY))
     done
+    [[ ${_visible} -eq 1 ]]
 }
 
 # _mount_authoring_dir DIR CREATE KIND
@@ -2397,13 +2418,15 @@ _mount_authoring_dir() {
         return 0
     fi
 
-    _canon="$(readlink -f -- "${_dir}" 2> /dev/null || true)"
+    # -m, not -f: a directory about to be created may have missing parents
+    # too (a fresh ~/.config/opencode), and -f yields nothing for those.
+    _canon="$(readlink -m -- "${_dir}" 2> /dev/null || true)"
     [[ -n "${_canon}" ]] || return 0
     if _bwrap_bind_blocked "${_canon}"; then
         echo "Warning: ${_kind} directory '${_dir}' resolves into or contains a blocked location (${_canon}); not mounted." >&2
         return 0
     fi
-    _path_already_mounted "${_dir}" && return 0
+    _path_visible_from_host "${_dir}" && return 0
 
     if [[ "${_create}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
         mkdir -p -- "${_canon}"
@@ -2413,7 +2436,7 @@ _mount_authoring_dir() {
 
     if [[ "${_canon}" != "${_dir}" ]]; then
         [[ -d "${_canon}" ]] || return 0
-        for _entry in "${_dir}"/*; do
+        for _entry in "${_dir}"/* "${_dir}"/.[!.]* "${_dir}"/..?*; do
             [[ -e "${_entry}" ]] || continue
             _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
             [[ -n "${_real}" ]] || continue
@@ -2431,11 +2454,11 @@ _mount_authoring_dir() {
     _MOUNTED_PREFIXES["${_dir}"]=1
 
     [[ -d "${_dir}" ]] || return 0
-    for _entry in "${_dir}"/*; do
+    for _entry in "${_dir}"/* "${_dir}"/.[!.]* "${_dir}"/..?*; do
         [[ -L "${_entry}" ]] || continue
         _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
         [[ -n "${_real}" && -e "${_real}" ]] || continue
-        _path_already_mounted "${_real}" && continue
+        _path_visible_from_host "${_real}" && continue
         if _bwrap_bind_blocked "${_real}"; then
             echo "Warning: ${_kind} '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
             continue
