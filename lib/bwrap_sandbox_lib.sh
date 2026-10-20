@@ -710,9 +710,10 @@ _emit_home_intermediate_dirs() {
 #   actually emitted, DIR is added to _MOUNTED_PREFIXES so future calls
 #   with the same path or a sub-path are no-ops.
 #   Handles intermediate --dir entries for paths under $HOME.
-#   Calls _check_path_safe before emitting any mount — aborts if DIR
+#   Calls _check_bind_safe before emitting any mount — aborts if DIR
 #   resolves into a blocked path (e.g. a tool binary that symlinks into
-#   ~/.ssh or a misconfigured npm prefix pointing at $HOME).
+#   ~/.ssh or a misconfigured npm prefix pointing at $HOME) or contains one
+#   (e.g. an on-PATH ~/.config holding ~/.config/gh).
 _mount_ro_dir_if_needed() {
     local dir="$1"
     [[ -d "${dir}" ]] || return 0
@@ -737,7 +738,7 @@ _mount_ro_dir_if_needed() {
     local _dir_canon
     _dir_canon="$(readlink -f -- "${dir}" 2> /dev/null || true)"
     [[ -n "${_dir_canon}" ]] || _dir_canon="${dir}"
-    _check_path_safe "${_dir_canon}" "dynamic mount"
+    _check_bind_safe "${_dir_canon}" "dynamic mount"
 
     # Create intermediate --dir entries for paths under $HOME (the
     # tmpfs $HOME has no subdirectories yet).  DIR is the bind mount point,
@@ -809,7 +810,7 @@ _mount_npm_global_prefix() {
     # are resolved (npm itself may return a non-canonical path on some systems).
     local npm_prefix_canon
     npm_prefix_canon="$(readlink -f "${npm_prefix}" 2> /dev/null || echo "${npm_prefix}")"
-    _check_path_safe "${npm_prefix_canon}" "npm global prefix"
+    _check_bind_safe "${npm_prefix_canon}" "npm global prefix"
 
     _mount_ro_dir_if_needed "${npm_prefix_canon}"
     _EXTRA_PATH_DIRS+=("${npm_prefix_canon}/bin")
@@ -1116,6 +1117,10 @@ _bwrap_path_blocked() {
 #   Assert that the already-resolved canonical path CANON is safe to mount
 #   into the sandbox.  Exits 1 with a descriptive error if it is not.
 #
+#   This only asks whether CANON is itself blocked.  Callers that bind a path
+#   into the sandbox should use _check_bind_safe, which also refuses a
+#   directory that CONTAINS a blocked location.
+#
 #   CANON   : absolute, symlink-free path (output of readlink -f).
 #   CONTEXT : short label used in error messages, e.g. "--ro-path",
 #             "--rw-path", or "working directory".
@@ -1193,28 +1198,57 @@ _check_path_safe() {
 # deliberately never mounted.  Existing paths only.
 EXTRA_BLOCKED_DIRS=()
 
-# _check_dir_contains_blocked CANON CONTEXT
-#   Companion of _check_path_safe for a directory that is bound WHOLE (working
-#   directory or git root, --ro-path, --rw-path): exit 1 when the canonical
-#   directory CANON is, or is an ancestor of, a blocked location that exists
-#   on disk (anything in the blocked list, a symlink's target included, or an
-#   EXTRA_BLOCKED_DIRS entry).  Binding such a directory would expose the
-#   blocked location through the parent mount (e.g. running from ~/.config
-#   would bind ~/.config/gh read-write).  Blocked locations that do not exist
-#   are ignored.  Call AFTER _check_path_safe (which reports $HOME, its
-#   ancestors and paths inside a blocked tree first).
-_check_dir_contains_blocked() {
-    local canon="$1" context="$2" _b _t
+# _bwrap_contains_blocked CANON
+#   Return 0 (true) when the canonical path CANON is, or is an ancestor of, a
+#   blocked location that exists on disk (anything in the blocked list, a
+#   symlink's target included, or an EXTRA_BLOCKED_DIRS entry); the offending
+#   entry is left in _BWRAP_CONTAINED_BLOCKED.  Blocked locations that do not
+#   exist are ignored.  Binding such a directory would expose the blocked
+#   location through the parent mount (e.g. running from ~/.config would bind
+#   ~/.config/gh read-write).  Does NOT check whether CANON itself is inside a
+#   blocked tree: use _bwrap_bind_blocked or _check_bind_safe for that.
+_bwrap_contains_blocked() {
+    local canon="$1" _b _t
+    _BWRAP_CONTAINED_BLOCKED=""
     _bwrap_load_blocked_prefixes
     for _b in "${_BWRAP_BLOCKED_LIST[@]}" "${EXTRA_BLOCKED_DIRS[@]+"${EXTRA_BLOCKED_DIRS[@]}"}"; do
         [[ -n "${_b}" ]] || continue
         [[ -e "${_b}" || -L "${_b}" ]] || continue
         _t="$(readlink -f -- "${_b}" 2> /dev/null || true)"
         if _is_prefix_of "${canon}" "${_b}" || { [[ -n "${_t}" ]] && _is_prefix_of "${canon}" "${_t}"; }; then
-            echo "Error: ${context} '${canon}' contains the blocked path '${_b}'. Refusing to mount." >&2
-            exit 1
+            _BWRAP_CONTAINED_BLOCKED="${_b}"
+            return 0
         fi
     done
+    return 1
+}
+
+# _bwrap_bind_blocked CANON
+#   Non-exiting safety check for a path about to be bind-mounted: return 0
+#   (true) when CANON is blocked (_bwrap_path_blocked) OR contains a blocked
+#   location (_bwrap_contains_blocked).  Use where an unsafe candidate is
+#   skipped with a warning instead of aborting the launcher.
+_bwrap_bind_blocked() {
+    _bwrap_path_blocked "$1" || _bwrap_contains_blocked "$1"
+}
+
+# _check_bind_safe CANON CONTEXT
+#   The safety check for ANY path about to be bind-mounted: exit 1 with an
+#   error when CANON is blocked (see _check_path_safe) or, for a directory
+#   bound whole, contains a blocked location.  Use this at every bind-mount
+#   site rather than _check_path_safe alone, which does not notice a
+#   directory that contains a blocked path.
+#
+#   _check_path_safe on its own is for paths that are validated but not bound
+#   whole: a tool-home directory that only has selected subpaths mounted
+#   (see _check_dir_safe), or a symlink target about to be resolved.
+_check_bind_safe() {
+    local canon="$1" context="$2"
+    _check_path_safe "${canon}" "${context}"
+    if _bwrap_contains_blocked "${canon}"; then
+        echo "Error: ${context} '${canon}' contains the blocked path '${_BWRAP_CONTAINED_BLOCKED}'. Refusing to mount." >&2
+        exit 1
+    fi
 }
 
 # _check_dir_safe PATH CONTEXT
@@ -1243,20 +1277,29 @@ _check_dir_safe() {
 
 # _bwrap_canonicalize_safe PATH CONTEXT
 #   Canonicalize PATH with readlink -f (falls back to PATH itself when
-#   readlink fails or PATH does not exist) and run _check_path_safe on the
+#   readlink fails or PATH does not exist) and run _check_bind_safe on the
 #   canonical result.  ALWAYS canonicalizes, so a symlinked parent directory
 #   cannot hide a blocked target (bwrap's --ro-bind follows the symlink and
 #   would mount the real file).
 #
+#   Pass "root" as MODE for a directory that is validated but NOT bound whole
+#   (a tool-home directory that only has selected subpaths mounted): then only
+#   _check_path_safe runs, as a contained blocked location is not exposed.
+#
 #   The canonical path is returned in the global _BWRAP_CANON, NOT on stdout:
-#   _check_path_safe calls exit 1, and inside $(...) that would only leave
-#   the subshell and let the launcher carry on.
+#   the checks call exit 1, and inside $(...) that would only leave the
+#   subshell and let the launcher carry on.
 _bwrap_canonicalize_safe() {
     local path="$1"
     local context="$2"
+    local mode="${3:-bind}"
     _BWRAP_CANON="$(readlink -f "${path}" 2> /dev/null || true)"
     [[ -n "${_BWRAP_CANON}" ]] || _BWRAP_CANON="${path}"
-    _check_path_safe "${_BWRAP_CANON}" "${context}"
+    if [[ "${mode}" == "root" ]]; then
+        _check_path_safe "${_BWRAP_CANON}" "${context}"
+    else
+        _check_bind_safe "${_BWRAP_CANON}" "${context}"
+    fi
 }
 
 # _bwrap_include_visible_path RAW
@@ -1383,10 +1426,7 @@ validate_extra_path() {
     fi
 
     # ── Safety check ─────────────────────────────────────────────
-    _check_path_safe "${canon}" "--${mode}-path"
-    if [[ -d "${canon}" ]]; then
-        _check_dir_contains_blocked "${canon}" "--${mode}-path"
-    fi
+    _check_bind_safe "${canon}" "--${mode}-path"
 
     # All checks passed — return the canonical path.
     echo "${canon}"
@@ -1891,12 +1931,9 @@ build_workdir_mount() {
     # Guard: reject dangerous working / git-root directories via the same
     # rules applied to --ro-path / --rw-path.  This catches $HOME itself,
     # ancestors of $HOME (/home, /), /root, ~/.ssh, and all other blocked
-    # prefixes.
-    _check_path_safe "${_BIND_DIR}" "working directory"
-
-    # A directory that CONTAINS a blocked location (e.g. ~/.config with
-    # ~/.config/gh) is refused too: the whole tree is bound read-write.
-    _check_dir_contains_blocked "${_BIND_DIR}" "working directory"
+    # prefixes, and a directory that CONTAINS a blocked location (e.g.
+    # ~/.config with ~/.config/gh): the whole tree is bound read-write.
+    _check_bind_safe "${_BIND_DIR}" "working directory"
 
     # If the bind dir is under HOME, create intermediate directories in the
     # tmpfs so the bind mount point is reachable.  _BIND_DIR is itself the
@@ -2351,10 +2388,7 @@ _mount_authoring_dir() {
 
     _canon="$(readlink -f -- "${_dir}" 2> /dev/null || true)"
     [[ -n "${_canon}" ]] || return 0
-    # _check_dir_contains_blocked exits on a hit, so it runs in a subshell
-    # here to skip the directory instead of aborting the launch.
-    if _bwrap_path_blocked "${_canon}" ||
-        ! (_check_dir_contains_blocked "${_canon}" "${_kind} directory") 2> /dev/null; then
+    if _bwrap_bind_blocked "${_canon}"; then
         echo "Warning: ${_kind} directory '${_dir}' resolves into or contains a blocked location (${_canon}); not mounted." >&2
         return 0
     fi
@@ -2372,8 +2406,7 @@ _mount_authoring_dir() {
             [[ -e "${_entry}" ]] || continue
             _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
             [[ -n "${_real}" ]] || continue
-            if _bwrap_path_blocked "${_real}" ||
-                { [[ -d "${_real}" ]] && ! (_check_dir_contains_blocked "${_real}" "${_kind}") 2> /dev/null; }; then
+            if _bwrap_bind_blocked "${_real}"; then
                 echo "Warning: ${_kind} '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
                 continue
             fi
@@ -2392,8 +2425,7 @@ _mount_authoring_dir() {
         _real="$(readlink -f -- "${_entry}" 2> /dev/null || true)"
         [[ -n "${_real}" && -e "${_real}" ]] || continue
         _path_already_mounted "${_real}" && continue
-        if _bwrap_path_blocked "${_real}" ||
-            { [[ -d "${_real}" ]] && ! (_check_dir_contains_blocked "${_real}" "${_kind}") 2> /dev/null; }; then
+        if _bwrap_bind_blocked "${_real}"; then
             echo "Warning: ${_kind} '${_entry}' resolves into or contains a blocked location (${_real}); not mounted." >&2
             continue
         fi

@@ -350,7 +350,7 @@ resolve_opencode2_paths() {
     OC2_CONFIG_DIR="${OC2_XDG_CONFIG_HOME}/opencode"
     # The config directory holds service.json, which is never mounted: refuse
     # a working directory / --ro-path / --rw-path that would bind it whole.
-    # shellcheck disable=SC2034  # read by _check_dir_contains_blocked in the library
+    # shellcheck disable=SC2034  # read by _bwrap_contains_blocked in the library
     EXTRA_BLOCKED_DIRS=("${OC2_CONFIG_DIR}")
     OC2_DATA_DIR="${OC2_XDG_DATA_HOME}/opencode"
     OC2_STATE_DIR="${OC2_XDG_STATE_HOME}/opencode"
@@ -387,7 +387,7 @@ resolve_config_symlinks() {
     [[ -d "${OC2_CONFIG_DIR}" ]] || return 0
 
     # The config directory itself may be (or sit under) a symlink.
-    _bwrap_canonicalize_safe "${OC2_CONFIG_DIR}" "opencode2 config dir"
+    _bwrap_canonicalize_safe "${OC2_CONFIG_DIR}" "opencode2 config dir" root
 
     local entry local_resolved
     for entry in "${OC2_CONFIG_DIR}"/*; do

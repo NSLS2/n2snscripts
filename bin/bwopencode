@@ -252,7 +252,7 @@ resolve_config_symlinks() {
     [[ -d "${OC_CONFIG_DIR}" ]] || return 0
 
     # The config directory itself may be (or sit under) a symlink.
-    _bwrap_canonicalize_safe "${OC_CONFIG_DIR}" "opencode config dir"
+    _bwrap_canonicalize_safe "${OC_CONFIG_DIR}" "opencode config dir" root
 
     local entry local_resolved
     for entry in "${OC_CONFIG_DIR}"/*; do

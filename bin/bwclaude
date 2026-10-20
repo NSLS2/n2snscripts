@@ -235,7 +235,7 @@ resolve_claude_paths() {
     # ~/.claude.json by default and $CLAUDE_CONFIG_DIR/.claude.json when
     # CLAUDE_CONFIG_DIR is set.  It is shared with unsandboxed claude.
     if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-        _bwrap_canonicalize_safe "${CLAUDE_CONFIG_DIR}" "CLAUDE_CONFIG_DIR"
+        _bwrap_canonicalize_safe "${CLAUDE_CONFIG_DIR}" "CLAUDE_CONFIG_DIR" root
         CLAUDE_HOME_DIR="${_BWRAP_CANON}"
         CLAUDE_STATE_FILE="${CLAUDE_HOME_DIR}/.claude.json"
     else
