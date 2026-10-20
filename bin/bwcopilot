@@ -464,13 +464,13 @@ main() {
         build_managed_ro_bind /opt/nsls2/skills/skills /opt/nsls2/skills/skills
     fi
 
-    # Mask dangerous binaries last: an earlier mask is hidden by any later
-    # bind that covers it (e.g. --ro-path /usr or /usr/bin).
-    build_binary_masks
-
     # Environment variables
     build_env_vars
     build_copilot_env
+
+    # Mask dangerous binaries as the very last step: a mask is hidden by any
+    # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
+    build_binary_masks
 
     # Launch
     if [[ "${DRY_RUN}" -eq 1 ]]; then

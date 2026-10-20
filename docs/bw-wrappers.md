@@ -95,9 +95,9 @@ Every `bw*` wrapper accepts these options:
 overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
 keeps `DIR/sub` read-only (the reverse, a read-only tree with one writable
 subdirectory, works too). A path given as both `--ro-path` and `--rw-path` is
-rejected. The masks on privileged binaries are applied after all other mounts,
-so a path that covers their directory (for example `--ro-path /usr`) does not
-undo them.
+rejected. The masks on privileged binaries are the very last step, applied after all
+other mounts and the environment setup, so a path that covers their directory
+(for example `--ro-path /usr`) does not undo them.
 
 Tool-specific options are listed in each wrapper's section below.
 
