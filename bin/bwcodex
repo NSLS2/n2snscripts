@@ -25,10 +25,11 @@
 #     - sessions/: bind-mounted read-write (for `codex resume` / `codex fork`)
 #     - log/: bind-mounted read-write (RUST_LOG / opt-in plaintext logs)
 #     - history.jsonl: bind-mounted read-write (prompt history)
-#     - config.toml: by default, copied to a per-session staging file and
-#         bind-mounted RW so Codex can persist project-trust grants for the
-#         session without touching the host file (the staging copy is removed
-#         on script exit).  With --persist-config, the host config.toml is
+#     - config.toml: by default, opened as a file descriptor and passed to
+#         bwrap via --file so Codex can persist project-trust grants for the
+#         session without touching the host file (the temp copy is unlinked
+#         immediately after opening; no cleanup needed on exit).
+#         With --persist-config, the host config.toml is
 #         bind-mounted RW so writes persist across sessions at the cost of
 #         weaker isolation.  Either the user file or the system file
 #         (/etc/codex/config.toml) is sufficient for fail-fast.
@@ -346,22 +347,36 @@ build_codex_home_mount() {
     fi
 
     # User config.toml mount strategy (see file header):
-    #   - Default: stage a writable copy in /tmp, bind RW into sandbox.
-    #     Codex can persist project trust / other mutations for the session,
-    #     but the host ~/.codex/config.toml is never touched.  The staging
-    #     file is cleaned up on script exit via the EXIT trap.
+    #   - Default: open a temporary copy of config.toml as an fd and pass it
+    #     to bwrap via --file.  bwrap creates a plain (writable) file in the
+    #     sandbox tmpfs from the fd content, so Codex can persist project-trust
+    #     grants for the session without touching the host file.  The temp
+    #     file is unlinked immediately after the fd is opened, so no cleanup
+    #     is needed on exit — the fd holds the only reference and closes when
+    #     bwrap exec's into the tool.
     #   - --persist-config: bind host config.toml RW so writes persist.
     # If the user file does not exist (managed host using only system
     # config), skip the user mount entirely.
     if [[ -f "${CODEX_CONFIG_FILE}" ]]; then
         if [[ "${PERSIST_CONFIG}" -eq 1 ]]; then
             BWRAP_ARGS+=(--bind "${CODEX_CONFIG_FILE}" "${CODEX_CONFIG_FILE}")
+        elif [[ "${DRY_RUN}" -eq 1 ]]; then
+            # --dry-run stages nothing on the host, and a real fd number could
+            # not be reproduced by copy-paste: print a placeholder instead.
+            BWRAP_ARGS+=(--file "<config-fd>" "${CODEX_CONFIG_FILE}")
         else
-            _STAGED_CONFIG="$(mktemp --tmpdir bwcodex-config.XXXXXX.toml)"
-            cp -p "${CODEX_CONFIG_FILE}" "${_STAGED_CONFIG}"
-            chmod u+w "${_STAGED_CONFIG}"
-            trap 'rm -f "${_STAGED_CONFIG}"' EXIT INT TERM
-            BWRAP_ARGS+=(--bind "${_STAGED_CONFIG}" "${CODEX_CONFIG_FILE}")
+            local _config_fd _staged_config
+            _staged_config="$(mktemp --tmpdir bwcodex-config.XXXXXX.toml)"
+            # Plain cp (not cp -p) keeps mktemp's 0600 mode; -p would apply
+            # the source's mode (typically 0644), leaving a world-readable
+            # copy in the shared temp directory until the unlink below.
+            cp "${CODEX_CONFIG_FILE}" "${_staged_config}"
+            # Open the copy as an fd then immediately unlink it.  The kernel
+            # keeps the data alive via the open fd; the filename disappears
+            # from /tmp so there is nothing to clean up on exit or signal.
+            exec {_config_fd}< "${_staged_config}"
+            rm -f "${_staged_config}"
+            BWRAP_ARGS+=(--file "${_config_fd}" "${CODEX_CONFIG_FILE}")
         fi
     fi
 
