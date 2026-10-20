@@ -397,10 +397,21 @@ Additional options:
 | `--debug` | Enable verbose debug logging: sets `ANTHROPIC_LOG=debug`, `NODE_DEBUG=http,https,tls`, and passes `--debug --verbose` to `claude` |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
-Persists `logs`, `projects`, `todos`, `statsig`, `file-history`, `plans`
-(plan-mode plan files) and `sessions` under `~/.claude`, plus
-`history.jsonl` and `~/.claude.json`. Other new files under `~/.claude` are
-discarded on exit.
+The Claude home is `~/.claude`, or `$CLAUDE_CONFIG_DIR` when that is set on the
+host (it is then also set inside the sandbox, pointing at the same directory).
+`bwclaude` persists `logs`, `projects`, `todos`, `statsig`, `file-history`,
+`plans` (plan-mode plan files) and `sessions` there, plus `history.jsonl` and
+the state file (`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`), which
+is shared with unsandboxed `claude`. Other new files under the Claude home are
+discarded on exit. The state file is not only UI state: it also holds the OAuth
+session (if any), per-project trust decisions and personal MCP server
+definitions, so a sandboxed session can change what unsandboxed `claude` trusts
+or starts. This is a known gap.
+
+`settings.json` can define hooks, `apiKeyHelper` and `env` that run outside
+the sandbox the next time `claude` is used on the host, so by default the
+sandbox only gets a throwaway copy of it. `--init-auth` bind-mounts it
+read-write (creating it if needed) along with the credentials.
 
 On shared accounts, auth is ephemeral. On a personal machine, run
 `bwclaude --init-auth` once to persist credentials.

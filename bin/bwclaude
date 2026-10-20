@@ -8,7 +8,7 @@
 #
 # The sandbox provides filesystem isolation:
 #   - Current directory: read-write
-#   - Claude home (~/.claude or $CLAUDE_HOME): tmpfs (ephemeral by default)
+#   - Claude home (~/.claude, or $CLAUDE_CONFIG_DIR when set): tmpfs (ephemeral by default)
 #     - logs/: bind-mounted read-write (persistent)
 #     - projects/: bind-mounted read-write (persistent)
 #     - todos/: bind-mounted read-write (persistent)
@@ -18,13 +18,18 @@
 #     - plans/: bind-mounted read-write (plan-mode plan files)
 #     - history.jsonl: bind-mounted read-write (prompt history across sessions)
 #     - .last-cleanup: bind-mounted read-write (throttles Claude's cleanup runs)
-#     - settings.json: bind-mounted read-write (if it exists; --init-auth creates a stub)
+#     - settings.json: ephemeral copy (via --file) by default, so a session cannot
+#       persist hooks/apiKeyHelper/env that would later run unsandboxed on the
+#       host; bind-mounted read-write only with --init-auth (which creates a stub)
 #     - settings.local.json: bind-mounted read-only (if it exists)
 #     - Use --init-auth to make auth credentials and settings persistent
-#   - Claude state file (~/.claude.json): bind-mounted read-write (persistent)
-#     Contains only UI/session state (onboarding flags, feature caches, project history);
-#     not a credential, safe to persist unconditionally.
-#   - Claude cache (~/.cache/claude or $CLAUDE_CACHE_HOME): read-write
+#   - Claude state file (~/.claude.json, or $CLAUDE_CONFIG_DIR/.claude.json when
+#     CLAUDE_CONFIG_DIR is set): bind-mounted read-write (persistent), shared
+#     with unsandboxed claude.  Besides UI state and onboarding flags it holds
+#     the OAuth session (if any), per-project trust decisions and personal MCP
+#     server definitions.  KNOWN GAP: a session can add an MCP server or a trust
+#     decision here that unsandboxed claude will honour later.
+#   - Claude cache ($XDG_CACHE_HOME/claude, default ~/.cache/claude): read-write
 #   - Git config + includes: read-only
 #   - Pixi cache: read-write
 #   - Pixi config: read-only
@@ -52,7 +57,8 @@
 #   --exec CMD      Run CMD inside the sandbox instead of claude.
 #                   Useful for running one-off commands, scripts, or diagnostic tools
 #                   inside the fully-configured sandbox environment.
-#   --init-auth     Persist auth credentials to host (run once on personal machines).
+#   --init-auth     Persist auth credentials and settings.json to host (run once on
+#                   personal machines).
 #   --debug         Enable verbose debug logging (ANTHROPIC_LOG=debug, NODE_DEBUG, --debug --verbose).
 #                   NOTE: shadows claude's own -d/--debug [filter] flag.  To pass a debug
 #                   filter to claude directly, place it after a non-wrapper argument so
@@ -172,6 +178,8 @@ Wrapper options (consumed before claude sees the command line):
                   CMD itself is split on whitespace; pass arguments that need
                   quoting as separate words after it, as above.
   --init-auth     Persist auth credentials to host (run once on personal machines).
+                  Also makes settings.json writable and persistent; without it
+                  the sandbox sees a throwaway copy of settings.json.
   --debug         Enable verbose debug logging (sets ANTHROPIC_LOG=debug,
                   NODE_DEBUG=http,https,tls, and passes --debug --verbose to claude).
                   NOTE: shadows claude's own -d/--debug [filter] flag.  To pass
@@ -217,28 +225,30 @@ HELP_EOF
 }
 
 resolve_claude_paths() {
-    # Claude home: config, credentials, projects, logs, todos.
-    # Override: CLAUDE_HOME env var.
-    CLAUDE_HOME_DIR="${CLAUDE_HOME:-${_HOME}/.claude}"
-
-    # Claude cache: follows XDG on Linux.
-    # Override: CLAUDE_CACHE_HOME env var.
-    if [[ -n "${CLAUDE_CACHE_HOME:-}" ]]; then
-        CLAUDE_CACHE_DIR="${CLAUDE_CACHE_HOME}"
+    # Claude home: config, credentials, projects, logs, todos.  The Claude CLI
+    # reads CLAUDE_CONFIG_DIR (default ~/.claude); the mounts must be keyed on
+    # the same directory or persistence and credentials silently break.
+    # The state file (onboarding flags, project history, ...) is
+    # ~/.claude.json by default and $CLAUDE_CONFIG_DIR/.claude.json when
+    # CLAUDE_CONFIG_DIR is set.  It is shared with unsandboxed claude.
+    if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+        _bwrap_canonicalize_safe "${CLAUDE_CONFIG_DIR}" "CLAUDE_CONFIG_DIR"
+        CLAUDE_HOME_DIR="${_BWRAP_CANON}"
+        CLAUDE_STATE_FILE="${CLAUDE_HOME_DIR}/.claude.json"
     else
-        CLAUDE_CACHE_DIR="${XDG_CACHE_HOME}/claude"
+        CLAUDE_HOME_DIR="${_HOME}/.claude"
+        _check_dir_safe "${CLAUDE_HOME_DIR}" "CLAUDE_CONFIG_DIR"
+        CLAUDE_STATE_FILE="${_HOME}/.claude.json"
     fi
+    # The state file is bound read-write: refuse one that resolves into a
+    # blocked location (e.g. a ~/.claude.json symlink into ~/.ssh).
+    _bwrap_canonicalize_safe "${CLAUDE_STATE_FILE}" "Claude state file"
+
+    # Claude cache: the CLI follows XDG_CACHE_HOME.
+    CLAUDE_CACHE_DIR="${XDG_CACHE_HOME}/claude"
+    _check_dir_safe "${CLAUDE_CACHE_DIR}" "XDG_CACHE_HOME (claude cache)"
 
     CLAUDE_CREDENTIALS_FILE="${CLAUDE_HOME_DIR}/.credentials.json"
-
-    # State file at $HOME/.claude.json (not inside .claude/) tracks
-    # hasCompletedOnboarding, numStartups, userID, project history.
-    CLAUDE_STATE_FILE="${_HOME}/.claude.json"
-
-    # Validate the user-controllable root directories once here so that all
-    # sub-path mounts derived from them are implicitly covered.
-    _check_dir_safe "${CLAUDE_HOME_DIR}"  "CLAUDE_HOME"
-    _check_dir_safe "${CLAUDE_CACHE_DIR}" "CLAUDE_CACHE_HOME"
 }
 
 # Ensure writable directories exist on host.
@@ -285,19 +295,29 @@ build_claude_home_mount() {
 
     local _settings_path="${CLAUDE_HOME_DIR}/settings.json"
 
-    # With --init-auth, create a stub settings.json on the host if none exists,
-    # so it can be bind-mounted read-write and persist across sessions.
-    # File creation is skipped on --dry-run to keep that mode side-effect-free.
-    if [[ "${INIT_AUTH}" -eq 1 ]] && [[ ! -e "${_settings_path}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
-        ( umask 077 && printf '{}' > "${_settings_path}" )
-        echo "Created ${_settings_path} — settings will persist after this session." >&2
-    fi
-
-    # settings.json: read-write if it exists (claude may update it during the
-    # session).  _persist_bind_wanted also emits the bind under
-    # --dry-run --init-auth, where the stub above is not created.
-    if _persist_bind_wanted "${_settings_path}"; then
-        BWRAP_ARGS+=(--bind "${_settings_path}" "${_settings_path}")
+    # settings.json can define hooks, apiKeyHelper and env that run
+    # UNSANDBOXED the next time claude is used on the host, so a sandboxed
+    # session must not be able to persist it.  By default it is provided as
+    # an ephemeral copy via --file (like .credentials.json); only --init-auth
+    # binds it read-write, creating a stub when it does not exist yet.
+    if [[ "${INIT_AUTH}" -eq 1 ]]; then
+        # File creation is skipped on --dry-run to keep that mode side-effect-free.
+        if [[ ! -e "${_settings_path}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
+            ( umask 077 && printf '{}' > "${_settings_path}" )
+            echo "Created ${_settings_path} — settings will persist after this session." >&2
+        fi
+        if _persist_bind_wanted "${_settings_path}"; then
+            BWRAP_ARGS+=(--bind "${_settings_path}" "${_settings_path}")
+        fi
+    elif [[ -f "${_settings_path}" ]]; then
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            # A real fd number could not be reproduced by copy-paste.
+            BWRAP_ARGS+=(--file "<settings-fd>" "${_settings_path}")
+        else
+            local _settings_fd
+            exec {_settings_fd}< "${_settings_path}"
+            BWRAP_ARGS+=(--file "${_settings_fd}" "${_settings_path}")
+        fi
     fi
 
     # Persistent read-only config file (if it exists)
@@ -319,15 +339,21 @@ build_claude_home_mount() {
     elif [[ -f "${CLAUDE_CREDENTIALS_FILE}" ]]; then
         # Normal mode: copy credentials into tmpfs via --file so host auth is
         # available but changes don't persist.
-        local _fd
-        exec {_fd}< "${CLAUDE_CREDENTIALS_FILE}"
-        BWRAP_ARGS+=(--file "${_fd}" "${CLAUDE_CREDENTIALS_FILE}")
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            BWRAP_ARGS+=(--file "<credentials-fd>" "${CLAUDE_CREDENTIALS_FILE}")
+        else
+            local _fd
+            exec {_fd}< "${CLAUDE_CREDENTIALS_FILE}"
+            BWRAP_ARGS+=(--file "${_fd}" "${CLAUDE_CREDENTIALS_FILE}")
+        fi
     fi
 
-    # State file (~/.claude.json): bind RW unconditionally.  Contains only
-    # UI/session state (onboarding flags, feature caches, project history) —
-    # not a credential.  Without this, $HOME is tmpfs and claude triggers
-    # the onboarding flow on every invocation.
+    # State file (~/.claude.json, or $CLAUDE_CONFIG_DIR/.claude.json): bind RW
+    # unconditionally.  Without it, $HOME is tmpfs and claude runs the
+    # onboarding flow on every invocation.  The file is not only UI state: it
+    # also holds the OAuth session (if any), per-project trust decisions and
+    # personal MCP server definitions, which unsandboxed claude reads too.
+    # Writing those from inside the sandbox is a known, not yet closed, gap.
     # File creation is skipped on --dry-run to keep that mode side-effect-free.
     if [[ ! -f "${CLAUDE_STATE_FILE}" ]] && [[ "${DRY_RUN}" -eq 0 ]]; then
         ( umask 077 && printf '{}' > "${CLAUDE_STATE_FILE}" )
@@ -376,16 +402,27 @@ build_claude_env() {
     # ignores ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY, so we no longer set
     # those defaults.
 
-    # Foundry mode requires an API key. Fail fast with a clear message
-    # rather than letting Claude Code fall through to the Azure SDK
-    # credential chain (az login, managed identity, etc.) and emit a
-    # wall of CredentialUnavailableError output.
-    if [[ -z "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]] && [[ -z "${AIFAPIM_API_KEY:-}" ]]; then
-        echo "Error: bwclaude (foundry mode) requires an API key." >&2
-        echo "Export one of:" >&2
-        echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
-        echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key (preferred)" >&2
-        exit 1
+    # Foundry mode requires an API key and a gateway.  Fail fast with a clear
+    # message rather than letting Claude Code fall through to the Azure SDK
+    # credential chain (az login, managed identity, etc.) and emit a wall of
+    # CredentialUnavailableError output.  Only checked when claude itself is
+    # launched: --dry-run inspects the sandbox and --exec runs another
+    # command, neither needs credentials.
+    if [[ "${DRY_RUN}" -eq 0 ]] && [[ -z "${TEST_CMD}" ]]; then
+        if [[ -z "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]] && [[ -z "${AIFAPIM_API_KEY:-}" ]]; then
+            echo "Error: bwclaude (foundry mode) requires an API key." >&2
+            echo "Export one of:" >&2
+            echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
+            echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key (preferred)" >&2
+            exit 1
+        fi
+        if [[ -z "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]] && [[ -z "${AIFAPIM_HOST:-}" ]]; then
+            echo "Error: bwclaude requires AIFAPIM_HOST (or ANTHROPIC_FOUNDRY_BASE_URL) to be set." >&2
+            echo "Export one of:" >&2
+            echo "  AIFAPIM_HOST=<gateway-hostname>          # NSLS-II AIFAPIM gateway hostname" >&2
+            echo "  ANTHROPIC_FOUNDRY_BASE_URL=https://...   # full Foundry base URL override" >&2
+            exit 1
+        fi
     fi
 
     # Foundry API key: prefer host's ANTHROPIC_FOUNDRY_API_KEY; fall back to
@@ -397,21 +434,23 @@ build_claude_env() {
     fi
 
     # Foundry base URL: prefer explicit ANTHROPIC_FOUNDRY_BASE_URL override;
-    # otherwise derive from AIFAPIM_HOST (required).
+    # otherwise derive from AIFAPIM_HOST.
     if [[ -n "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]]; then
         pass_through_if_set ANTHROPIC_FOUNDRY_BASE_URL
     elif [[ -n "${AIFAPIM_HOST:-}" ]]; then
         BWRAP_ARGS+=(--setenv ANTHROPIC_FOUNDRY_BASE_URL "https://${AIFAPIM_HOST}/anthropic")
-    else
-        echo "Error: bwclaude requires AIFAPIM_HOST (or ANTHROPIC_FOUNDRY_BASE_URL) to be set." >&2
-        echo "Export one of:" >&2
-        echo "  AIFAPIM_HOST=<gateway-hostname>          # NSLS-II AIFAPIM gateway hostname" >&2
-        echo "  ANTHROPIC_FOUNDRY_BASE_URL=https://...   # full Foundry base URL override" >&2
-        exit 1
     fi
 
     # Forward any host CLAUDE_* env vars (incl. user overrides for verbosity, etc.).
     forward_env_by_prefix CLAUDE_
+
+    # A host CLAUDE_CONFIG_DIR is forwarded above as written; point it at the
+    # canonical directory the mounts were built on (--setenv: last one wins).
+    # When the host does not set it, neither does the sandbox, so claude uses
+    # ~/.claude and ~/.claude.json exactly as outside the sandbox.
+    if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+        BWRAP_ARGS+=(--setenv CLAUDE_CONFIG_DIR "${CLAUDE_HOME_DIR}")
+    fi
 
     # GitHub CLI token passthrough (opt-in via --github-tokens).  In
     # --dry-run, print_dry_run redacts the values (the names match *TOKEN*).
