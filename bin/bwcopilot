@@ -319,10 +319,16 @@ build_copilot_home_mount() {
     elif [[ -f "${COPILOT_CONFIG_FILE}" ]]; then
         # Normal mode: copy config.json into tmpfs via --file
         # This makes host auth available but changes don't persist
-        local _fd
-        exec {_fd}< "${COPILOT_CONFIG_FILE}"
-        BWRAP_ARGS+=(--file "${_fd}" "${COPILOT_CONFIG_FILE}")
-        # Note: fd stays open until bwrap exec's, then it's inherited and used
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            # A real fd number could not be reproduced by copy-paste: print a
+            # placeholder for the --file mount instead.
+            BWRAP_ARGS+=(--file "<config-fd>" "${COPILOT_CONFIG_FILE}")
+        else
+            local _fd
+            exec {_fd}< "${COPILOT_CONFIG_FILE}"
+            BWRAP_ARGS+=(--file "${_fd}" "${COPILOT_CONFIG_FILE}")
+            # Note: fd stays open until bwrap exec's, then it's inherited and used
+        fi
     fi
 }
 
