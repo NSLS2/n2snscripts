@@ -520,6 +520,22 @@ _bwrap_symlink_is_restricted() {
     done
 }
 
+# bwrap_show_tool_help NAME
+#   Finish a launcher's --help after its own text has been printed.  When the
+#   tool NAME is usable, re-exec the launcher as `--exec "NAME --help"` so the
+#   tool's own help comes from inside the fully built sandbox.  Otherwise say
+#   so and exit 0: the wrapper help must not depend on the tool being
+#   installed.  Never returns.
+bwrap_show_tool_help() {
+    local _name="$1" _bin
+    _bin="$(bwrap_find_tool "${_name}" 2> /dev/null || true)"
+    if [[ -n "${_bin}" && -x "${_bin}" ]]; then
+        exec "$0" --exec "${_bin} --help"
+    fi
+    echo "('${_name}' is not available here, so its own --help is not shown.)"
+    exit 0
+}
+
 # bwrap_resolve_tool NAME [NOT_FOUND_HINT]
 #   Resolve the agent binary NAME for a launcher, setting _TOOL_BIN and
 #   _TOOL_CMD (TEST_CMD, split into words, overrides the command).  When NAME

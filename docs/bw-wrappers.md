@@ -52,9 +52,9 @@ Every `bw*` wrapper accepts these options:
 
 | Option | Effect |
 | --- | --- |
-| `--help`, `-h` | Show wrapper help plus the underlying tool's help |
+| `--help`, `-h` | Show wrapper help, then the underlying tool's help when the tool is installed |
 | `--dry-run` | Print the `bwrap` command without executing it |
-| `--exec CMD` | Run `CMD` inside the sandbox instead of the tool |
+| `--exec CMD [ARGS...]` | Run `CMD` inside the sandbox instead of the tool. `CMD` is split on whitespace; following arguments are passed unchanged, e.g. `--exec bash -c 'env \| sort'` |
 | `--init-auth` | Persist auth credentials to the host (first-time setup; not available in `bwopencode2`) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 | `--ro-path PATH` | Read-only mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |

@@ -168,7 +168,9 @@ Wrapper options (consumed before claude sees the command line):
                   Use this to run scripts, diagnostic tools, or any command with
                   the same filesystem isolation and environment as claude itself.
                   Example: bwclaude --exec bash
-                           bwclaude --exec 'env | sort'
+                           bwclaude --exec bash -c 'env | sort'
+                  CMD itself is split on whitespace; pass arguments that need
+                  quoting as separate words after it, as above.
   --init-auth     Persist auth credentials to host (run once on personal machines).
   --debug         Enable verbose debug logging (sets ANTHROPIC_LOG=debug,
                   NODE_DEBUG=http,https,tls, and passes --debug --verbose to claude).
@@ -211,7 +213,7 @@ Authentication:
 HELP_EOF
     # Delegate to claude --help inside the sandbox so the user sees the full
     # claude option set in the same invocation.
-    exec "$0" --exec "${_TOOL_BIN} --help"
+    bwrap_show_tool_help claude
 }
 
 resolve_claude_paths() {
@@ -436,11 +438,10 @@ build_claude_env() {
     if [[ "${DEBUG_MODE}" -eq 1 ]]; then
         BWRAP_ARGS+=(--setenv ANTHROPIC_LOG debug)
         BWRAP_ARGS+=(--setenv NODE_DEBUG "http,https,tls")
-        # Prepend --debug --verbose to the args passed to claude.
-        if [[ "${#TOOL_ARGS[@]}" -gt 0 ]]; then
-            TOOL_ARGS=(--debug --verbose "${TOOL_ARGS[@]}")
-        else
-            TOOL_ARGS=(--debug --verbose)
+        # Prepend --debug --verbose to the args passed to claude (not to an
+        # --exec command, which is not claude).
+        if [[ -z "${TEST_CMD}" ]]; then
+            TOOL_ARGS=(--debug --verbose ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
         fi
     fi
 }
@@ -461,12 +462,13 @@ build_claude_bin_mount() {
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
-    bwrap_resolve_tool claude
 
     if [[ "${SHOW_HELP}" -eq 1 ]]; then
         show_help
-        # show_help does exec, never returns
+        # show_help never returns
     fi
+
+    bwrap_resolve_tool claude
 
     detect_bwrap_capabilities
     detect_kernel_capabilities
