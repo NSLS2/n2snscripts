@@ -487,6 +487,12 @@ Two approved auth paths (configured in `~/.codex/config.toml`):
   tokens to `~/.codex/auth.json`. Run once with `--init-auth` to make
   that file persist across sandbox invocations.
 
+The wrapper keeps `~/.codex/packages` in its ephemeral Codex home. When the
+daemon starts, Codex copies its package from the system CLI, which the wrapper
+mounts read-only with its metadata and resources. An ephemeral
+`app-server-daemon/settings.json` disables automatic daemon package updates.
+The package copy is discarded when the sandbox exits.
+
 Additional options:
 
 | Option | Effect |

@@ -33,7 +33,8 @@
 #         weaker isolation.  Either the user file or the system file
 #         (/etc/codex/config.toml) is sufficient for fail-fast.
 #     - AGENTS.md: bind-mounted read-only (if it exists)
-#     - packages/: bind-mounted read-only (if it exists, installer cache)
+#     - packages/: tmpfs; managed daemon package copied from the CLI on each run
+#     - app-server-daemon/settings.json: ephemeral, disables daemon auto-update
 #     - auth.json: bind-mounted read-write only if it already exists on host;
 #         --init-auth creates a {} stub for first-time ChatGPT-login setup
 #     - Everything else (tmp/, state.toml, features/, ...): tmpfs, discarded on exit
@@ -45,7 +46,7 @@
 #       top of this file.
 #   - /etc/codex/requirements.toml: admin-enforced restrictions (if
 #       present); bind-mounted read-only.  Users cannot loosen these.
-#   - Codex CLI binary + npm prefix: read-only (handled by build_dynamic_tool_mounts)
+#   - Codex CLI package (including metadata and resources): read-only
 #   - Git config + includes: read-only
 #   - Pixi cache: read-write
 #   - Pixi config: read-only
@@ -267,7 +268,7 @@ resolve_codex_paths() {
     CODEX_LOG_DIR="${CODEX_HOME_DIR}/log"
     CODEX_SKILLS_DIR="${CODEX_HOME_DIR}/skills"
     CODEX_HISTORY_FILE="${CODEX_HOME_DIR}/history.jsonl"
-    CODEX_PACKAGES_DIR="${CODEX_HOME_DIR}/packages"
+    CODEX_DAEMON_SETTINGS_FILE="${CODEX_HOME_DIR}/app-server-daemon/settings.json"
 
     # Validate the user-controllable root directory once here so that all
     # sub-path mounts derived from it are implicitly covered.
@@ -387,8 +388,19 @@ build_codex_home_mount() {
         BWRAP_ARGS+=(--ro-bind "${CODEX_AGENTS_FILE}" "${CODEX_AGENTS_FILE}")
     fi
 
-    if [[ -d "${CODEX_PACKAGES_DIR}" ]]; then
-        BWRAP_ARGS+=(--ro-bind "${CODEX_PACKAGES_DIR}" "${CODEX_PACKAGES_DIR}")
+    # Keep the managed daemon package in tmpfs.  The complete CLI package
+    # mounted by build_codex_bin_mount seeds it on each launch.  Disable the
+    # daemon's updater before Codex starts so it does not fetch a newer copy.
+    BWRAP_ARGS+=(--perms 0700 --dir "${CODEX_HOME_DIR}/app-server-daemon")
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        BWRAP_ARGS+=(--perms 0600 --file "<daemon-settings-fd>" "${CODEX_DAEMON_SETTINGS_FILE}")
+    else
+        local _settings_fd _staged_settings
+        _staged_settings="$(mktemp --tmpdir bwcodex-daemon-settings.XXXXXX.json)"
+        printf '{"updater":{"autoUpdateEnabled":false}}\n' > "${_staged_settings}"
+        exec {_settings_fd}< "${_staged_settings}"
+        rm -f "${_staged_settings}"
+        BWRAP_ARGS+=(--perms 0600 --file "${_settings_fd}" "${CODEX_DAEMON_SETTINGS_FILE}")
     fi
 
     # auth.json: only persist if it already exists on the host.
@@ -471,14 +483,20 @@ build_codex_env() {
     fi
 }
 
-# ── Codex install dir (stub) ─────────────────────────────────────
-# Codex CLI is installed via npm at /usr/local/lib/node_modules/@openai/codex,
-# which build_dynamic_tool_mounts already covers via the npm-prefix mount.
-# This stub is kept for symmetry with bwclaude/bwopencode and as a future
-# hook for non-npm Codex installs (e.g. the standalone installer's
-# /opt/codex layout).
+# ── Complete Codex CLI package ──────────────────────────────────
+# A packaged CLI needs codex-package.json and its sibling resource dirs to
+# seed a managed app-server daemon.  The dynamic tool mount only sees the
+# binary directory for a symlink such as /usr/bin/codex ->
+# /opt/openai-codex/bin/codex.
+# Mount the entire package when its metadata is present; npm installations
+# are already covered by the dynamic npm-prefix mount.
 build_codex_bin_mount() {
-    :
+    local _real_bin _package_dir
+    _real_bin="$(readlink -f -- "${_TOOL_BIN}")"
+    _package_dir="$(dirname "$(dirname "${_real_bin}")")"
+    if [[ -f "${_package_dir}/codex-package.json" ]]; then
+        _mount_ro_dir_if_needed "${_package_dir}"
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════════
