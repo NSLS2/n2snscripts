@@ -458,10 +458,10 @@ main() {
     # the read-only logical settings path.
     build_copilot_settings_mount
     # Deployment-managed skills are optional and never replace user-created
-    # skills under COPILOT_HOME.  Bind the deployment alias read-only after
+    # skills under COPILOT_HOME.  Bind the shared skills tree read-only after
     # user extra mounts so this narrow final mount cannot be shadowed writable.
-    if [[ -d /opt/nsls2/skills/skills && -r /opt/nsls2/skills/skills ]]; then
-        build_managed_ro_bind /opt/nsls2/skills/skills /opt/nsls2/skills/skills
+    if [[ -d /nsls2/agents/skills && -r /nsls2/agents/skills ]]; then
+        build_managed_ro_bind /nsls2/agents/skills /nsls2/agents/skills
     fi
 
     # Environment variables

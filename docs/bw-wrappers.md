@@ -30,17 +30,19 @@ configuration directories.
 - Codex: `/etc/codex/skills`
 - Claude: `/etc/claude-code/.claude/skills` and
   `/etc/claude-code/managed-settings.json`
-- Copilot: its deployment-defined shared-skill directory, when configured by
-  the wrapper
+- Copilot: the shared skills tree `/nsls2/agents/skills`, at the same path
+  inside the sandbox
 
 ## Shared agent skills
 
-Shared agent skills are a deployment-managed skill collection. The deployment
-defines the source repository or checkout and manages read-only aliases at the
-paths above. When those aliases are present, `bwopencode`, `bwopencode2`,
-`bwcodex`, and `bwclaude` mount them read-only into their sandboxes. A wrapper configured for
-Copilot likewise mounts its deployment-defined shared-skill directory
-read-only.
+Shared agent skills are a deployment-managed skill collection published to
+`/nsls2/agents/skills`. The deployment links the system skill directories above
+to it. When those links are present, `bwopencode`, `bwopencode2`, `bwcodex`,
+and `bwclaude` resolve them and mount the shared tree read-only at the same
+paths inside their sandboxes. `bwcopilot` has no system skill directory, so it
+mounts `/nsls2/agents/skills` read-only at that path; list it in Copilot's
+`skillDirectories` setting. `/nsls2/agents` itself is not mounted, so a skill
+refers to files beside it with relative paths such as `../_site/nsls2.md`.
 
 Contribute or update skills through the deployment's documented contribution
 workflow; do not edit its deployed checkout or managed aliases directly.

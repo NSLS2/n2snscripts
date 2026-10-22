@@ -480,7 +480,8 @@ build_managed_config() {
     fi
 }
 
-# The host-managed skills alias may point into /opt/nsls2/skills.  Bind
+# The host-managed skills alias may point into the shared skills tree
+# (/nsls2/agents/skills).  Bind
 # its resolved source at OpenCode's documented managed-skills location so the
 # alias target and every supporting file remain available inside the sandbox.
 build_managed_skills() {
