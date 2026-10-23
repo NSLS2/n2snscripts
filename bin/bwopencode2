@@ -13,7 +13,9 @@
 # On the host the opencode2 convention separates the directories
 # (~/.config|.local/share|.cache/opencode2/opencode); inside the sandbox
 # everything is mounted at the standard locations (~/.config/opencode, ...), so
-# no XDG_* override is set.
+# no XDG_* override is set.  For the same reason the sandbox runs the OpenCode 2
+# binary directly instead of the ansible /usr/local/bin/opencode2 wrapper, which
+# exports XDG_*_HOME=~/.../opencode2 (see use_opencode2_binary).
 #
 # Requires at least a minimal OpenCode config: /etc/opencode/opencode.json{,c}
 # or a user opencode.json, opencode.jsonc or config.json in
@@ -218,6 +220,11 @@ standard locations (~/.local/share/opencode, ...), and the config is
 ~/.config/opencode2/opencode mounted at ~/.config/opencode.  Sign-in is stored in the database in the
 persistent data directory, so there is no --init-auth.
 
+Inside the sandbox the OpenCode 2 binary is run directly, not through the
+/usr/local/bin/opencode2 wrapper: the wrapper's XDG_* exports would point
+OpenCode 2 (and every tool it runs) away from the standard locations.  Use
+the binary with --exec as well, not `opencode2`.
+
 Sandbox-escape guard: OpenCode 2 normally connects to a shared background
 service that runs tools OUTSIDE the sandbox.  To keep tools sandboxed:
   - `--standalone` (a private in-process server) is added automatically when
@@ -348,6 +355,25 @@ guard_tool_args() {
     if [[ "${_inject_front}" -eq 1 && "${_has_standalone}" -eq 0 ]]; then
         TOOL_ARGS=(--standalone ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
     fi
+}
+
+# ── Run the OpenCode 2 binary, not the ansible wrapper ───────────
+# /usr/local/bin/opencode2 (ansible) exports
+# XDG_{CONFIG,DATA,STATE,CACHE}_HOME=~/.{config,local/share,local/state,cache}/opencode2
+# to keep OpenCode 2 apart from OpenCode 1 on the host.  Inside the sandbox
+# only the OpenCode 2 directories are mounted, at the standard locations, so
+# those exports would point OpenCode 2 at empty directories (no config,
+# plugins or database) and leak into every tool it runs (git, pixi and ccache
+# would miss their config).  The wrapper's other job, --standalone, is done
+# by guard_tool_args.  Falls back to the wrapper when the binary is not at the
+# ansible install path.  --exec commands are left alone.
+# Sets globals: _TOOL_BIN, _TOOL_CMD
+OC2_INSTALL_BIN="/opt/nsls2/opencode2/node_modules/@opencode/cli/bin/opencode.exe"
+use_opencode2_binary() {
+    [[ -z "${TEST_CMD}" ]] || return 0
+    [[ -x "${OC2_INSTALL_BIN}" ]] || return 0
+    _TOOL_BIN="${OC2_INSTALL_BIN}"
+    _TOOL_CMD=("${_TOOL_BIN}")
 }
 
 resolve_opencode2_paths() {
@@ -586,9 +612,10 @@ build_opencode2_state_dir() {
 #
 # ── OpenCode 2 install directory (read-only) ─────────────────────
 # /usr/local/bin/opencode2 is a wrapper script (deployed by ansible) that runs
-# /opt/nsls2/opencode2/node_modules/@opencode/cli/bin/opencode.exe.  The
-# sandbox mounts /usr but not /opt, so without this mount the wrapper cannot
-# find the binary and exits with "binary not found or not executable".  The
+# /opt/nsls2/opencode2/node_modules/@opencode/cli/bin/opencode.exe, which
+# use_opencode2_binary runs directly.  The
+# sandbox mounts /usr but not /opt, so without this mount neither the binary
+# nor the wrapper (--exec, fallback) can run it.  The
 # path is fixed by the ansible base role.  Mounted read-only; nothing is bound
 # when the directory is absent (for example a plain opencode2 elsewhere on PATH).
 build_opencode2_install_mount() {
@@ -597,6 +624,9 @@ build_opencode2_install_mount() {
             --dir /opt/nsls2
             --ro-bind /opt/nsls2/opencode2 /opt/nsls2/opencode2
         )
+        # Already covers the binary run by use_opencode2_binary, so
+        # build_dynamic_tool_mounts must not bind its directory again.
+        _MOUNTED_PREFIXES["/opt/nsls2/opencode2"]=1
     fi
 }
 
@@ -668,6 +698,7 @@ main() {
     fi
 
     bwrap_resolve_tool opencode2 "OpenCode 2 is installed by the ansible base role."
+    use_opencode2_binary
 
     # --exec runs an arbitrary command, so its arguments are not opencode2's.
     if [[ -z "${TEST_CMD}" ]]; then
