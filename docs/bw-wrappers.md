@@ -24,9 +24,10 @@ When present, the wrappers expose administrator-managed paths as optional,
 read-only mounts. They do not expose the rest of the corresponding `/etc`
 configuration directories.
 
-- OpenCode: `/etc/opencode/skills`
+- OpenCode: `/etc/opencode/skills` and `/etc/opencode/AGENTS.md`
 - OpenCode 2 (`bwopencode2`): `/etc/opencode/skills`, `/etc/opencode/agents`,
-  `/etc/opencode/commands`, and `/etc/opencode/plugins`
+  `/etc/opencode/commands`, `/etc/opencode/plugins`, and
+  `/etc/opencode/AGENTS.md`
 - Codex: `/etc/codex/skills`
 - Claude: `/etc/claude-code/.claude/skills` and
   `/etc/claude-code/managed-settings.json`
