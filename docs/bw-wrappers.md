@@ -331,6 +331,17 @@ mounted at the **standard** locations (the same ones `bwopencode` uses, under
 `$XDG_CONFIG_HOME` and so on), so the wrapper sets no `XDG_*` variable and git,
 pixi and ccache find their config where the shared library mounts it.
 
+For the same reason the sandbox does not run the ansible
+`/usr/local/bin/opencode2` wrapper: it exports
+`XDG_*_HOME=~/.{config,local/share,local/state,cache}/opencode2`, which would
+point OpenCode 2 at empty directories inside the sandbox (no config, plugins or
+database) and pass those variables on to every tool it runs. `bwopencode2` runs
+the binary the wrapper runs,
+`/opt/nsls2/opencode2/node_modules/@opencode/cli/bin/opencode.exe`, directly
+and adds `--standalone` itself (see below). If that binary is missing it falls
+back to `opencode2` from `PATH`. `--exec` runs its command unchanged, so use the
+binary path there too, not `opencode2`.
+
 | Host | Sandbox | Mount |
 | --- | --- | --- |
 | `~/.config/opencode2/opencode` | `~/.config/opencode` | read-only, symlinks resolved |
