@@ -38,8 +38,11 @@
 #     (database incl. saved sign-in, logs, ...)
 #   - OpenCode 2 cache (host ~/.cache/opencode2/opencode, mounted at
 #     ~/.cache/opencode): read-write
-#   - OpenCode 2 state (~/.local/state/opencode): ephemeral
-#     (last-used model and prompt history are not remembered)
+#   - OpenCode 2 state (~/.local/state/opencode): ephemeral, except the TUI
+#     plugin storage (host ~/.local/state/opencode2/opencode/latest/tui,
+#     mounted at ~/.local/state/opencode/latest/tui): read-write, so
+#     dismissed onboarding boxes and tab layout persist (locks and service
+#     files, and last-used model and prompt history, are not remembered)
 #   - Managed config: /etc/opencode/opencode.json{,c} and
 #     /etc/opencode/{agents,commands,plugins,skills}, read-only
 #   - Project .opencode/: persistent copy kept outside the repository
@@ -385,6 +388,7 @@ resolve_opencode2_paths() {
     OC2_CONFIG_SRC="${_HOME}/.config/opencode2/opencode"
     OC2_DATA_SRC="${_HOME}/.local/share/opencode2/opencode"
     OC2_CACHE_SRC="${_HOME}/.cache/opencode2/opencode"
+    OC2_TUI_STATE_SRC="${_HOME}/.local/state/opencode2/opencode/latest/tui"
 
     # Sandbox side: always the standard locations, which is where OpenCode 2
     # looks by default, so no XDG_* override is needed.  The XDG_* values are
@@ -394,6 +398,7 @@ resolve_opencode2_paths() {
     OC2_DATA_DIR="${XDG_DATA_HOME}/opencode"
     OC2_CACHE_DIR="${XDG_CACHE_HOME}/opencode"
     OC2_STATE_DIR="${_HOME}/.local/state/opencode"
+    OC2_TUI_STATE_DIR="${OC2_STATE_DIR}/latest/tui"
 
     # The opencode2 config directory holds service.json, which is never
     # mounted: refuse a working directory / --ro-path / --rw-path that would
@@ -405,13 +410,14 @@ resolve_opencode2_paths() {
     # the checks mirror bwopencode and also catch symlinked directories.
     _check_dir_safe "${OC2_DATA_SRC}"  "opencode2 data dir"
     _check_dir_safe "${OC2_CACHE_SRC}" "opencode2 cache dir"
+    _check_dir_safe "${OC2_TUI_STATE_SRC}" "opencode2 TUI state dir"
 }
 
 # Ensure writable directories exist on host.  The data dir is bound whole
 # because the OpenCode 2 layout is not documented (database + -shm/-wal, log,
 # repos, shell, ...), so no file list could be kept in sync.
 ensure_host_dirs() {
-    mkdir -p "${OC2_DATA_SRC}" "${OC2_CACHE_SRC}"
+    mkdir -p "${OC2_DATA_SRC}" "${OC2_CACHE_SRC}" "${OC2_TUI_STATE_SRC}"
 }
 
 # Resolve opencode2 config symlinks.
@@ -583,13 +589,22 @@ build_opencode2_cache_mount() {
     )
 }
 
-# ── OpenCode 2 state (ephemeral) ─────────────────────────────────
+# ── OpenCode 2 state (ephemeral, TUI plugin storage persists) ────
 # $HOME is a tmpfs, so state is discarded on exit; this avoids lock
-# clashes on NFS homes.  Create the directory chain so OpenCode 2 can
-# write into it without having to create parents.
+# clashes on NFS homes (locks/) and sharing service files with a host
+# opencode2.  Create the directory chain so OpenCode 2 can write into it
+# without having to create parents.
+#
+# Only the TUI plugin storage directory is persisted: it holds the
+# dismissed "Getting started" box and the tab layout, and is never locked.
+# A directory is bound (not single files) because OpenCode writes a temp
+# file and renames it over the target, which fails on a bind-mounted file.
+# "latest" is the release channel directory name used by OpenCode 2; a
+# different channel would use another name and not be persisted.
 build_opencode2_state_dir() {
     BWRAP_ARGS+=(
         --dir "${OC2_STATE_DIR}"
+        --bind "${OC2_TUI_STATE_SRC}" "${OC2_TUI_STATE_DIR}"
     )
 }
 
