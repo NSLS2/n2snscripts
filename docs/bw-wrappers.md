@@ -347,7 +347,8 @@ binary path there too, not `opencode2`.
 | `~/.config/opencode2/opencode` | `~/.config/opencode` | read-only, symlinks resolved |
 | `~/.local/share/opencode2/opencode` | `~/.local/share/opencode` | read-write, the whole directory persists |
 | `~/.cache/opencode2/opencode` | `~/.cache/opencode` | read-write (provider npm packages install here) |
-| (none) | `~/.local/state/opencode` | not persisted (ephemeral) |
+| (none) | `~/.local/state/opencode` | not persisted (ephemeral), except the next row |
+| `~/.local/state/opencode2/opencode/latest/tui` | `~/.local/state/opencode/latest/tui` | read-write (TUI plugin storage: dismissed onboarding boxes, tab layout) |
 | `<repo>/.opencode` | `<repo>/.opencode` | persistent copy under the host data dir `project-dotfiles/<hash>`, so repository content cannot inject config or plugins |
 | `/etc/opencode/opencode.json{,c}`, `skills`, `agents`, `commands`, `plugins` | same | read-only, when present |
 
@@ -355,8 +356,12 @@ The whole data directory is bound because the OpenCode 2 layout (database with
 `-shm`/`-wal`, `log`, `repos`, `shell`, ...) is not documented. Credentials are
 stored in the `credential` table of its database, so `opencode2 auth login`
 persists across sessions without anything like `--init-auth` (OpenCode 2's
-legacy `auth.json` is only an import source). State is not persisted, so the
-last-used model and prompt history are not remembered between sessions.
+legacy `auth.json` is only an import source). State is not persisted, except
+the TUI plugin storage directory (`latest/tui`), so a dismissed "Getting
+started" box and the tab layout survive restarts. Locks and background-service
+files stay ephemeral (avoids lock clashes on NFS homes and sharing service
+files with a host `opencode2`), so the last-used model and prompt history are
+not remembered between sessions.
 
 ### Config and authoring directories
 
