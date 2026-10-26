@@ -66,6 +66,9 @@
 #   - Namespace tools: masked (nsenter, unshare, chroot)
 #   - Keyring tools: masked (keyctl)
 #   - SSH/GPG agent env vars: stripped
+#   - Zellij env vars (ZELLIJ, ZELLIJ_SESSION_NAME, ZELLIJ_PANE_ID): passed;
+#     inside Zellij OPENTUI_FORCE_WCWIDTH=1 is also set so the TUI's column
+#     counts match Zellij's (a user-set OPENTUI_FORCE_WCWIDTH wins)
 #   - ~/.bashrc and other shell rc files: not mounted
 #
 # Sandbox-escape guard: OpenCode 2 normally talks to a shared background

@@ -2601,6 +2601,22 @@ build_env_vars() {
     pass_through_if_set COLORTERM
     pass_through_if_set TERM_PROGRAM
 
+    # Zellij: these only identify the session (no socket is mounted), so
+    # OpenTUI can tell it runs inside Zellij.  Zellij drops zero-width
+    # code points (emoji variation selectors, ZWJ) and has no grapheme width
+    # mode, so OpenTUI's default width counting drifts from Zellij's and the
+    # screen is left garbled until a resize.  Count each code point on its
+    # own (OPENTUI_FORCE_WCWIDTH, which OpenTUI only tests for presence)
+    # unless the user set it themselves.
+    pass_through_if_set ZELLIJ
+    pass_through_if_set ZELLIJ_SESSION_NAME
+    pass_through_if_set ZELLIJ_PANE_ID
+    if [[ -n "${OPENTUI_FORCE_WCWIDTH+x}" ]]; then
+        SANDBOX_ENV+=("OPENTUI_FORCE_WCWIDTH=${OPENTUI_FORCE_WCWIDTH}")
+    elif [[ -n "${ZELLIJ:-}" ]]; then
+        SANDBOX_ENV+=("OPENTUI_FORCE_WCWIDTH=1")
+    fi
+
     # Locale
     pass_through_if_set LANG
     pass_through_if_set LC_ALL
