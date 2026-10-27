@@ -109,6 +109,16 @@
 #                   A nested --ro-path/--rw-path overrides the one it sits under,
 #                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 #   --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox.
+#   --no-sandbox-context
+#                   Do not generate the sandbox context file (see below).
+#
+# Sandbox context: a short markdown file describing this sandbox (what is
+# mounted read-only or read-write, what is lost at exit, which tools are
+# disabled) is built from the final mounts and mounted read-only at
+# ~/.sandbox/AGENTS.md, and BWRAP_SANDBOX / BWRAP_SANDBOX_CONTEXT are set.
+# OpenCode 2 loads it through OPENCODE_CONFIG_CONTENT, whose "instructions"
+# list is added to the user's own instructions (verified with 2.1.4); no user
+# file is overwritten.  Not added to a --exec command.
 #
 # There is no --init-auth: OpenCode 2 stores credentials in its database
 # (the `credential` table in opencode.db), which lives in the persistent
@@ -167,6 +177,11 @@ parse_wrapper_args() {
                 fi
                 add_n2c_token "$2"
                 shift 2
+                ;;
+            --no-sandbox-context)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+                SANDBOX_CONTEXT_ENABLED=0
+                shift
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -732,6 +747,29 @@ build_opencode2_env() {
     fi
 }
 
+# ── Sandbox context ──────────────────────────────────────────────
+# Mount the context file (see build_sandbox_context) and make OpenCode 2 load
+# it.  OPENCODE_CONFIG_CONTENT is an inline config layered over the user's:
+# its "instructions" list is added to theirs, not substituted for it.  Any
+# host OPENCODE_CONFIG_CONTENT is dropped by build_opencode2_env, so this is
+# the only value the sandbox sees.  Must run after build_opencode2_env.
+build_opencode2_context() {
+    # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+    SANDBOX_CONTEXT_NOTES=(
+        "Only run \`opencode2\` with \`--standalone\`. Without it the CLI talks to a shared background service (port 49374) that runs tools OUTSIDE this sandbox."
+        "Plan mode writes plan files to \`~/.opencode/plan/\`, which is not mounted: they are lost at exit unless the plan-mirror plugin keeps them."
+    )
+    build_sandbox_context bwopencode2
+    [[ -n "${SANDBOX_CONTEXT_PATH}" && -z "${TEST_CMD}" ]] || return 0
+
+    local _path_json
+    if ! _path_json="$(_bwrap_json_quote "${SANDBOX_CONTEXT_PATH}")"; then
+        echo "Warning: bwopencode2: cannot pass the sandbox context file to OpenCode (unusual characters in the path)." >&2
+        return 0
+    fi
+    SANDBOX_ENV+=("OPENCODE_CONFIG_CONTENT={\"instructions\":[${_path_json}]}")
+}
+
 # ═══════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════
@@ -798,6 +836,7 @@ main() {
     # Environment variables
     build_env_vars
     build_opencode2_env
+    build_opencode2_context
 
     # Mask dangerous binaries as the very last step: a mask is hidden by any
     # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
