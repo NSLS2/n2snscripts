@@ -297,7 +297,9 @@ build_opencode_authoring_mounts() {
 # sources; config in the project cannot override it.
 #
 # Both opencode.json and opencode.jsonc are mounted when present, so
-# opencode can pick whichever format it prefers.
+# opencode can pick whichever format it prefers.  A managed
+# /etc/opencode/AGENTS.md is mounted too when present (opencode.jsonc
+# references it via "instructions").
 #
 # On hosts without /etc/opencode/, nothing is bound here — opencode
 # falls back to user config at ~/.config/opencode/ as usual.  A
@@ -316,6 +318,10 @@ build_managed_config() {
         fi
         if [[ "${_has_jsonc}" -eq 1 ]]; then
             BWRAP_ARGS+=(--ro-bind /etc/opencode/opencode.jsonc /etc/opencode/opencode.jsonc)
+        fi
+        # Managed AGENTS.md, referenced from opencode.jsonc via "instructions".
+        if [[ -f /etc/opencode/AGENTS.md ]]; then
+            BWRAP_ARGS+=(--ro-bind /etc/opencode/AGENTS.md /etc/opencode/AGENTS.md)
         fi
     else
         printf 'bwopencode: warning: no /etc/opencode/opencode.json{,c} found on host.\n' >&2
