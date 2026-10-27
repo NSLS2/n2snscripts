@@ -98,6 +98,7 @@ Common wrapper options:
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 | `--ro-path PATH`, `--rw-path PATH` | Mount an existing path read-only / read-write (may be repeated and nested) |
 | `--github-tokens` | Forward `GH_TOKEN_*` variables so `gh` can authenticate inside the sandbox (off by default) |
+| `--no-sandbox-context` | Do not tell the agent about the sandbox (by default a short description of the mounts is added to its instructions) |
 
 `bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
 persists in its data directory), always runs OpenCode 2 with `--standalone`
