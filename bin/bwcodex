@@ -101,6 +101,17 @@
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
 #                   A nested --ro-path/--rw-path overrides the one it sits under,
 #                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
+#   --no-sandbox-context
+#                   Do not generate the sandbox context file (see below).
+#
+# Sandbox context: a short markdown file describing this sandbox (what is
+# mounted read-only or read-write, what is lost at exit, which tools are
+# disabled) is built from the final mounts and mounted read-only at
+# ~/.sandbox/AGENTS.md, and BWRAP_SANDBOX / BWRAP_SANDBOX_CONTEXT are set.
+# Codex loads it through -c developer_instructions=..., which is sent as a
+# separate message and leaves AGENTS.md alone (verified with 0.164.0); skipped,
+# with a warning, when a config.toml or the command line already sets it.
+# Not added to a --exec command.
 
 set -euo pipefail
 
@@ -170,6 +181,11 @@ parse_wrapper_args() {
                 fi
                 add_n2c_token "$2"
                 shift 2
+                ;;
+            --no-sandbox-context)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+                SANDBOX_CONTEXT_ENABLED=0
+                shift
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -259,6 +275,13 @@ Wrapper options (consumed before codex sees the command line):
                   Off by default.  When set, use per-command token selection:
                     GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
                     GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
+  --no-sandbox-context
+                  Do not tell the agent about the sandbox.  By default a short
+                  description of what is mounted (read-only or read-write), what
+                  is lost at exit and which tools are disabled is mounted at
+                  ~/.sandbox/AGENTS.md and passed to Codex as
+                  developer_instructions (AGENTS.md is kept).
+                  Use --dry-run to see it.
 
 All other arguments are passed through to codex unchanged.
 
@@ -536,6 +559,40 @@ build_codex_bin_mount() {
 # Main
 # ═══════════════════════════════════════════════════════════════════
 
+# ── Sandbox context ──────────────────────────────────────────────
+# Mount the context file (see build_sandbox_context) and make Codex load it.
+# -c developer_instructions=... is sent as a separate message and leaves
+# AGENTS.md alone.  It is a single value, so it is not set when the user's
+# config.toml (system, user or project) or command line already sets it: that
+# would replace theirs.  The file is then only mounted.
+build_codex_context() {
+    # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+    SANDBOX_CONTEXT_NOTES=()
+    build_sandbox_context bwcodex
+    [[ -n "${SANDBOX_CONTEXT_PATH}" && -z "${TEST_CMD}" ]] || return 0
+
+    local _f _arg _toml
+    for _f in "${SYSTEM_CODEX_CONFIG_FILE}" "${CODEX_CONFIG_FILE}" \
+        "${_PWD}/.codex/config.toml" "${_GIT_ROOT:-${_PWD}}/.codex/config.toml"; do
+        if [[ -r "${_f}" ]] && grep -qE '^[[:space:]]*developer_instructions[[:space:]]*=' "${_f}"; then
+            echo "Warning: bwcodex: ${_f} sets developer_instructions, so Codex is not told to load ${SANDBOX_CONTEXT_PATH} (the file is still mounted)." >&2
+            return 0
+        fi
+    done
+    for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do
+        [[ "${_arg}" == -- ]] && break
+        if [[ "${_arg}" == *developer_instructions=* ]]; then
+            echo "Warning: bwcodex: developer_instructions was given on the command line, so Codex is not told to load ${SANDBOX_CONTEXT_PATH} (the file is still mounted)." >&2
+            return 0
+        fi
+    done
+    if ! _toml="$(_bwrap_toml_string "${_SANDBOX_CONTEXT_TEXT}")"; then
+        echo "Warning: bwcodex: cannot pass the sandbox context to Codex (unusual characters); the file is still mounted at ${SANDBOX_CONTEXT_PATH}." >&2
+        return 0
+    fi
+    TOOL_ARGS=(-c "developer_instructions=${_toml}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
+}
+
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
@@ -584,6 +641,7 @@ main() {
     # Environment variables
     build_env_vars
     build_codex_env
+    build_codex_context
 
     # Mask dangerous binaries as the very last step: a mask is hidden by any
     # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
