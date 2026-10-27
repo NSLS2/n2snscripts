@@ -81,6 +81,16 @@
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
 #                   A nested --ro-path/--rw-path overrides the one it sits under,
 #                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
+#   --no-sandbox-context
+#                   Do not generate the sandbox context file (see below).
+#
+# Sandbox context: a short markdown file describing this sandbox (what is
+# mounted read-only or read-write, what is lost at exit, which tools are
+# disabled) is built from the final mounts and mounted read-only at
+# ~/.sandbox/AGENTS.md, and BWRAP_SANDBOX / BWRAP_SANDBOX_CONTEXT are set.
+# OpenCode loads it through OPENCODE_CONFIG_CONTENT, whose "instructions"
+# list is added to the user's own instructions (verified with 1.19.4); no user
+# file is overwritten.  Not added to a --exec command.
 
 set -euo pipefail
 
@@ -141,6 +151,11 @@ parse_wrapper_args() {
                 fi
                 add_n2c_token "$2"
                 shift 2
+                ;;
+            --no-sandbox-context)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+                SANDBOX_CONTEXT_ENABLED=0
+                shift
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -218,6 +233,12 @@ Wrapper options (consumed before opencode sees the command line):
                   Off by default.  When set, use per-command token selection:
                     GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
                     GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
+  --no-sandbox-context
+                  Do not tell the agent about the sandbox.  By default a short
+                  description of what is mounted (read-only or read-write), what
+                  is lost at exit and which tools are disabled is mounted at
+                  ~/.sandbox/AGENTS.md and added to OpenCode's instructions
+                  (your own instructions are kept).  Use --dry-run to see it.
 
 All other arguments are passed through to opencode unchanged.
 
@@ -556,6 +577,26 @@ build_opencode_env() {
 # Main
 # ═══════════════════════════════════════════════════════════════════
 
+# ── Sandbox context ──────────────────────────────────────────────
+# Mount the context file (see build_sandbox_context) and make OpenCode load
+# it.  OPENCODE_CONFIG_CONTENT is an inline config layered over the user's:
+# its "instructions" list is added to theirs, not substituted for it.  Any
+# host OPENCODE_CONFIG_CONTENT is dropped by build_opencode_env, so this is
+# the only value the sandbox sees.  Must run after build_opencode_env.
+build_opencode_context() {
+    # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+    SANDBOX_CONTEXT_NOTES=()
+    build_sandbox_context bwopencode
+    [[ -n "${SANDBOX_CONTEXT_PATH}" && -z "${TEST_CMD}" ]] || return 0
+
+    local _path_json
+    if ! _path_json="$(_bwrap_json_quote "${SANDBOX_CONTEXT_PATH}")"; then
+        echo "Warning: bwopencode: cannot pass the sandbox context file to OpenCode (unusual characters in the path)." >&2
+        return 0
+    fi
+    SANDBOX_ENV+=("OPENCODE_CONFIG_CONTENT={\"instructions\":[${_path_json}]}")
+}
+
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
@@ -609,6 +650,7 @@ main() {
     # Environment variables
     build_env_vars
     build_opencode_env
+    build_opencode_context
 
     # Mask dangerous binaries as the very last step: a mask is hidden by any
     # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
