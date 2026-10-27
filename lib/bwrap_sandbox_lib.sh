@@ -3046,6 +3046,19 @@ _bwrap_context_touched() {
     return 1
 }
 
+# _bwrap_context_under_writable PATH
+#   Return 0 when a visible rw, copy or tmpfs mount is an ancestor of PATH: a
+#   read-only mount there is an exception to it and must be listed.
+_bwrap_context_under_writable() {
+    local _p="$1" _d
+    for _d in "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}"; do
+        case "${_CTX_MODE["${_d}"]}" in
+            rw | copy | tmpfs) [[ "${_p}" == "${_d}"/* ]] && return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # _bwrap_context_render TOOL DEST
 #   Build the context file text for launcher TOOL (to be mounted at DEST) in
 #   _SANDBOX_CONTEXT_TEXT, from BWRAP_ARGS, SANDBOX_ENV and the launcher's
@@ -3087,7 +3100,12 @@ _bwrap_context_render() {
                 _c="${_gcount["${_key}"]}"
                 _gcount["${_key}"]=$((_c + 1))
                 ;;
-            /proc | /dev | /dev/* | /tmp | /sys/*) ;;
+            /tmp)
+                [[ "${_mode}" == tmpfs ]] || _other+=("${_d}")
+                ;;
+            /sys/*)
+                [[ "${_mode}" == ro ]] || _other+=("${_d}")
+                ;;
             /usr | /bin | /sbin | /lib | /lib64)
                 if [[ "${_mode}" == rw || "${_mode}" == copy ]]; then
                     _other+=("${_d}")
@@ -3096,7 +3114,7 @@ _bwrap_context_render() {
                 fi
                 ;;
             /usr/* | /etc/*)
-                if [[ "${_mode}" != ro ]]; then
+                if [[ "${_mode}" != ro ]] || _bwrap_context_under_writable "${_d}"; then
                     _other+=("${_d}")
                 elif [[ "${_d}" == /etc/* ]]; then
                     _n="${_d#/etc/}"
@@ -3197,7 +3215,13 @@ _bwrap_context_render() {
     for _d in "${_other[@]+"${_other[@]}"}"; do
         _t+="- \`${_d}\`: $(_bwrap_context_access "${_CTX_MODE["${_d}"]}").${_nl}"
     done
-    _t+="- \`/tmp\` is a private tmpfs (lost at exit); \`/proc\` and \`/dev\` are private to the sandbox.${_nl}${_nl}"
+    _bwrap_context_mode_at /tmp
+    if [[ "${_CTX_AT}" == tmpfs ]]; then
+        _t+="- \`/tmp\` is a private tmpfs (lost at exit)."
+    else
+        _t+="- \`/tmp\` is NOT private here (see its mount above): what you write there may persist on the host."
+    fi
+    _t+=" \`/proc\` and \`/dev\` are private to the sandbox unless listed above.${_nl}${_nl}"
 
     _t+="## Not available${_nl}${_nl}"
     _line=""

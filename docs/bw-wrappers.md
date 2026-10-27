@@ -165,7 +165,8 @@ and makes the tool load it.
   table of every mount under `$HOME` marked `rw` / `ro` / `copy` (a writable
   copy of a host file, lost at exit) / `tmpfs`; the system mounts collapsed
   into one line each, with writable exceptions such as `--rw-path /usr/local`
-  listed on their own; what is not mounted (credential and rc files are named
+  (and read-only exceptions below them) listed on their own, and `/tmp`
+  described from its effective mount (`--rw-path /tmp` makes it the host's); what is not mounted (credential and rc files are named
   only when no mount exposes them); the disabled binaries; the *names* of
   passed-in variables (never values); and tool-specific notes (`bwopencode2`:
   use `--standalone`, plans in `~/.opencode/plan` are lost). A mount hidden by
@@ -182,7 +183,7 @@ files:
 | --- | --- | --- |
 | `bwopencode`, `bwopencode2` | `OPENCODE_CONFIG_CONTENT='{"instructions":["<file>"]}'`; the list is added to the user's `instructions` (tested with 1.19.4 and 2.1.4, including a project `opencode.json`). A host value of this variable is dropped, as before. | Not applicable: lists are combined |
 | `bwclaude` | `--append-system-prompt-file <file>`; adds to the default system prompt and leaves `CLAUDE.md` alone | A user `--append-system-prompt[-file]` wins; warning, file only mounted |
-| `bwcodex` | `-c developer_instructions=<text>`; a separate message that leaves `AGENTS.md` alone | `developer_instructions` in the system, user or project `config.toml`, or in a `-c` argument, wins; warning, file only mounted |
+| `bwcodex` | `-c developer_instructions=<text>`; a separate message that leaves `AGENTS.md` alone | `developer_instructions` in any form (also a quoted, dotted or profile key, or an inline table) in the system, user or any project `config.toml` from the repository root down, or anywhere in the arguments, wins; warning, file only mounted |
 | `bwcopilot` | `COPILOT_CUSTOM_INSTRUCTIONS_DIRS=~/.sandbox`; Copilot reads that directory's `AGENTS.md` in addition to its usual files | A host value is not forwarded (it never was), so nothing is replaced |
 
 `--exec` mounts the file and sets the two variables but adds no loader, since

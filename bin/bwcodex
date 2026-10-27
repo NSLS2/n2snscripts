@@ -565,23 +565,39 @@ build_codex_bin_mount() {
 # AGENTS.md alone.  It is a single value, so it is not set when the user's
 # config.toml (system, user or project) or command line already sets it: that
 # would replace theirs.  The file is then only mounted.
+# _codex_sets_developer_instructions FILE
+#   Return 0 when the TOML FILE sets developer_instructions anywhere: as a key
+#   at the start of a line, a quoted or dotted key (profiles.x.developer_instructions)
+#   or inside an inline table.  Comment lines are ignored.
+_codex_sets_developer_instructions() {
+    [[ -r "$1" ]] || return 1
+    grep -vE '^[[:space:]]*#' "$1" | grep -qE "developer_instructions[\"']?[[:space:]]*="
+}
+
 build_codex_context() {
     # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
     SANDBOX_CONTEXT_NOTES=()
     build_sandbox_context bwcodex
     [[ -n "${SANDBOX_CONTEXT_PATH}" && -z "${TEST_CMD}" ]] || return 0
 
-    local _f _arg _toml
-    for _f in "${SYSTEM_CODEX_CONFIG_FILE}" "${CODEX_CONFIG_FILE}" \
-        "${_PWD}/.codex/config.toml" "${_GIT_ROOT:-${_PWD}}/.codex/config.toml"; do
-        if [[ -r "${_f}" ]] && grep -qE '^[[:space:]]*developer_instructions[[:space:]]*=' "${_f}"; then
+    # Project configs are read from the repository root down to the working
+    # directory, so check every directory on that path.
+    local _f _arg _toml _dir="${_PWD}"
+    local -a _files=("${SYSTEM_CODEX_CONFIG_FILE}" "${CODEX_CONFIG_FILE}")
+    while :; do
+        _files+=("${_dir}/.codex/config.toml")
+        [[ "${_dir}" == "${_GIT_ROOT:-${_PWD}}" || "${_dir}" == / || -z "${_dir}" ]] && break
+        _dir="${_dir%/*}"
+    done
+    for _f in "${_files[@]}"; do
+        if _codex_sets_developer_instructions "${_f}"; then
             echo "Warning: bwcodex: ${_f} sets developer_instructions, so Codex is not told to load ${SANDBOX_CONTEXT_PATH} (the file is still mounted)." >&2
             return 0
         fi
     done
     for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do
         [[ "${_arg}" == -- ]] && break
-        if [[ "${_arg}" == *developer_instructions=* ]]; then
+        if [[ "${_arg}" == *developer_instructions* ]]; then
             echo "Warning: bwcodex: developer_instructions was given on the command line, so Codex is not told to load ${SANDBOX_CONTEXT_PATH} (the file is still mounted)." >&2
             return 0
         fi
