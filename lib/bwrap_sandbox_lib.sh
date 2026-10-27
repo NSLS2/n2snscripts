@@ -2912,22 +2912,30 @@ build_env_vars() {
 #   BWRAP_SANDBOX_CONTEXT  path of the context file
 
 # Row data collected from BWRAP_ARGS by _bwrap_context_collect, keyed by the
-# destination path.  _CTX_DESTS keeps first-seen order; a later mount at the
-# same destination replaces the earlier one, as in bwrap.
+# cleaned destination path.  _CTX_DESTS keeps first-seen order.  A later mount
+# at a destination replaces the earlier one and hides everything mounted below
+# it (mode "hidden"), as in bwrap.
 declare -A _CTX_MODE=()
 declare -A _CTX_SRC=()
 _CTX_DESTS=()
+_CTX_HOME=""
+_CTX_AT=""
+# Characters that would break the markdown or the line-based processing below
+# (control characters, | and a backtick) are shown as ? in every path.
+_CTX_BAD='[[:cntrl:]|`]'
 
 # _bwrap_context_collect
-#   Walk BWRAP_ARGS and record every bind, tmpfs and symlink destination.
-#   *-try binds whose source is missing are skipped (bwrap skips them too), as
-#   is anything bound from /dev/null (the tty mask and, later, the binary
-#   masks).
+#   Walk BWRAP_ARGS and record every bind, file copy, tmpfs and symlink
+#   destination with its mode: ro, rw, copy (--file and --bind-data: a
+#   writable copy that is lost at exit), tmpfs or link.  *-try binds whose
+#   source is missing are skipped (bwrap skips them too), as is anything bound
+#   from /dev/null (the tty mask and, later, the binary masks).
 _bwrap_context_collect() {
     _CTX_DESTS=()
     _CTX_MODE=()
     _CTX_SRC=()
-    local _i=0 _flag _a1 _a2 _mode _src _dest
+    _CTX_HOME="${_HOME//${_CTX_BAD}/?}"
+    local _i=0 _flag _a1 _a2 _mode _src _dest _e
     while [[ ${_i} -lt ${#BWRAP_ARGS[@]} ]]; do
         _flag="${BWRAP_ARGS[${_i}]}"
         _bwrap_flag_arity "${_flag}"
@@ -2937,17 +2945,25 @@ _bwrap_context_collect() {
         _src=""
         case "${_flag}" in
             --ro-bind | --ro-bind-try)
-                _mode=ro
+                _mode="ro"
                 _src="${_a1}"
                 _dest="${_a2}"
                 ;;
             --bind | --bind-try)
-                _mode=rw
+                _mode="rw"
                 _src="${_a1}"
                 _dest="${_a2}"
                 ;;
+            --ro-bind-data)
+                _mode="ro"
+                _dest="${_a2}"
+                ;;
+            --file | --bind-data)
+                _mode="copy"
+                _dest="${_a2}"
+                ;;
             --tmpfs)
-                _mode=tmpfs
+                _mode="tmpfs"
                 _dest="${_a1}"
                 ;;
             --symlink)
@@ -2963,6 +2979,10 @@ _bwrap_context_collect() {
             *-try) [[ -e "${_src}" ]] || continue ;;
         esac
         [[ "${_src}" == /dev/null ]] && continue
+        _dest="${_dest//${_CTX_BAD}/?}"
+        for _e in "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}"; do
+            [[ "${_e}" == "${_dest}"/* ]] && _CTX_MODE["${_e}"]="hidden"
+        done
         [[ -n "${_CTX_MODE["${_dest}"]+x}" ]] || _CTX_DESTS+=("${_dest}")
         _CTX_MODE["${_dest}"]="${_mode}"
         _CTX_SRC["${_dest}"]="${_src}"
@@ -2970,14 +2990,14 @@ _bwrap_context_collect() {
 }
 
 # _bwrap_context_display PATH
-#   Print PATH with a leading $HOME shown as ~.
+#   Print PATH cleaned, with a leading $HOME shown as ~.
 _bwrap_context_display() {
-    local _p="$1"
-    if [[ "${_p}" == "${_HOME}" ]]; then
+    local _p="${1//${_CTX_BAD}/?}"
+    if [[ "${_p}" == "${_CTX_HOME}" ]]; then
         printf '~'
-    elif [[ "${_p}" == "${_HOME}"/* ]]; then
+    elif [[ "${_p}" == "${_CTX_HOME}"/* ]]; then
         # shellcheck disable=SC2088  # a literal tilde is wanted
-        printf '~/%s' "${_p#"${_HOME}"/}"
+        printf '~/%s' "${_p#"${_CTX_HOME}"/}"
     else
         printf '%s' "${_p}"
     fi
@@ -2989,9 +3009,41 @@ _bwrap_context_access() {
     case "$1" in
         ro) printf 'ro' ;;
         rw) printf 'rw' ;;
+        copy) printf 'copy' ;;
         tmpfs) printf 'tmpfs' ;;
         link) printf 'symlink' ;;
     esac
+}
+
+# _bwrap_context_mode_at PATH
+#   Set _CTX_AT to the mode of the deepest visible mount that is PATH or one of
+#   its ancestors (empty when none).
+_bwrap_context_mode_at() {
+    local _p="${1//${_CTX_BAD}/?}"
+    _CTX_AT=""
+    while [[ -n "${_p}" ]]; do
+        if [[ -n "${_CTX_MODE["${_p}"]+x}" && "${_CTX_MODE["${_p}"]}" != hidden ]]; then
+            _CTX_AT="${_CTX_MODE["${_p}"]}"
+            return 0
+        fi
+        _p="${_p%/*}"
+    done
+}
+
+# _bwrap_context_touched PATH
+#   Return 0 when a visible mount is PATH, lies below it, or is a bind that
+#   contains it (a tmpfs does not count: $HOME itself is one).
+_bwrap_context_touched() {
+    local _p="$1" _d _m
+    for _d in "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}"; do
+        _m="${_CTX_MODE["${_d}"]}"
+        [[ "${_m}" == hidden ]] && continue
+        [[ "${_d}" == "${_p}" || "${_d}" == "${_p}"/* ]] && return 0
+        case "${_m}" in
+            ro | rw | copy) [[ "${_p}" == "${_d}"/* ]] && return 0 ;;
+        esac
+    done
+    return 1
 }
 
 # _bwrap_context_render TOOL DEST
@@ -3001,7 +3053,7 @@ _bwrap_context_access() {
 #   except the binary masks (the masked names come from _MASKED_BINS).
 _bwrap_context_render() {
     local _tool="$1" _dest_file="$2" _nl=$'\n'
-    local _t="" _d _key _mode _line _n _c _tab=$'\t' _names _cnt
+    local _t="" _d _key _mode _line _n _c _tab=$'\t' _gn _acc _p
 
     _bwrap_context_collect
 
@@ -3010,16 +3062,19 @@ _bwrap_context_render() {
         _sorted+=("${_d}")
     done < <(printf '%s\n' "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}" | LC_ALL=C sort)
 
-    # Home rows, grouped by (parent directory, mode); other destinations.
+    # Home rows are grouped by (parent directory, mode).  System mounts are
+    # collapsed; a mount outside $HOME that is not read-only, or not part of
+    # the system trees, is listed on its own.
     local -a _gkeys=() _sys=() _etc=() _other=()
     declare -A _gnames=() _gcount=() _gfirst=() _seen=()
     local _par
     for _d in "${_sorted[@]+"${_sorted[@]}"}"; do
         [[ -n "${_d}" ]] || continue
         _mode="${_CTX_MODE["${_d}"]}"
+        [[ "${_mode}" == hidden ]] && continue
         case "${_d}" in
-            "${_HOME}") continue ;;
-            "${_HOME}"/*)
+            "${_CTX_HOME}") continue ;;
+            "${_CTX_HOME}"/*)
                 _par="${_d%/*}"
                 _key="${_par}${_tab}${_mode}"
                 if [[ -z "${_gcount["${_key}"]:-}" ]]; then
@@ -3033,14 +3088,23 @@ _bwrap_context_render() {
                 _gcount["${_key}"]=$((_c + 1))
                 ;;
             /proc | /dev | /dev/* | /tmp | /sys/*) ;;
-            /usr | /bin | /sbin | /lib | /lib64) _sys+=("${_d}") ;;
-            /usr/*) ;;
-            /etc/*)
-                _n="${_d#/etc/}"
-                _n="${_n%%/*}"
-                if [[ -z "${_seen["etc:${_n}"]:-}" ]]; then
-                    _seen["etc:${_n}"]=1
-                    _etc+=("${_n}")
+            /usr | /bin | /sbin | /lib | /lib64)
+                if [[ "${_mode}" == rw || "${_mode}" == copy ]]; then
+                    _other+=("${_d}")
+                else
+                    _sys+=("${_d}")
+                fi
+                ;;
+            /usr/* | /etc/*)
+                if [[ "${_mode}" != ro ]]; then
+                    _other+=("${_d}")
+                elif [[ "${_d}" == /etc/* ]]; then
+                    _n="${_d#/etc/}"
+                    _n="${_n%%/*}"
+                    if [[ -z "${_seen["etc:${_n}"]:-}" ]]; then
+                        _seen["etc:${_n}"]=1
+                        _etc+=("${_n}")
+                    fi
                 fi
                 ;;
             *) _other+=("${_d}") ;;
@@ -3053,7 +3117,7 @@ _bwrap_context_render() {
     _t+=" This file describes this session; trust it over assumptions about the host.${_nl}${_nl}"
 
     _t+="## What this means${_nl}${_nl}"
-    _t+="- \`\$HOME\` ($(_bwrap_context_display "${_HOME}") = ${_HOME}) is an empty tmpfs. Only the paths listed below exist in it;"
+    _t+="- \`\$HOME\` (~ = ${_CTX_HOME}) is an empty tmpfs. Only the paths listed below exist in it;"
     _t+=" anything else you write there is lost when the session ends.${_nl}"
     _t+="- Read-only files under \`\$HOME\` that look like links are bind mounts, not hard links."
     _t+=" The launcher resolves host symlinks and mounts the target at the expected path,"
@@ -3064,12 +3128,19 @@ _bwrap_context_render() {
     _t+=" and only if the source is mounted read-write below."
     _t+=" \"Read-only file system\" on a mount point is expected.${_nl}"
     _t+="- \`ln -s\` creates ordinary symlinks, in writable locations only.${_nl}"
-    _t+="- Read-write mounts are the real host files (often NFS): changes are visible on the host at once.${_nl}"
     _t+="- The network is shared with the host. Host processes are not visible (private PID namespace)."
     _t+=" There are no SSH or GPG agents and no sudo.${_nl}${_nl}"
 
+    _bwrap_context_mode_at "${_PWD}"
+    case "${_CTX_AT}" in
+        rw) _acc="read-write" ;;
+        ro) _acc="read-only" ;;
+        copy) _acc="a writable copy (lost at exit)" ;;
+        tmpfs) _acc="an empty tmpfs (lost at exit)" ;;
+        *) _acc="not mounted" ;;
+    esac
     _t+="## Working directory${_nl}${_nl}"
-    _t+="\`$(_bwrap_context_display "${_PWD}")\`, read-write."
+    _t+="\`$(_bwrap_context_display "${_PWD}")\`, ${_acc}."
     if [[ -n "${_GIT_ROOT}" ]]; then
         if [[ "${_PWD}" == "${_GIT_ROOT}" ]]; then
             _t+=" It is the root of a git repository, which is mounted whole;"
@@ -3082,10 +3153,13 @@ _bwrap_context_render() {
     fi
     _t+="${_nl}${_nl}"
 
-    _t+="## Mounts under \`\$HOME\`${_nl}${_nl}"
+    _t+="## Mounts${_nl}${_nl}"
     _t+="\`rw\` is the real host files (often NFS): changes persist and show on the host at once."
-    _t+=" \`ro\` is read-only. \`tmpfs\` is empty and lost at exit, except the mounts listed under it."
-    _t+="${_nl}${_nl}| Path | Access |${_nl}| --- | --- |${_nl}"
+    _t+=" \`ro\` is read-only. \`copy\` is a writable copy of a host file: changes are lost at exit."
+    _t+=" \`tmpfs\` is empty and lost at exit, except the mounts listed under it.${_nl}${_nl}"
+
+    _t+="### Under \`\$HOME\`${_nl}${_nl}"
+    _t+="| Path | Access |${_nl}| --- | --- |${_nl}"
     if [[ ${#_gkeys[@]} -eq 0 ]]; then
         _t+="| (none) | |${_nl}"
     else
@@ -3095,25 +3169,21 @@ _bwrap_context_render() {
                 _d="${_gfirst["${_key}"]}"
                 _line="| \`$(_bwrap_context_display "${_d}")\` | $(_bwrap_context_access "${_mode}")"
                 if [[ "${_mode}" == link ]]; then
-                    _line+=" to \`${_CTX_SRC["${_d}"]}\`"
+                    _line+=" to \`$(_bwrap_context_display "${_CTX_SRC["${_d}"]}")\`"
                 elif [[ -n "${_CTX_SRC["${_d}"]}" && "${_CTX_SRC["${_d}"]}" != "${_d}" ]]; then
                     _line+=" (host source \`$(_bwrap_context_display "${_CTX_SRC["${_d}"]}")\`)"
                 fi
             else
                 _par="${_key%"${_tab}"*}"
-                _names="${_gnames["${_key}"]}"
-                _cnt="${_gcount["${_key}"]}"
-                if [[ "${_cnt}" -gt 4 ]]; then
-                    _names="$(printf '%s' "${_names}" | cut -d, -f1-3),…+$((_cnt - 3))"
-                fi
-                _line="| \`$(_bwrap_context_display "${_par}")/{${_names}}\` | $(_bwrap_context_access "${_mode}")"
+                _gn="${_gnames["${_key}"]}"
+                _line="| \`$(_bwrap_context_display "${_par}")/{${_gn}}\` | $(_bwrap_context_access "${_mode}")"
             fi
             _t+="${_line} |${_nl}"
         done < <(printf '%s\n' "${_gkeys[@]}" | LC_ALL=C sort)
     fi
     _t+="${_nl}"
 
-    _t+="## Other mounts${_nl}${_nl}"
+    _t+="### Elsewhere${_nl}${_nl}"
     if [[ ${#_sys[@]} -gt 0 ]]; then
         _line=""
         for _d in "${_sys[@]}"; do _line+="${_line:+, }\`${_d}\`"; done
@@ -3130,9 +3200,14 @@ _bwrap_context_render() {
     _t+="- \`/tmp\` is a private tmpfs (lost at exit); \`/proc\` and \`/dev\` are private to the sandbox.${_nl}${_nl}"
 
     _t+="## Not available${_nl}${_nl}"
-    _t+="- Not mounted: everything under \`\$HOME\` that is not listed above, including"
-    _t+=" \`~/.ssh\`, \`~/.gnupg\`, \`~/.aws\`, \`~/.kube\`, \`~/.docker\`, \`~/.netrc\`, \`~/.config/gh\` and shell rc files."
-    _t+="${_nl}"
+    _line=""
+    for _n in .ssh .gnupg .aws .kube .docker .netrc .config/gh .bashrc .bash_profile .zshrc .profile; do
+        _p="${_CTX_HOME}/${_n}"
+        _bwrap_context_touched "${_p}" || _line+="${_line:+, }\`~/${_n}\`"
+    done
+    _t+="- Not mounted: everything under \`\$HOME\` that is not listed above"
+    [[ -z "${_line}" ]] || _t+=", for example ${_line}"
+    _t+=".${_nl}"
     if [[ "${HAS_BIND_OVER_RO}" -eq 1 ]]; then
         _line=""
         for _n in "${_MASKED_BINS[@]}"; do _line+="${_line:+, }\`${_n}\`"; done

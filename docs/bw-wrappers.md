@@ -161,11 +161,17 @@ and makes the tool load it.
   (the path) are set in the sandbox for scripts and skills.
 - **Contents** (about 50 lines): `$HOME` is a tmpfs; same-inode files are bind
   mounts, not hard links, and are edited at their source; the working directory
-  and whether it is a git root; a table of the mounts under `$HOME` marked
-  `rw` / `ro` / `tmpfs` with system mounts collapsed into one line each; what is
-  not mounted; the disabled binaries; the *names* of passed-in variables (never
-  values); and tool-specific notes (`bwopencode2`: use `--standalone`, plans in
-  `~/.opencode/plan` are lost).
+  (its access taken from the effective mounts) and whether it is a git root; a
+  table of every mount under `$HOME` marked `rw` / `ro` / `copy` (a writable
+  copy of a host file, lost at exit) / `tmpfs`; the system mounts collapsed
+  into one line each, with writable exceptions such as `--rw-path /usr/local`
+  listed on their own; what is not mounted (credential and rc files are named
+  only when no mount exposes them); the disabled binaries; the *names* of
+  passed-in variables (never values); and tool-specific notes (`bwopencode2`:
+  use `--standalone`, plans in `~/.opencode/plan` are lost). A mount hidden by
+  a later mount over its parent (for example `--ro-path` on the working
+  directory) is left out. Control characters, `|` and backticks in paths are
+  shown as `?`.
 - **Snapshot.** The file is written at launch; the mounts of a running sandbox
   cannot change, so it stays correct for the whole session.
 
