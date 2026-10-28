@@ -59,6 +59,10 @@ EXTRA_RO_PATHS=()
 # shellcheck disable=SC2034  # used by tool wrappers that source this library
 EXTRA_RW_PATHS=()
 
+# N2C access tokens requested with --n2c-token (names, or "all").
+# Populated by add_n2c_token; mounted by build_n2c_token_mounts.
+N2C_TOKENS=()
+
 # Tool binary (set by bwrap_resolve_tool)
 _TOOL_BIN=""
 _TOOL_CMD=()
@@ -1026,7 +1030,7 @@ _is_prefix_of() {
 _BWRAP_BLOCKED_LIST=()
 _BWRAP_BLOCKED_KEY=""
 _bwrap_load_blocked_prefixes() {
-    local _key="${_HOME}|${XDG_CONFIG_HOME:-}|${XDG_DATA_HOME:-}"
+    local _key="${_HOME}|${XDG_CONFIG_HOME:-}|${XDG_DATA_HOME:-}|${XDG_RUNTIME_DIR:-}|${N2C_STATE_DIR:-}"
     [[ "${_key}" == "${_BWRAP_BLOCKED_KEY}" && ${#_BWRAP_BLOCKED_LIST[@]} -gt 0 ]] && return 0
     local -a _literal=(
         # SSH / GPG / cloud keys
@@ -1049,6 +1053,10 @@ _bwrap_load_blocked_prefixes() {
         "${_HOME}/.config/op"        # 1Password CLI (alternate path)
         # GitHub CLI tokens
         "${_HOME}/.config/gh"
+        # n2c-token session: the MSAL cache holds the refresh token, which can
+        # mint access tokens for every NSLS-II API.  Only the access-token files
+        # are ever mounted (see build_n2c_token_mounts).
+        "$(_n2c_state_dir)"
         # Default stores of git's "store" credential helper (plaintext).  Listing
         # them here makes the working-directory / --ro-path / --rw-path checks
         # refuse them, and refuse a directory that contains an existing one
@@ -1538,6 +1546,130 @@ build_extra_path_mounts() {
             BWRAP_ARGS+=(--bind "${_canon}" "${_canon}")
         fi
         _bound_dests["${_canon}"]=1
+    done
+}
+
+# ── N2C access tokens ────────────────────────────────────────────
+
+# n2c-token (NSLS2/ansible roles/base) signs a user in once on the host and
+# keeps a short-lived access token per API in
+#   ${N2SN_CREDS_DIR:-${XDG_RUNTIME_DIR:-/run/user/UID}/nsls2/creds}/NAME/token
+# It keeps the MSAL cache, which holds the refresh token, in
+#   ${N2C_STATE_DIR:-${XDG_RUNTIME_DIR:-/run/user/UID}/nsls2/n2c}
+# These helpers use the same defaults.  Only token files are ever mounted.
+_n2c_runtime_dir() {
+    printf '%s\n' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+}
+
+_n2c_creds_root() {
+    printf '%s\n' "${N2SN_CREDS_DIR:-$(_n2c_runtime_dir)/nsls2/creds}"
+}
+
+_n2c_state_dir() {
+    printf '%s\n' "${N2C_STATE_DIR:-$(_n2c_runtime_dir)/nsls2/n2c}"
+}
+
+# add_n2c_token NAME
+#   Record a --n2c-token argument.  NAME is "all" or a token name: lowercase
+#   letters, digits and "-", starting and ending with a letter or digit.
+add_n2c_token() {
+    local name="$1"
+    local name_re='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+    if [[ ! "${name}" =~ ${name_re} ]]; then
+        echo "Error: --n2c-token '${name}': expected 'all' or a token name (lowercase letters, digits and '-')." >&2
+        exit 1
+    fi
+    N2C_TOKENS+=("${name}")
+}
+
+# _n2c_require_private DIR WHAT
+#   Exit 1 unless DIR is a real directory (not a symlink) owned by the
+#   current user with mode 0700.
+_n2c_require_private() {
+    local dir="$1" what="$2"
+    if [[ -L "${dir}" ]] || [[ ! -d "${dir}" ]] || [[ ! -O "${dir}" ]]; then
+        echo "Error: ${what} '${dir}' must be a real directory owned by you (not a symlink). Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+    if [[ "$(stat -c '%a' -- "${dir}" 2> /dev/null || true)" != "700" ]]; then
+        echo "Error: ${what} '${dir}' must have mode 0700. Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+}
+
+# build_n2c_token_mounts
+#   Add the token files requested with --n2c-token to EXTRA_RO_PATHS, so
+#   build_extra_path_mounts validates and mounts each one read-only at its own
+#   path.  Nothing is mounted unless --n2c-token was given.  "all" selects every
+#   non-empty token under the credentials directory.  n2c-token rewrites a token
+#   in place, so a mounted file sees every refresh.
+#
+#   A requested token that is missing or empty only warns (run `n2c-token
+#   login`).  A credentials directory or token directory that is a symlink, is
+#   owned by someone else or is not mode 0700, or a token file that is a
+#   symlink or not a regular file, is an error: the launch stops.
+#
+#   Must be called BEFORE build_extra_path_mounts.
+build_n2c_token_mounts() {
+    [[ -z "${N2C_TOKENS[*]+x}" ]] && return 0
+
+    local root name tdir tfile want_all=0
+    local -a names=() found=()
+    local -A seen=()
+    root="$(_n2c_creds_root)"
+
+    for name in "${N2C_TOKENS[@]}"; do
+        if [[ "${name}" == "all" ]]; then
+            want_all=1
+        elif [[ -z "${seen["${name}"]:-}" ]]; then
+            seen["${name}"]=1
+            names+=("${name}")
+        fi
+    done
+
+    if [[ ! -e "${root}" && ! -L "${root}" ]]; then
+        echo "Warning: N2C credentials directory '${root}' does not exist; no tokens mounted. Run: n2c-token login" >&2
+        return 0
+    fi
+    _n2c_require_private "${root}" "N2C credentials directory"
+
+    if [[ ${want_all} -eq 1 ]]; then
+        names=()
+        for tdir in "${root}"/*/; do
+            [[ -e "${tdir}" || -L "${tdir}" ]] || continue
+            tdir="${tdir%/}"
+            name="${tdir##*/}"
+            [[ "${name}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || continue
+            names+=("${name}")
+        done
+    fi
+
+    for name in "${names[@]+"${names[@]}"}"; do
+        tdir="${root}/${name}"
+        tfile="${tdir}/token"
+        if [[ ! -e "${tdir}" && ! -L "${tdir}" ]]; then
+            echo "Warning: no N2C token '${name}' (${tdir} does not exist); not mounted." >&2
+            continue
+        fi
+        _n2c_require_private "${tdir}" "N2C token directory"
+        if [[ -L "${tfile}" ]] || { [[ -e "${tfile}" ]] && [[ ! -f "${tfile}" ]]; }; then
+            echo "Error: N2C token '${tfile}' must be a regular file, not a symlink. Refusing to mount N2C tokens." >&2
+            exit 1
+        fi
+        if [[ ! -s "${tfile}" ]]; then
+            if [[ ${want_all} -eq 0 ]]; then
+                echo "Warning: N2C token '${name}' is missing or empty; not mounted. Run: n2c-token login" >&2
+            fi
+            continue
+        fi
+        found+=("${tfile}")
+    done
+
+    if [[ ${want_all} -eq 1 && ${#found[@]} -eq 0 ]]; then
+        echo "Warning: no N2C tokens found in '${root}'; none mounted. Run: n2c-token login" >&2
+    fi
+    for tfile in "${found[@]+"${found[@]}"}"; do
+        EXTRA_RO_PATHS+=("${tfile}")
     done
 }
 
