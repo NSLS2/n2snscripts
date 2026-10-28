@@ -1561,12 +1561,24 @@ _n2c_runtime_dir() {
     printf '%s\n' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 }
 
+# _n2c_strip_slashes PATH
+#   Print PATH without trailing slashes ("/" stays "/").  A trailing slash makes
+#   `[[ -L ... ]]` follow the link, so a symlink given as "link/" would pass the
+#   symlink checks below.
+_n2c_strip_slashes() {
+    local p="$1"
+    while [[ "${p}" == */ && "${p}" != "/" ]]; do
+        p="${p%/}"
+    done
+    printf '%s\n' "${p}"
+}
+
 _n2c_creds_root() {
-    printf '%s\n' "${N2SN_CREDS_DIR:-$(_n2c_runtime_dir)/nsls2/creds}"
+    _n2c_strip_slashes "${N2SN_CREDS_DIR:-$(_n2c_runtime_dir)/nsls2/creds}"
 }
 
 _n2c_state_dir() {
-    printf '%s\n' "${N2C_STATE_DIR:-$(_n2c_runtime_dir)/nsls2/n2c}"
+    _n2c_strip_slashes "${N2C_STATE_DIR:-$(_n2c_runtime_dir)/nsls2/n2c}"
 }
 
 # add_n2c_token NAME
@@ -1586,7 +1598,8 @@ add_n2c_token() {
 #   Exit 1 unless DIR is a real directory (not a symlink) owned by the
 #   current user with mode 0700.
 _n2c_require_private() {
-    local dir="$1" what="$2"
+    local dir what="$2"
+    dir="$(_n2c_strip_slashes "$1")"
     if [[ -L "${dir}" ]] || [[ ! -d "${dir}" ]] || [[ ! -O "${dir}" ]]; then
         echo "Error: ${what} '${dir}' must be a real directory owned by you (not a symlink). Refusing to mount N2C tokens." >&2
         exit 1
