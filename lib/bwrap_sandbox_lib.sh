@@ -1602,7 +1602,9 @@ _n2c_require_private() {
 #   build_extra_path_mounts validates and mounts each one read-only at its own
 #   path.  Nothing is mounted unless --n2c-token was given.  "all" selects every
 #   non-empty token under the credentials directory.  n2c-token rewrites a token
-#   in place, so a mounted file sees every refresh.
+#   in place, so a mounted file sees every refresh.  When at least one token is
+#   mounted, N2SN_CREDS_DIR (the canonical credentials directory) is set in the
+#   sandbox environment, because the host's location variables are not passed in.
 #
 #   A requested token that is missing or empty only warns (run `n2c-token
 #   login`).  A credentials directory or token directory that is a symlink, is
@@ -1671,6 +1673,16 @@ build_n2c_token_mounts() {
     for tfile in "${found[@]+"${found[@]}"}"; do
         EXTRA_RO_PATHS+=("${tfile}")
     done
+
+    # The sandbox environment is scrubbed (env -i), so tell consumers where the
+    # tokens are, as they would find them on the host.  The files are mounted
+    # at their canonical paths, so give the canonical credentials directory.
+    if [[ ${#found[@]} -gt 0 ]]; then
+        local croot
+        croot="$(readlink -f -- "${root}" 2> /dev/null || true)"
+        [[ -n "${croot}" ]] || croot="${root}"
+        SANDBOX_ENV+=("N2SN_CREDS_DIR=${croot}")
+    fi
 }
 
 # ── Path resolution ──────────────────────────────────────────────

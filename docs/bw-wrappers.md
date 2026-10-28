@@ -131,6 +131,10 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   `n2c-token` timer (`n2c-token install` on the host).
 - **Locations.** `N2SN_CREDS_DIR` and `N2C_STATE_DIR` override the two
   directories, as they do for `n2c-token`.
+- **The sandbox is told where the tokens are.** The sandbox environment is
+  scrubbed, so when at least one token is mounted the launcher sets
+  `N2SN_CREDS_DIR` inside the sandbox to the credentials directory, even when
+  the host uses a non-default location. Nothing is set when no token is mounted.
 
 Example: `bwopencode2 --n2c-token observability --n2c-token epics`.
 
