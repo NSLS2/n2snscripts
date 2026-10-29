@@ -1698,6 +1698,40 @@ build_n2c_token_mounts() {
     fi
 }
 
+# verify_n2c_state_not_exposed
+#   Exit 1 when a bind mount in BWRAP_ARGS would expose the N2C session
+#   directory, which holds the refresh token (see _n2c_state_dir).  The blocked
+#   list refuses --ro-path and --rw-path, but the automatic whole-directory mounts
+#   (npm and pixi caches, ccache, tool data and cache directories) are only
+#   checked for being blocked themselves, so with N2C_STATE_DIR set inside one of
+#   them the session directory would be mounted along with it.  This looks at the
+#   finished mount list, so it covers every mount whatever added it.  Nothing is
+#   checked while the directory does not exist.
+#
+#   Called by print_dry_run and launch_sandbox, after all mounts are built.
+verify_n2c_state_not_exposed() {
+    local state canon src flag i=0
+    state="$(_n2c_state_dir)"
+    [[ -e "${state}" ]] || return 0
+    canon="$(readlink -f -- "${state}" 2> /dev/null || true)"
+    while [[ ${i} -lt ${#BWRAP_ARGS[@]} ]]; do
+        flag="${BWRAP_ARGS[${i}]}"
+        _bwrap_flag_arity "${flag}"
+        case "${flag}" in
+            --bind | --bind-try | --ro-bind | --ro-bind-try | --dev-bind | --dev-bind-try)
+                src="${BWRAP_ARGS[$((i + 1))]}"
+                if _is_prefix_of "${src}" "${state}" ||
+                    { [[ -n "${canon}" ]] && _is_prefix_of "${src}" "${canon}"; }; then
+                    echo "Error: the mount of '${src}' would expose the N2C session directory '${state}' (it holds the refresh token)." >&2
+                    echo "       Move N2C_STATE_DIR out of directories that the launcher mounts (for example ~/.npm, ~/.pixi, ~/.ccache)." >&2
+                    exit 1
+                fi
+                ;;
+        esac
+        i=$((i + 1 + _BWRAP_FLAG_ARITY))
+    done
+}
+
 # ── Path resolution ──────────────────────────────────────────────
 
 resolve_common_paths() {
@@ -2892,6 +2926,7 @@ _is_secret_env_name() {
 }
 
 print_dry_run() {
+    verify_n2c_state_not_exposed
     local _BWRAP_BIN _ENV_BIN
     _BWRAP_BIN="$(command -v bwrap)"
     _ENV_BIN="$(resolve_env_bin)"
@@ -2963,6 +2998,7 @@ print_dry_run() {
 # via PATH lookup at exec time — this prevents a user shell script named
 # "env" earlier on PATH from hijacking the launch.  See resolve_env_bin.
 launch_sandbox() {
+    verify_n2c_state_not_exposed
     local _BWRAP_BIN _ENV_BIN
     _BWRAP_BIN="$(command -v bwrap)"
     _ENV_BIN="$(resolve_env_bin)"

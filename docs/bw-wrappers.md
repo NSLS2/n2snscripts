@@ -122,6 +122,12 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   in `/run/user/<uid>/nsls2/n2c` and is on the blocked list, so `--ro-path` and
   `--rw-path` refuse it and refuse a directory that contains it. The creds
   directory itself is allowed.
+- **Automatic mounts cannot expose it either.** Directories the launcher mounts
+  whole (the npm and pixi caches, ccache, the tool data and cache directories)
+  are only checked for being blocked themselves. So, after all mounts are built,
+  the launch stops with an error if any bind mount would contain the N2C session
+  directory, for example with `N2C_STATE_DIR` set inside `~/.npm`. The default
+  location, under `/run/user/<uid>`, is never inside such a directory.
 - **The directories are checked.** The creds directory and each token directory
   must be real directories (not symlinks), owned by you, with mode `0700`, and
   a token must be a regular file, not a symlink; otherwise the launch stops with
