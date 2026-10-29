@@ -44,6 +44,9 @@
 #   - Zellij env vars (ZELLIJ, ZELLIJ_SESSION_NAME, ZELLIJ_PANE_ID): passed;
 #     inside Zellij OPENTUI_FORCE_WCWIDTH=1 is also set so the TUI's column
 #     counts match Zellij's (a user-set OPENTUI_FORCE_WCWIDTH wins)
+#     and the TUI gets TERM=alacritty and COLORTERM=truecolor (when unset) so it
+#     moves the cursor explicitly and a width mismatch cannot leave stale
+#     regions (BWRAP_OPENTUI_TERM=<name> overrides the TERM, empty keeps it)
 #   - ~/.bashrc and other shell rc files: not mounted
 #
 # Usage:
@@ -494,6 +497,8 @@ _OPENCODE_ENV_ALLOWLIST=(
 # can authenticate gh(1) via per-command:
 #   GH_TOKEN="$GH_TOKEN_NSLS2" gh <subcommand>
 build_opencode_env() {
+    build_opentui_zellij_env
+
     # AIFAPIM gateway config
     pass_through_if_set AIFAPIM_HOST
     pass_through_if_set AIFAPIM_API_KEY

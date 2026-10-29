@@ -69,6 +69,9 @@
 #   - Zellij env vars (ZELLIJ, ZELLIJ_SESSION_NAME, ZELLIJ_PANE_ID): passed;
 #     inside Zellij OPENTUI_FORCE_WCWIDTH=1 is also set so the TUI's column
 #     counts match Zellij's (a user-set OPENTUI_FORCE_WCWIDTH wins)
+#     and the TUI gets TERM=alacritty and COLORTERM=truecolor (when unset) so it
+#     moves the cursor explicitly and a width mismatch cannot leave stale
+#     regions (BWRAP_OPENTUI_TERM=<name> overrides the TERM, empty keeps it)
 #   - ~/.bashrc and other shell rc files: not mounted
 #
 # Sandbox-escape guard: OpenCode 2 normally talks to a shared background
@@ -657,6 +660,8 @@ build_opencode2_install_mount() {
 # Must run AFTER build_env_vars.  No XDG_* override is set: OpenCode 2 finds
 # its directories at the standard locations they are mounted at.
 build_opencode2_env() {
+    build_opentui_zellij_env
+
     # Allowlist of OPENCODE_* variables that may enter the sandbox.
     # Do NOT add anything that carries a secret, a port, a file path or a URL.
     local -a _OC2_ENV_ALLOWLIST=(

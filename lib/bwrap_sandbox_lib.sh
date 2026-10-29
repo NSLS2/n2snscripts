@@ -2579,6 +2579,39 @@ build_dynamic_tool_mounts() {
     finalize_sandbox_path
 }
 
+# ── OpenTUI inside Zellij ────────────────────────────────────────
+# build_opentui_zellij_env  (OpenTUI tools only: bwopencode, bwopencode2)
+#   Must run AFTER build_env_vars, whose --setenv TERM this overrides.
+#
+#   OpenTUI repaints only the cells it thinks changed.  For tmux, GNU Screen
+#   and a TERM containing "alacritty" it moves the cursor explicitly after
+#   wide characters, so one width mismatch with the multiplexer cannot shift
+#   the rest of a line.  It never does that for Zellij, which leaves stale
+#   regions on the screen until the window is resized.  The check reads TERM
+#   when the TUI starts, so inside Zellij the sandbox gets TERM=alacritty
+#   (the terminfo entry is in /usr/share/terminfo) and COLORTERM=truecolor,
+#   because "alacritty" lacks the "256color" that OpenTUI uses to detect
+#   colour depth.  OpenCode sets TERM back to xterm-256color for the commands
+#   it runs.  Only the Zellij case changes.
+#
+#   BWRAP_OPENTUI_TERM   unset: alacritty; a value: use it; set but empty:
+#                        keep TERM as it is.
+build_opentui_zellij_env() {
+    [[ -n "${ZELLIJ:-}" ]] || return 0
+
+    local _term="${BWRAP_OPENTUI_TERM-alacritty}"
+    [[ -n "${_term}" ]] || return 0
+    if [[ ! "${_term}" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+        echo "Warning: ignoring BWRAP_OPENTUI_TERM='${_term}' (not a plain terminal name)" >&2
+        return 0
+    fi
+
+    BWRAP_ARGS+=(--setenv TERM "${_term}")
+    if [[ -z "${COLORTERM:-}" ]]; then
+        SANDBOX_ENV+=("COLORTERM=truecolor")
+    fi
+}
+
 # ── Environment variables ────────────────────────────────────────
 # The sandbox environment is exactly bwrap's environment, which
 # launch_sandbox builds from scratch with `env -i` (a few base variables plus
