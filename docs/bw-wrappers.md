@@ -92,6 +92,7 @@ Every `bw*` wrapper accepts these options:
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
 | `--ro-path PATH` | Read-only mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 | `--rw-path PATH` | Read-write mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
+| `--n2c-token NAME` | Mount the N2C access token `NAME` read-only so skills in the sandbox can call NSLS-II APIs. May be repeated; `--n2c-token all` mounts every token present. Off by default. See [N2C access tokens](#n2c-access-tokens) |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 
 `--ro-path` and `--rw-path` may be nested: a path nested under another
@@ -103,6 +104,45 @@ other mounts and the environment setup, so a path that covers their directory
 (for example `--ro-path /usr`) does not undo them.
 
 Tool-specific options are listed in each wrapper's section below.
+
+## N2C access tokens
+
+`n2c-token` (installed by the NSLS2/ansible `base` role) signs a user in to the
+NSLS2 N2C Entra app on the host and keeps a short-lived access token per
+NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
+`observability`, `docs` and `epics`. Skills read those files.
+
+- **Nothing is mounted by default.** `--n2c-token NAME` mounts
+  `creds/NAME/token` read-only at the same path; repeat it for several tokens.
+  `--n2c-token all` mounts every non-empty token in the directory. `all`
+  together with names means all.
+- **Only token files are mounted**, one file each. `n2c-token` rewrites a token
+  in place, so a mounted file sees every refresh while the timer runs.
+- **The refresh token is never mounted.** The MSAL cache (`cache.json`) lives
+  in `/run/user/<uid>/nsls2/n2c` and is on the blocked list, so `--ro-path` and
+  `--rw-path` refuse it and refuse a directory that contains it. The creds
+  directory itself is allowed.
+- **Automatic mounts cannot expose it either.** Directories the launcher mounts
+  whole (the npm and pixi caches, ccache, the tool data and cache directories)
+  are only checked for being blocked themselves. So, after all mounts are built,
+  the launch stops with an error if any bind mount would contain the N2C session
+  directory, for example with `N2C_STATE_DIR` set inside `~/.npm`. The default
+  location, under `/run/user/<uid>`, is never inside such a directory.
+- **The directories are checked.** The creds directory and each token directory
+  must be real directories (not symlinks), owned by you, with mode `0700`, and
+  a token must be a regular file, not a symlink; otherwise the launch stops with
+  an error. `n2c-token` creates them that way.
+- **A missing or empty token only warns**; run `n2c-token login` on the host. A
+  token that expires while the sandbox runs is refreshed in place by the
+  `n2c-token` timer (`n2c-token install` on the host).
+- **Locations.** `N2SN_CREDS_DIR` and `N2C_STATE_DIR` override the two
+  directories, as they do for `n2c-token`.
+- **The sandbox is told where the tokens are.** The sandbox environment is
+  scrubbed, so when at least one token is mounted the launcher sets
+  `N2SN_CREDS_DIR` inside the sandbox to the credentials directory, even when
+  the host uses a non-default location. Nothing is set when no token is mounted.
+
+Example: `bwopencode2 --n2c-token observability --n2c-token epics`.
 
 ## Account check
 

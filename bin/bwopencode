@@ -67,6 +67,9 @@
 #   --new-session   Force bwrap --new-session even on kernels with the TIOCSTI cap
 #                   guard.  Detaches the controlling tty for stricter isolation at the
 #                   cost of SIGWINCH (terminal resize) propagation.
+#   --n2c-token NAME  Mount the N2C access token NAME read-only (for NSLS-II API
+#                   skills).  May be repeated; `all` mounts every token present.
+#                   Off by default.  The refresh token is never mounted.
 #   --ro-path PATH  Mount PATH read-only into the sandbox.  May be repeated to
 #                   accumulate multiple paths.  Dangerous paths are blocked:
 #                   $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws, ~/.kube,
@@ -131,6 +134,14 @@ parse_wrapper_args() {
                 FORCE_NEW_SESSION=1
                 shift
                 ;;
+            --n2c-token)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --n2c-token requires a token name or 'all'." >&2
+                    exit 1
+                fi
+                add_n2c_token "$2"
+                shift 2
+                ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
                     echo "Error: --ro-path requires a path argument." >&2
@@ -181,6 +192,14 @@ Wrapper options (consumed before opencode sees the command line):
                   (< 5.14); on newer kernels we omit it so that SIGWINCH (terminal
                   resize) propagates from tmux/screen.  Use this flag to opt back
                   into stricter terminal isolation when SIGWINCH is not important.
+  --n2c-token NAME
+                  Mount the N2C access token NAME (read-only) so skills inside
+                  the sandbox can call NSLS-II APIs, for example observability,
+                  docs or epics.  May be repeated; `--n2c-token all` mounts every
+                  token present.  Off by default: no token is mounted unless
+                  asked for.  Tokens are written on the host by `n2c-token`
+                  (run `n2c-token login` first); the refresh token is never
+                  mounted.  A missing token only warns.
   --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
                   May be repeated to accumulate multiple extra paths.
                   Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
@@ -584,6 +603,7 @@ main() {
     build_user_bin_mount
     build_nsls2_mount
     build_dynamic_tool_mounts
+    build_n2c_token_mounts
     build_extra_path_mounts
 
     # Environment variables
