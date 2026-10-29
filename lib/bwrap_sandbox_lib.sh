@@ -2912,16 +2912,18 @@ build_env_vars() {
 #   BWRAP_SANDBOX_CONTEXT  path of the context file
 
 # Row data collected from BWRAP_ARGS by _bwrap_context_collect, keyed by the
-# cleaned destination path.  _CTX_DESTS keeps first-seen order.  A later mount
-# at a destination replaces the earlier one and hides everything mounted below
-# it (mode "hidden"), as in bwrap.
+# raw destination path, so that two different paths never share a key.
+# _CTX_DESTS keeps first-seen order.  A later mount at a destination replaces
+# the earlier one and hides everything mounted below it (mode "hidden"), as in
+# bwrap.  Paths are only cleaned where they are written into the text.
 declare -A _CTX_MODE=()
 declare -A _CTX_SRC=()
 _CTX_DESTS=()
 _CTX_HOME=""
 _CTX_AT=""
-# Characters that would break the markdown or the line-based processing below
-# (control characters, | and a backtick) are shown as ? in every path.
+# Characters that would break the markdown (control characters, | and a
+# backtick) are shown as ? in every path in the text.  Lists of paths are
+# sorted and read NUL-delimited, because a path may hold a newline.
 _CTX_BAD='[[:cntrl:]|`]'
 
 # _bwrap_context_collect
@@ -2934,7 +2936,7 @@ _bwrap_context_collect() {
     _CTX_DESTS=()
     _CTX_MODE=()
     _CTX_SRC=()
-    _CTX_HOME="${_HOME//${_CTX_BAD}/?}"
+    _CTX_HOME="${_HOME}"
     local _i=0 _flag _a1 _a2 _mode _src _dest _e
     while [[ ${_i} -lt ${#BWRAP_ARGS[@]} ]]; do
         _flag="${BWRAP_ARGS[${_i}]}"
@@ -2979,7 +2981,6 @@ _bwrap_context_collect() {
             *-try) [[ -e "${_src}" ]] || continue ;;
         esac
         [[ "${_src}" == /dev/null ]] && continue
-        _dest="${_dest//${_CTX_BAD}/?}"
         for _e in "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}"; do
             [[ "${_e}" == "${_dest}"/* ]] && _CTX_MODE["${_e}"]="hidden"
         done
@@ -2992,14 +2993,15 @@ _bwrap_context_collect() {
 # _bwrap_context_display PATH
 #   Print PATH cleaned, with a leading $HOME shown as ~.
 _bwrap_context_display() {
-    local _p="${1//${_CTX_BAD}/?}"
+    local _p="$1" _s
     if [[ "${_p}" == "${_CTX_HOME}" ]]; then
         printf '~'
     elif [[ "${_p}" == "${_CTX_HOME}"/* ]]; then
+        _s="${_p#"${_CTX_HOME}"/}"
         # shellcheck disable=SC2088  # a literal tilde is wanted
-        printf '~/%s' "${_p#"${_CTX_HOME}"/}"
+        printf '~/%s' "${_s//${_CTX_BAD}/?}"
     else
-        printf '%s' "${_p}"
+        printf '%s' "${_p//${_CTX_BAD}/?}"
     fi
 }
 
@@ -3019,7 +3021,7 @@ _bwrap_context_access() {
 #   Set _CTX_AT to the mode of the deepest visible mount that is PATH or one of
 #   its ancestors (empty when none).
 _bwrap_context_mode_at() {
-    local _p="${1//${_CTX_BAD}/?}"
+    local _p="$1"
     _CTX_AT=""
     while [[ -n "${_p}" ]]; do
         if [[ -n "${_CTX_MODE["${_p}"]+x}" && "${_CTX_MODE["${_p}"]}" != hidden ]]; then
@@ -3071,9 +3073,9 @@ _bwrap_context_render() {
     _bwrap_context_collect
 
     local -a _sorted=()
-    while IFS= read -r _d; do
+    while IFS= read -r -d '' _d; do
         _sorted+=("${_d}")
-    done < <(printf '%s\n' "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}" | LC_ALL=C sort)
+    done < <(printf '%s\0' "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}" | LC_ALL=C sort -z)
 
     # Home rows are grouped by (parent directory, mode).  System mounts are
     # collapsed; a mount outside $HOME that is not read-only, or not part of
@@ -3135,7 +3137,7 @@ _bwrap_context_render() {
     _t+=" This file describes this session; trust it over assumptions about the host.${_nl}${_nl}"
 
     _t+="## What this means${_nl}${_nl}"
-    _t+="- \`\$HOME\` (~ = ${_CTX_HOME}) is an empty tmpfs. Only the paths listed below exist in it;"
+    _t+="- \`\$HOME\` (~ = ${_CTX_HOME//${_CTX_BAD}/?}) is an empty tmpfs. Only the paths listed below exist in it;"
     _t+=" anything else you write there is lost when the session ends.${_nl}"
     _t+="- Read-only files under \`\$HOME\` that look like links are bind mounts, not hard links."
     _t+=" The launcher resolves host symlinks and mounts the target at the expected path,"
@@ -3181,7 +3183,7 @@ _bwrap_context_render() {
     if [[ ${#_gkeys[@]} -eq 0 ]]; then
         _t+="| (none) | |${_nl}"
     else
-        while IFS= read -r _key; do
+        while IFS= read -r -d '' _key; do
             _mode="${_key##*"${_tab}"}"
             if [[ "${_gcount["${_key}"]}" -eq 1 ]]; then
                 _d="${_gfirst["${_key}"]}"
@@ -3194,10 +3196,10 @@ _bwrap_context_render() {
             else
                 _par="${_key%"${_tab}"*}"
                 _gn="${_gnames["${_key}"]}"
-                _line="| \`$(_bwrap_context_display "${_par}")/{${_gn}}\` | $(_bwrap_context_access "${_mode}")"
+                _line="| \`$(_bwrap_context_display "${_par}")/{${_gn//${_CTX_BAD}/?}}\` | $(_bwrap_context_access "${_mode}")"
             fi
             _t+="${_line} |${_nl}"
-        done < <(printf '%s\n' "${_gkeys[@]}" | LC_ALL=C sort)
+        done < <(printf '%s\0' "${_gkeys[@]}" | LC_ALL=C sort -z)
     fi
     _t+="${_nl}"
 
@@ -3209,11 +3211,11 @@ _bwrap_context_render() {
     fi
     if [[ ${#_etc[@]} -gt 0 ]]; then
         _line=""
-        for _n in "${_etc[@]}"; do _line+="${_line:+, }\`${_n}\`"; done
+        for _n in "${_etc[@]}"; do _line+="${_line:+, }\`${_n//${_CTX_BAD}/?}\`"; done
         _t+="- \`/etc\`, read-only, selected entries only: ${_line}.${_nl}"
     fi
     for _d in "${_other[@]+"${_other[@]}"}"; do
-        _t+="- \`${_d}\`: $(_bwrap_context_access "${_CTX_MODE["${_d}"]}").${_nl}"
+        _t+="- \`$(_bwrap_context_display "${_d}")\`: $(_bwrap_context_access "${_CTX_MODE["${_d}"]}").${_nl}"
     done
     _bwrap_context_mode_at /tmp
     if [[ "${_CTX_AT}" == tmpfs ]]; then
