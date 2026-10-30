@@ -97,12 +97,15 @@
 #   --net-log FILE  Log every network flow to FILE on the host.
 #   --share-net     Share the host network instead (the behaviour before
 #                   private namespaces); not with the options above.
+#   --net-backend pasta|slirp4netns
+#                   Use only this backend for the private namespace.
 #
 # Network: the sandbox has its own network namespace from pasta (package
-# passt).  Outbound connections work; services on the host's loopback are
-# unreachable and the sandbox's listeners are invisible to the host, except
-# for the ports opened with --publish and --host-port.  Without a usable
-# private namespace the launch stops (exit 3) unless --share-net is given.
+# passt), or else slirp4netns (--host-port and --net-log need pasta).
+# Outbound connections work; services on the host's loopback are unreachable
+# and the sandbox's listeners are invisible to the host, except for the ports
+# opened with --publish and --host-port.  Without a usable private namespace
+# the launch stops (exit 3) unless --share-net is given.
 #
 # Sandbox context: a short markdown file describing this sandbox (what is
 # mounted read-only or read-write, what is lost at exit, which tools are
@@ -209,6 +212,14 @@ parse_wrapper_args() {
             --share-net)
                 net_set_share
                 shift
+                ;;
+            --net-backend)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --net-backend requires pasta or slirp4netns." >&2
+                    exit 1
+                fi
+                net_set_backend "$2"
+                shift 2
                 ;;
             --net-log)
                 if [[ $# -lt 2 ]]; then
