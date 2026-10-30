@@ -355,14 +355,8 @@ build_claude_home_mount() {
             BWRAP_ARGS+=(--bind "${_settings_path}" "${_settings_path}")
         fi
     elif [[ -f "${_settings_path}" ]]; then
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-            # A real fd number could not be reproduced by copy-paste.
-            BWRAP_ARGS+=(--file "<settings-fd>" "${_settings_path}")
-        else
-            local _settings_fd
-            exec {_settings_fd}< "${_settings_path}"
-            BWRAP_ARGS+=(--file "${_settings_fd}" "${_settings_path}")
-        fi
+        bwrap_fd_from_file "${_settings_path}"
+        BWRAP_ARGS+=(--file "${_BWRAP_FD}" "${_settings_path}")
     fi
 
     # Persistent read-only config file (if it exists)
@@ -384,13 +378,8 @@ build_claude_home_mount() {
     elif [[ -f "${CLAUDE_CREDENTIALS_FILE}" ]]; then
         # Normal mode: copy credentials into tmpfs via --file so host auth is
         # available but changes don't persist.
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-            BWRAP_ARGS+=(--file "<credentials-fd>" "${CLAUDE_CREDENTIALS_FILE}")
-        else
-            local _fd
-            exec {_fd}< "${CLAUDE_CREDENTIALS_FILE}"
-            BWRAP_ARGS+=(--file "${_fd}" "${CLAUDE_CREDENTIALS_FILE}")
-        fi
+        bwrap_fd_from_file "${CLAUDE_CREDENTIALS_FILE}"
+        BWRAP_ARGS+=(--file "${_BWRAP_FD}" "${CLAUDE_CREDENTIALS_FILE}")
     fi
 
     # State file (~/.claude.json, or $CLAUDE_CONFIG_DIR/.claude.json): bind RW

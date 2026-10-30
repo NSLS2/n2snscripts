@@ -84,6 +84,14 @@ BWRAP_ARGS=()
 declare -A _MOUNTED_PREFIXES=()
 _EXTRA_PATH_DIRS=()
 
+# Descriptors that bwrap reads (--file, --ro-bind-data), opened by the fd
+# relay just before bwrap starts (see "File descriptor relay").
+_BWRAP_FD=""
+_BWRAP_FD_NEXT=10
+_BWRAP_FD_RELAY=()
+declare -A _BWRAP_FD_DATA=()
+declare -A _BWRAP_FD_LABEL=()
+
 # Cached result of `npm prefix -g` (resolved at most once per run).
 # _NPM_PREFIX_RESOLVED flips to 1 after the first lookup; _NPM_PREFIX holds
 # the value (empty string if npm is absent or the lookup failed).
@@ -2906,8 +2914,9 @@ build_env_vars() {
 # then makes its tool load the file in addition to the user's own
 # instruction files (never in place of them; no user file is touched).
 #
-# The file travels as --ro-bind-data on a file descriptor, so nothing is
-# written to the host.  Variables set inside the sandbox:
+# The file travels as --ro-bind-data on a file descriptor (see "File
+# descriptor relay"), so nothing is written to the host.  Variables set
+# inside the sandbox:
 #   BWRAP_SANDBOX          launcher name (for example bwopencode2)
 #   BWRAP_SANDBOX_CONTEXT  path of the context file
 
@@ -3277,7 +3286,7 @@ _bwrap_context_render() {
 #   SANDBOX_CONTEXT_PATH (and _SANDBOX_CONTEXT_TEXT) when the file is mounted.
 build_sandbox_context() {
     local _tool="$1"
-    local _dir="${_HOME}/.sandbox" _file="${_HOME}/.sandbox/AGENTS.md" _fd
+    local _dir="${_HOME}/.sandbox" _file="${_HOME}/.sandbox/AGENTS.md"
     SANDBOX_CONTEXT_PATH=""
     [[ "${SANDBOX_CONTEXT_ENABLED}" -eq 1 ]] || return 0
 
@@ -3288,17 +3297,16 @@ build_sandbox_context() {
 
     _bwrap_context_render "${_tool}" "${_file}"
 
-    # The descriptor stays open in this shell until launch_sandbox execs
-    # bwrap, which reads it for --ro-bind-data and closes it.
-    exec {_fd}<<< "${_SANDBOX_CONTEXT_TEXT}"
+    bwrap_fd_from_data "sandbox context file, mounted at ${_file}" "${_SANDBOX_CONTEXT_TEXT}"
     BWRAP_ARGS+=(
         --dir "${_dir}"
-        --ro-bind-data "${_fd}" "${_file}"
+        --ro-bind-data "${_BWRAP_FD}" "${_file}"
     )
     SANDBOX_ENV+=(
         "BWRAP_SANDBOX=${_tool}"
         "BWRAP_SANDBOX_CONTEXT=${_file}"
     )
+    # shellcheck disable=SC2034  # read by the launchers' context loaders
     SANDBOX_CONTEXT_PATH="${_file}"
 }
 
@@ -3325,6 +3333,124 @@ _bwrap_toml_string() {
     _s="${_s//$'\t'/\\t}"
     [[ "${_s}" =~ [[:cntrl:]] ]] && return 1
     printf '"%s"' "${_s}"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# File descriptor relay
+# ═══════════════════════════════════════════════════════════════════
+# bwrap reads some files from descriptors: --file FD for writable copies of
+# credentials and config, --ro-bind-data FD for generated files such as the
+# sandbox context.  The launcher does not open them itself, because bwrap is
+# started by pasta (see "Network isolation"), and pasta closes every
+# descriptor above 2 that it inherits.  The launcher only reserves the
+# numbers and records where each one's content comes from.  A short fixed
+# bash script, the relay, runs where bwrap used to (as pasta's command), opens
+# each descriptor at its reserved number and execs bwrap.  Sources:
+#   file PATH  the relay opens PATH read-only.
+#   data       generated text, carried in the environment variable
+#              _BWRAP_FD_DATA_<N>; the relay turns it into a here-string
+#              (which appends one newline) and unsets the variable before
+#              exec'ing bwrap.  Not for secrets: the variable stays in
+#              pasta's environment for the whole session.
+
+# bwrap_fd_from_file PATH
+#   Reserve a descriptor that the relay opens on PATH and set _BWRAP_FD to its
+#   number.  Exits 1 when PATH cannot be read now.
+bwrap_fd_from_file() {
+    local _path="$1"
+    if [[ ! -f "${_path}" || ! -r "${_path}" ]]; then
+        echo "Error: cannot read '${_path}'." >&2
+        exit 1
+    fi
+    _BWRAP_FD="${_BWRAP_FD_NEXT}"
+    _BWRAP_FD_NEXT=$((_BWRAP_FD_NEXT + 1))
+    _BWRAP_FD_RELAY+=("${_BWRAP_FD}" file "${_path}")
+}
+
+# bwrap_fd_from_data LABEL TEXT
+#   Reserve a descriptor that the relay fills with TEXT and a newline, and set
+#   _BWRAP_FD to its number.  LABEL describes the content in --dry-run output.
+#   The kernel limits one environment string to 128 KiB, so TEXT must be
+#   shorter than that.
+bwrap_fd_from_data() {
+    local _label="$1" _text="$2"
+    if [[ ${#_text} -gt 120000 ]]; then
+        echo "Error: the ${_label} is too large to pass to the sandbox (${#_text} characters)." >&2
+        exit 1
+    fi
+    _BWRAP_FD="${_BWRAP_FD_NEXT}"
+    _BWRAP_FD_NEXT=$((_BWRAP_FD_NEXT + 1))
+    _BWRAP_FD_RELAY+=("${_BWRAP_FD}" data)
+    _BWRAP_FD_DATA["${_BWRAP_FD}"]="${_text}"
+    _BWRAP_FD_LABEL["${_BWRAP_FD}"]="${_label}"
+}
+
+# The relay, run as
+#   bash -c "${_BWRAP_FD_RELAY_SHIM}" bwrap-fd-relay ENTRY... -- COMMAND ARGS...
+# with each ENTRY either `N file PATH` or `N data`.  N is checked to be a
+# number before it reaches eval; PATH and the data are only expanded there,
+# never pasted into the evaluated text.  bash exports SHLVL to the command it
+# execs, so it is unset; PWD is overridden by bwrap's --setenv.
+# shellcheck disable=SC2016  # expanded by the relay, not here
+_BWRAP_FD_RELAY_SHIM='
+while [[ $# -gt 0 && "$1" != -- ]]; do
+    if [[ ! "$1" =~ ^[0-9]+$ ]]; then
+        echo "$0: bad descriptor number: $1" >&2
+        exit 126
+    fi
+    case "$2" in
+        file)
+            eval "exec $1<\"\$3\"" || { echo "$0: cannot open $3" >&2; exit 126; }
+            shift 3
+            ;;
+        data)
+            _v="_BWRAP_FD_DATA_$1"
+            eval "exec $1<<<\"\${!_v}\"" || { echo "$0: cannot fill descriptor $1" >&2; exit 126; }
+            unset "${_v}"
+            shift 2
+            ;;
+        *)
+            echo "$0: bad relay entry: $2" >&2
+            exit 126
+            ;;
+    esac
+done
+shift
+unset _v SHLVL
+exec "$@"
+'
+
+# resolve_bash_bin
+#   Print the bash that runs the relay: /usr/bin/bash or /bin/bash (labelled
+#   shell_exec_t, so SELinux moves it out of pasta's domain), else the bash
+#   running this script.
+resolve_bash_bin() {
+    local _b
+    for _b in /usr/bin/bash /bin/bash "${BASH}"; do
+        if [[ -n "${_b}" && -x "${_b}" ]]; then
+            echo "${_b}"
+            return 0
+        fi
+    done
+    echo "Error: cannot locate bash for the descriptor relay." >&2
+    exit 1
+}
+
+# _bwrap_fd_data_numbers
+#   Set _BWRAP_FD_DATA_NUMS to the numbers of the data descriptors, in the
+#   order they were reserved.
+_BWRAP_FD_DATA_NUMS=()
+_bwrap_fd_data_numbers() {
+    local _r=0
+    _BWRAP_FD_DATA_NUMS=()
+    while [[ ${_r} -lt ${#_BWRAP_FD_RELAY[@]} ]]; do
+        if [[ "${_BWRAP_FD_RELAY[$((_r + 1))]}" == file ]]; then
+            _r=$((_r + 3))
+        else
+            _BWRAP_FD_DATA_NUMS+=("${_BWRAP_FD_RELAY[${_r}]}")
+            _r=$((_r + 2))
+        fi
+    done
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3407,14 +3533,19 @@ _is_secret_env_name() {
 
 print_dry_run() {
     verify_n2c_state_not_exposed
-    local _BWRAP_BIN _ENV_BIN
+    local _BWRAP_BIN _ENV_BIN _BASH_BIN
     _BWRAP_BIN="$(command -v bwrap)"
     _ENV_BIN="$(resolve_env_bin)"
+    _BASH_BIN="$(resolve_bash_bin)"
 
     # Mirror the exact invocation used by launch_sandbox:
-    #   exec <env_bin> -i <base vars> <SANDBOX_ENV> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
+    #   exec <env_bin> -i <base vars> <SANDBOX_ENV> <relay data>
+    #     <bash_bin> -c <relay> bwrap-fd-relay <relay entries> --
+    #     <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
     # Values of secret-looking variables (_is_secret_env_name) are printed as
     # REDACTED, on the env line and in --setenv; only the printed text changes.
+    # The relay script and its data are shown as placeholders, the data in
+    # full after the command.
     printf "exec %s -i \\\\\n" "${_ENV_BIN}"
     printf "  HOME=%q \\\\\n"    "${_HOME}"
     printf "  USER=%q \\\\\n"    "${_USER}"
@@ -3429,6 +3560,23 @@ print_dry_run() {
             printf "  %s=%q \\\\\n" "${_name}" "${_entry#*=}"
         fi
     done
+    local _n
+    _bwrap_fd_data_numbers
+    for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
+        printf "  _BWRAP_FD_DATA_%s='<%s, shown below>' \\\\\n" "${_n}" "${_BWRAP_FD_LABEL["${_n}"]}"
+    done
+    printf "  %s -c '<_BWRAP_FD_RELAY_SHIM from bwrap_sandbox_lib.sh>' bwrap-fd-relay \\\\\n" "${_BASH_BIN}"
+    local _r=0
+    while [[ ${_r} -lt ${#_BWRAP_FD_RELAY[@]} ]]; do
+        if [[ "${_BWRAP_FD_RELAY[$((_r + 1))]}" == file ]]; then
+            printf "    %s file %q \\\\\n" "${_BWRAP_FD_RELAY[${_r}]}" "${_BWRAP_FD_RELAY[$((_r + 2))]}"
+            _r=$((_r + 3))
+        else
+            printf "    %s data \\\\\n" "${_BWRAP_FD_RELAY[${_r}]}"
+            _r=$((_r + 2))
+        fi
+    done
+    printf "    -- \\\\\n"
     printf "  %s \\\\\n" "${_BWRAP_BIN}"
 
     # Print bwrap arguments one flag-plus-values per line.  Each flag's
@@ -3462,11 +3610,10 @@ print_dry_run() {
     local _arg
     for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do printf " %q" "${_arg}"; done
     printf "\n"
-    if [[ -n "${SANDBOX_CONTEXT_PATH}" ]]; then
-        printf '\n# --ro-bind-data above reads a file descriptor that a real run fills with this\n'
-        printf '# sandbox context file, mounted at %s:\n#\n' "${SANDBOX_CONTEXT_PATH}"
-        printf '%s\n' "${_SANDBOX_CONTEXT_TEXT}" | sed 's/^/# /; s/ *$//'
-    fi
+    for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
+        printf '\n# Descriptor %s, filled by the relay with the %s:\n#\n' "${_n}" "${_BWRAP_FD_LABEL["${_n}"]}"
+        printf '%s\n' "${_BWRAP_FD_DATA["${_n}"]}" | sed 's/^/# /; s/ *$//'
+    done
     exit 0
 }
 
@@ -3482,11 +3629,21 @@ print_dry_run() {
 # `env` is resolved via resolve_env_bin (prefers /usr/bin/env) rather than
 # via PATH lookup at exec time — this prevents a user shell script named
 # "env" earlier on PATH from hijacking the launch.  See resolve_env_bin.
+#
+# bwrap is started through the descriptor relay (see "File descriptor
+# relay"), which opens the descriptors that BWRAP_ARGS refers to.
 launch_sandbox() {
     verify_n2c_state_not_exposed
-    local _BWRAP_BIN _ENV_BIN
+    local _BWRAP_BIN _ENV_BIN _BASH_BIN _n
     _BWRAP_BIN="$(command -v bwrap)"
     _ENV_BIN="$(resolve_env_bin)"
+    _BASH_BIN="$(resolve_bash_bin)"
+
+    local -a _data_env=()
+    _bwrap_fd_data_numbers
+    for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
+        _data_env+=("_BWRAP_FD_DATA_${_n}=${_BWRAP_FD_DATA["${_n}"]}")
+    done
 
     exec "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
@@ -3494,5 +3651,8 @@ launch_sandbox() {
         LOGNAME="${_USER}" \
         PATH="/usr/bin:/bin" \
         ${SANDBOX_ENV[@]+"${SANDBOX_ENV[@]}"} \
+        ${_data_env[@]+"${_data_env[@]}"} \
+        "${_BASH_BIN}" -c "${_BWRAP_FD_RELAY_SHIM}" bwrap-fd-relay \
+        ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"} -- \
         "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
 }
