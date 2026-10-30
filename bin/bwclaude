@@ -85,6 +85,22 @@
 #                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 #   --no-sandbox-context
 #                   Do not generate the sandbox context file (see below).
+#   --publish PORT[:SANDBOXPORT]
+#                   Make a server in the sandbox reachable on the host at a
+#                   per-user, per-session loopback address (127.H1.H2.S:PORT).
+#                   May be repeated.
+#   --publish-addr ADDR
+#                   Use ADDR (in 127.0.0.0/8) for --publish instead.
+#   --host-port PORT[:SANDBOXPORT]
+#                   Make the host's 127.0.0.1:PORT reachable in the sandbox at
+#                   host.internal:SANDBOXPORT.  May be repeated.
+#   --net-log FILE  Log every network flow to FILE on the host.
+#
+# Network: the sandbox has its own network namespace from pasta (package
+# passt; required, there is no fallback to the host network).  Outbound
+# connections work; services on the host's loopback are unreachable and the
+# sandbox's listeners are invisible to the host, except for the ports opened
+# with --publish and --host-port.
 #
 # Sandbox context: a short markdown file describing this sandbox (what is
 # mounted read-only or read-write, what is lost at exit, which tools are
@@ -163,6 +179,38 @@ parse_wrapper_args() {
                 # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
                 SANDBOX_CONTEXT_ENABLED=0
                 shift
+                ;;
+            --publish)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_publish "$2"
+                shift 2
+                ;;
+            --publish-addr)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish-addr requires an address in 127.0.0.0/8." >&2
+                    exit 1
+                fi
+                net_set_publish_addr "$2"
+                shift 2
+                ;;
+            --host-port)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --host-port requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_host_port "$2"
+                shift 2
+                ;;
+            --net-log)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --net-log requires a file name." >&2
+                    exit 1
+                fi
+                net_set_log_file "$2"
+                shift 2
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -263,6 +311,7 @@ Authentication:
     bwclaude --init-auth
 
 HELP_EOF
+    net_print_help
     # Delegate to claude --help inside the sandbox so the user sees the full
     # claude option set in the same invocation.
     bwrap_show_tool_help claude
@@ -582,6 +631,7 @@ main() {
     bwrap_resolve_tool claude
 
     detect_kernel_capabilities
+    detect_net_capabilities
     resolve_common_paths
     resolve_claude_paths
     detect_shell
@@ -597,6 +647,7 @@ main() {
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
+    build_net_isolation
     build_managed_claude_paths
     build_home_tmpfs
     build_workdir_mount
