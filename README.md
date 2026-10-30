@@ -69,9 +69,10 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 - `bash` >= 4.x (the `bw*` wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0 for the `bw*` wrappers
   - 0.6.3+ enables bind-over-ro-bind binary masking
-- `pasta` (package `passt`), `/dev/net/tun` and unprivileged user namespaces
-  for the `bw*` wrappers, which run every sandbox in a private network
-  namespace (no fallback: they exit 3 without it)
+- optional: `pasta` (package `passt`, RHEL 9+), `/dev/net/tun` and
+  unprivileged user namespaces, with which the `bw*` wrappers run every sandbox
+  in a private network namespace; without them (RHEL 8) the sandbox shares the
+  host network, with a warning
 - `gpg(1)` for `gpg-passwd.sh`
 - `openssl(1)` for `pemdecompose`
 - `python3 >= 3.9` (stdlib only, no pip dependencies) for `azoidcapp`
@@ -106,6 +107,7 @@ Common wrapper options:
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`, e.g. `127.0.0.1` for OAuth) for `--publish` |
 | `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal` |
 | `--net-log FILE` | Log every network flow to `FILE` on the host |
+| `--local-net` | Share the host network instead of a private namespace (the behaviour without `pasta`) |
 
 `bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
 persists in its data directory), always runs OpenCode 2 with `--standalone`

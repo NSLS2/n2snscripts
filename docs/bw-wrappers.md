@@ -17,10 +17,11 @@ option list; the tables below summarise the common surface.
 - `bash` >= 4.x (the wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0
   - 0.6.3+ enables bind-over-ro-bind binary masking
-- `pasta` (package `passt`), `/dev/net/tun`, and unprivileged user namespaces
-  on the host. There is no fallback: without them every `bw*` wrapper stops
-  with exit status 3 (see [Network](#network)). `ss` (iproute) is used to
-  find busy ports for `--publish`.
+- Optional, for the private network namespace: `pasta` (package `passt`,
+  in RHEL 9 AppStream; not available for RHEL 8), `/dev/net/tun`, and
+  unprivileged user namespaces on the host. Without them the sandbox shares
+  the host network, with a warning (see [Network](#network)). `ss` (iproute)
+  is used to find busy ports for `--publish`.
 
 ## Managed system paths
 
@@ -103,6 +104,7 @@ Every `bw*` wrapper accepts these options:
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`) for `--publish` instead of the derived address, for example `127.0.0.1` for OAuth redirects |
 | `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal:SANDBOXPORT`. May be repeated |
 | `--net-log FILE` | Log every network flow to `FILE` on the host (`pasta --debug`) |
+| `--local-net` | Share the host network instead of a private namespace (the behaviour without `pasta`); not with the forwarding options |
 
 `--ro-path` and `--rw-path` may be nested: a path nested under another
 overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
@@ -230,10 +232,23 @@ env -i ... pasta [options] -- bash <descriptor relay> -- bwrap [options] -- <too
 - **Not hidden:** host services bound to a non-loopback address (sshd on
   `0.0.0.0:22`, the Tailscale address) stay reachable, as from any other
   machine.
-- **No fallback.** If `pasta` is missing, `/dev/net/tun` is missing, or a test
-  run of `pasta` fails (for example unprivileged user namespaces are disabled),
-  the wrapper stops with exit status 3 and names the problem. `--dry-run` works
-  without `pasta`. Deploy `passt` before this version of the wrappers.
+- **Fallback to the host network.** If `pasta` is missing (RHEL 8),
+  `/dev/net/tun` is missing, or a test run of `pasta` fails (for example
+  unprivileged user namespaces are disabled), the sandbox shares the host
+  network as before, and a warning naming the problem is printed. The
+  forwarding options (`--publish`, `--publish-addr`, `--host-port`,
+  `--net-log`) need the private namespace: with them the launch stops instead
+  (exit status 3). `--dry-run` assumes an installed `pasta` works.
+- **`--local-net`** chooses the host network explicitly, even where `pasta`
+  works, without the warning: an escape hatch for workflows that need the host's
+  loopback services or ports. It cannot be combined with the forwarding
+  options (exit status 1). Prefer `--host-port` / `--publish` for single ports.
+
+On the host network everything is as before this feature: the host's
+`/etc/resolv.conf` and `/etc/hosts` are mounted, host loopback services are
+reachable, sandbox listeners are visible on the host, and the
+[sandbox context file](#sandbox-context) says so. `BWRAP_NET_MODE` is `host`
+in the sandbox (`private` otherwise).
 
 DNS: the host's resolver is usually on loopback (`127.0.0.53`), so the sandbox
 gets a generated `/etc/resolv.conf` naming `169.254.1.1`, which pasta forwards
