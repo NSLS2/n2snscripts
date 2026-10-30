@@ -17,11 +17,14 @@ option list; the tables below summarise the common surface.
 - `bash` >= 4.x (the wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0
   - binary masking is verified on RHEL 8.10 (`bubblewrap-0.4.0-3.el8_10`) and EL9 (0.6.3)
-- Optional, for the private network namespace: `pasta` (package `passt`,
-  in RHEL 9 AppStream; not available for RHEL 8), `/dev/net/tun`, and
-  unprivileged user namespaces on the host. Without them the sandbox shares
-  the host network, with a warning (see [Network](#network)). `ss` (iproute)
-  is used to find busy ports for `--publish`.
+- For the private network namespace, one of: `pasta` (package `passt`,
+  RHEL 9 and later), or `slirp4netns` >= 0.4.0 with libslirp >= 4.3.0
+  (package `slirp4netns`, RHEL 8 AppStream) and util-linux `unshare`; plus
+  `/dev/net/tun` and unprivileged user namespaces on the host. Without them
+  the wrappers stop (exit status 3) unless run with `--share-net` (see
+  [Network](#network)). `ss` (iproute) is used to find busy ports for
+  `--publish`; with slirp4netns, `--publish` also needs `python3` (or RHEL 8's
+  `/usr/libexec/platform-python`).
 
 ## Managed system paths
 
@@ -91,7 +94,7 @@ Every `bw*` wrapper accepts these options:
 | Option | Effect |
 | --- | --- |
 | `--help`, `-h` | Show wrapper help, then the underlying tool's help when the tool is installed |
-| `--dry-run` | Print the command (`pasta`, the descriptor relay and `bwrap`) without executing it |
+| `--dry-run` | Print the command (the network backend, the descriptor relay and `bwrap`) without executing it |
 | `--exec CMD [ARGS...]` | Run `CMD` inside the sandbox instead of the tool. `CMD` is split on whitespace; following arguments are passed unchanged, e.g. `--exec bash -c 'env \| sort'` |
 | `--init-auth` | Persist auth credentials to the host (first-time setup; not available in `bwopencode2`) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
@@ -102,9 +105,10 @@ Every `bw*` wrapper accepts these options:
 | `--no-sandbox-context` | Do not generate the [sandbox context file](#sandbox-context) that tells the agent what is mounted |
 | `--publish PORT[:SANDBOXPORT]` | Make a server in the sandbox reachable on the host at a per-user, per-session loopback address. May be repeated. See [Network](#network) |
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`) for `--publish` instead of the derived address, for example `127.0.0.1` for OAuth redirects |
-| `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal:SANDBOXPORT`. May be repeated |
-| `--net-log FILE` | Log every network flow to `FILE` on the host (`pasta --debug`) |
-| `--share-net` | Share the host network instead of a private namespace (the behaviour without `pasta`); not with the forwarding options |
+| `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal:SANDBOXPORT`. May be repeated (pasta only) |
+| `--net-log FILE` | Log every network flow to `FILE` on the host (`pasta --debug`; pasta only) |
+| `--share-net` | Share the host network instead of a private namespace (the behaviour before private namespaces); not with the forwarding options |
+| `--net-backend pasta\|slirp4netns` | Use only this backend for the private namespace (normally pasta, else slirp4netns) |
 
 `--ro-path` and `--rw-path` may be nested: a path nested under another
 overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
@@ -281,15 +285,19 @@ link?"), or for Copilot run `bwcopilot instruction list`.
 
 ## Network
 
-Every sandbox runs in its own network namespace, created by
-[pasta](https://passt.top) (package `passt`):
+Every sandbox runs in its own network namespace, provided by the first usable
+backend:
 
-```text
-env -i ... pasta [options] -- bash <descriptor relay> -- bwrap [options] -- <tool>
-```
+1. [pasta](https://passt.top) (package `passt`, RHEL 9 and later, Fedora);
+2. else [slirp4netns](https://github.com/rootless-containers/slirp4netns)
+   (package `slirp4netns`, RHEL 8 AppStream);
+3. else the launch **stops** (exit status 3), naming what is missing for each
+   backend, unless `--share-net` is given.
 
-- **Outbound connections work** (model gateway, package installs, docs) and
-  leave from the host's address. Egress is not filtered.
+So sandboxes are isolated by default, with one explicit escape hatch.
+
+- **Outbound connections work** (model gateway, package installs, docs). Egress
+  is not filtered.
 - **The host's loopback is unreachable.** Services bound to `127.0.0.1` on the
   host (OpenCode's own server, language servers, CUPS, local databases, Tiled
   or queueserver dev instances, other users' sessions) cannot be reached from
@@ -300,27 +308,37 @@ env -i ... pasta [options] -- bash <descriptor relay> -- bwrap [options] -- <too
 - **Not hidden:** host services bound to a non-loopback address (sshd on
   `0.0.0.0:22`, the Tailscale address) stay reachable, as from any other
   machine.
-- **Fallback to the host network.** If `pasta` is missing (RHEL 8),
-  `/dev/net/tun` is missing, or a test run of `pasta` fails (for example
-  unprivileged user namespaces are disabled), the sandbox shares the host
-  network as before, and a warning naming the problem is printed. The
-  forwarding options (`--publish`, `--publish-addr`, `--host-port`,
-  `--net-log`) need the private namespace: with them the launch stops instead
-  (exit status 3). `--dry-run` assumes an installed `pasta` works.
-- **`--share-net`** chooses the host network explicitly, even where `pasta`
-  works, without the warning: an escape hatch for workflows that need the host's
-  loopback services or ports. It cannot be combined with the forwarding
-  options (exit status 1). Prefer `--host-port` / `--publish` for single ports.
+- **`--share-net`** shares the host network instead: the behaviour before
+  private namespaces, for workflows that need the host's loopback services or
+  ports, or hosts where neither backend works. The host's `/etc/resolv.conf`
+  and `/etc/hosts` are mounted, host loopback services are reachable, sandbox
+  listeners are visible on the host, and the
+  [sandbox context file](#sandbox-context) says so. It cannot be combined with
+  the forwarding options or `--net-backend` (exit status 1). Prefer
+  `--host-port` / `--publish` for single ports.
+- **`--net-backend pasta|slirp4netns`** uses only that backend (no
+  fallthrough), for testing the slirp4netns path on a host with pasta, or for
+  diagnosis.
 
-On the host network everything is as before this feature: the host's
-`/etc/resolv.conf` and `/etc/hosts` are mounted, host loopback services are
-reachable, sandbox listeners are visible on the host, and the
-[sandbox context file](#sandbox-context) says so. `BWRAP_NET_MODE` is `host`
-in the sandbox (`private` otherwise).
+`BWRAP_NET_BACKEND` in the sandbox is `pasta`, `slirp4netns` or `none`
+(`--share-net`).
+
+| | pasta | slirp4netns | `--share-net` |
+| --- | --- | --- | --- |
+| Address in the sandbox | the host's | `192.168.254.100` (IPv4 only) | the host's |
+| Outbound traffic leaves from | the host's address | the host's address | the host |
+| DNS | `169.254.1.1`, forwarded to the host's resolver | `192.168.254.3`, forwarded to the host's resolver | the host's `resolv.conf` |
+| `--publish`, `--publish-addr` | yes | yes (at most 64 ports) | no |
+| `--host-port`, `--net-log` | yes | no: the launch stops (exit 3) rather than drop them | no |
+| Speed | close to native | slower (user-mode TCP/IP); fine for API calls | native |
+
+With `--host-port` or `--net-log`, a host without a working pasta stops even
+if slirp4netns would work.
 
 DNS: the host's resolver is usually on loopback (`127.0.0.53`), so the sandbox
-gets a generated `/etc/resolv.conf` naming `169.254.1.1`, which pasta forwards
-to the first nameserver in the host's `/etc/resolv.conf`. Only IPv4
+gets a generated `/etc/resolv.conf` naming the backend's DNS address, which the
+backend forwards to the first nameserver in the host's `/etc/resolv.conf`
+(port 53 only), so split DNS (VPN, tailnet) keeps working. Only IPv4
 nameservers are supported; the wrapper warns when the host has none. The host's
 search domains are not passed on, so use fully qualified names. `/etc/hosts` is
 the host's file, plus `host.internal` when `--host-port` is used.
@@ -356,7 +374,7 @@ and your own dev server on `127.0.0.1:8000` does not collide. The address is
 printed as a URL; there is no host name for it. Every `127/8` address is a
 secure context in browsers. The host port is bound for the whole session,
 whether or not a server runs. The server inside must bind `0.0.0.0` (or the
-interface address): pasta delivers forwarded connections to the namespace's
+interface address): both backends deliver forwarded connections to the namespace's
 interface, not its loopback; the context file tells the agent so. A port that
 something on the host already holds on every address (`0.0.0.0:PORT`) is
 refused at launch.
@@ -393,7 +411,7 @@ logged on the host, which is the data needed to write an egress allowlist.
 pasta keeps the newest 1 MiB. The wrapper warns when `FILE` is inside a
 read-write mount of the sandbox, where the agent could change it.
 
-### Implementation notes
+### Implementation notes: pasta
 
 - pasta runs outside bwrap, as you, and starts the sandbox. Default pasta
   behaviour is overridden where it would re-expose the host's loopback:
@@ -411,6 +429,50 @@ read-write mount of the sandbox, where the agent could change it.
 - `ping` may not work (ICMP depends on the host's `ping_group_range`).
 - Nested namespaces in the sandbox (rootless podman) still do not work.
 
+### Implementation notes: slirp4netns
+
+slirp4netns cannot start the sandbox; it attaches to an existing network
+namespace. The launch has two steps, and the launcher still `exec`s in the
+foreground, so the terminal, job control, the exit status and
+`--die-with-parent` behave as before:
+
+```text
+launcher ─┬─ helper (background): waits for the namespace, starts slirp4netns,
+          │    adds the --publish forwards, then releases the sandbox
+          └─ exec env -i ... unshare --user --map-root-user --net --
+               bash <descriptor relay> -- bwrap --unshare-user --uid --gid
+               --info-fd --block-fd --sync-fd ... -- <tool>
+```
+
+- **The tool does not start before the network is ready**: bwrap waits on
+  `--block-fd` until the helper writes to it.
+- **`unshare`, not bwrap's `--unshare-net`, creates the namespaces.** Because
+  bwrap mounts `/dev`, it nests the sandbox in a second user namespace inside
+  the one that owns the network namespace. slirp4netns joins the user
+  namespace of the process it is given, so it would have no rights over the
+  network. With `unshare` the launcher process itself holds a single user
+  namespace that owns the network namespace, and slirp4netns attaches to it.
+  `unshare` maps you to uid 0 there, so bwrap runs the agent as your real uid
+  and gid, as with pasta.
+- slirp4netns options: `--disable-host-loopback` (otherwise the gateway
+  address `192.168.254.2` reaches the host's `127.0.0.1` on every port),
+  `--cidr=192.168.254.0/24` (slirp's default, `10.0.2.0/24`, lies inside
+  BNL's 10/8), the built-in DNS at `.3` (forwards port 53 only, with libslirp
+  4.3.0 and later, which the launcher checks), `--mtu=65520`, and
+  `--enable-sandbox --enable-seccomp` when `/etc/resolv.conf` resolves inside
+  `/etc` or `/run`.
+- slirp4netns runs in its own session (Ctrl-C does not reach it) with a
+  scrubbed environment (no API keys). It exits when bwrap does: its
+  `--exit-fd` is the other end of bwrap's `--sync-fd`.
+- `--publish` uses slirp4netns's API socket (`add_hostfwd`, one request per
+  port). The socket is in a private `mktemp -d` directory under
+  `$XDG_RUNTIME_DIR`, removed once the forwards are added, so nothing else can
+  add forwards later.
+- **On a setup failure** (slirp4netns does not start, a port cannot be
+  published) the helper prints the reason and slirp4netns's last messages,
+  kills the still-waiting sandbox (its pid comes from bwrap's `--info-fd`), so
+  the tool never runs, and then bwrap. The exit status is then 137, not 3.
+
 ### Descriptor relay
 
 bwrap reads some files from descriptors: `--file` for writable copies of
@@ -418,7 +480,7 @@ credentials and config (`bwclaude`, `bwcopilot`, `bwcodex`), `--ro-bind-data`
 for generated files (the context file, `/etc/resolv.conf`, `/etc/hosts`).
 pasta closes every inherited descriptor above 2, so the launcher does not open
 them itself. It reserves their numbers; a short fixed bash script (the relay,
-`_BWRAP_FD_RELAY_SHIM`) runs as pasta's command, opens each descriptor at its
+`_BWRAP_FD_RELAY_SHIM`) runs as the command of pasta or `unshare`, opens each descriptor at its
 number, from the host file or from generated text carried in an environment
 variable that it then unsets, and execs bwrap. Nothing is staged on the host.
 
