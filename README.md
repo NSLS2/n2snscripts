@@ -107,7 +107,7 @@ Common wrapper options:
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`, e.g. `127.0.0.1` for OAuth) for `--publish` |
 | `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal` |
 | `--net-log FILE` | Log every network flow to `FILE` on the host |
-| `--local-net` | Share the host network instead of a private namespace (the behaviour without `pasta`) |
+| `--share-net` | Share the host network instead of a private namespace (the behaviour without `pasta`) |
 
 `bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
 persists in its data directory), always runs OpenCode 2 with `--standalone`

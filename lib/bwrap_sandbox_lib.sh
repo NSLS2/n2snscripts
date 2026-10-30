@@ -69,15 +69,15 @@ EXTRA_RW_PATHS=()
 
 # Private network namespace (see "Network isolation").  Filled by the
 # launchers' parse_wrapper_args through net_add_publish, net_add_host_port,
-# net_set_publish_addr, net_set_log_file and net_set_local; turned into pasta
-# arguments by build_net_isolation.  NET_LOCAL=1 (--local-net) keeps the
+# net_set_publish_addr, net_set_log_file and net_set_share; turned into pasta
+# arguments by build_net_isolation.  NET_SHARE=1 (--share-net) keeps the
 # sandbox on the host network.  NET_PUBLISH and NET_HOST_PORTS hold validated specs
 # "PORTS[:SANDBOXPORTS]" (PORTS is N or LOW-HIGH).
 NET_PUBLISH=()
 NET_PUBLISH_ADDR=""
 NET_HOST_PORTS=()
 NET_LOG_FILE=""
-NET_LOCAL=0
+NET_SHARE=0
 PASTA_ARGS=()
 
 # N2C access tokens requested with --n2c-token (names, or "all").
@@ -2138,9 +2138,9 @@ build_etc_mounts() {
 #   --host-port PORT[:SANDBOXPORT]  host 127.0.0.1:PORT -> sandbox
 #                                   host.internal:SANDBOXPORT (127.0.42.1)
 # Without a working pasta (not installed, as on RHEL 8, no /dev/net/tun, or
-# no unprivileged user namespaces), or with --local-net, the sandbox shares
+# no unprivileged user namespaces), or with --share-net, the sandbox shares
 # the host network as before: pasta is not used, the host's resolv.conf and
-# hosts are mounted, and a warning is printed unless --local-net asked for
+# hosts are mounted, and a warning is printed unless --share-net asked for
 # it.  --publish, --host-port and --net-log need pasta and then stop the
 # launch (exit 3).
 #
@@ -2194,7 +2194,7 @@ Outbound connections work as on the host; services on the host's loopback
 from the host, unless opened below.  Without pasta (for example on RHEL 8) the
 sandbox shares the host network, with a warning.  Ports must be in
 1024-65535; N or LOW-HIGH ranges are accepted.
-  --local-net     Share the host network (the behaviour without pasta): host
+  --share-net     Share the host network (the behaviour without pasta): host
                   loopback services are reachable from the sandbox and its
                   listeners are reachable on the host.  Cannot be combined
                   with the options below.
@@ -2238,10 +2238,10 @@ _net_baseline_args() {
     fi
 }
 
-# net_set_local
-#   --local-net: share the host network, without pasta.
-net_set_local() {
-    NET_LOCAL=1
+# net_set_share
+#   --share-net: share the host network, without pasta.
+net_set_share() {
+    NET_SHARE=1
 }
 
 # _net_forward_options
@@ -2258,10 +2258,10 @@ _net_forward_options() {
 
 # detect_net_capabilities
 #   Decide between a private network namespace and the host network.  With
-#   --local-net, the host network.  Otherwise find pasta and check that it can
+#   --share-net, the host network.  Otherwise find pasta and check that it can
 #   create a namespace here (one probe run, about 50 ms); when it cannot, warn
 #   and fall back to the host network.  The forward options need pasta: with
-#   them, --local-net is an error (exit 1) and a missing pasta stops the launch
+#   them, --share-net is an error (exit 1) and a missing pasta stops the launch
 #   (exit 3).  Under --dry-run nothing is run: an installed pasta is assumed
 #   to work.
 detect_net_capabilities() {
@@ -2269,12 +2269,12 @@ detect_net_capabilities() {
     _NET_PRIVATE=0
     _NET_SHARED_REASON=""
     _fwd="$(_net_forward_options)"
-    if [[ "${NET_LOCAL}" -eq 1 ]]; then
+    if [[ "${NET_SHARE}" -eq 1 ]]; then
         if [[ -n "${_fwd}" ]]; then
-            echo "Error: --local-net cannot be combined with the forwarding options (${_fwd}): they need the private network namespace." >&2
+            echo "Error: --share-net cannot be combined with the forwarding options (${_fwd}): they need the private network namespace." >&2
             exit 1
         fi
-        _NET_SHARED_REASON="--local-net was given"
+        _NET_SHARED_REASON="--share-net was given"
         return 0
     fi
     _PASTA_BIN="$(command -v pasta 2> /dev/null || true)"
@@ -2307,7 +2307,7 @@ detect_net_capabilities() {
         _NET_SHARED_REASON="${_reason}"
         printf 'Warning: %s: no private network namespace: %s.\n' "${0##*/}" "${_reason}" >&2
         printf '         The sandbox shares the host network: services on the host loopback are reachable from it.\n' >&2
-        printf '         Use --local-net to choose this explicitly and silence the warning.\n' >&2
+        printf '         Use --share-net to choose this explicitly and silence the warning.\n' >&2
         return 0
     fi
     _NET_PRIVATE=1
@@ -2590,7 +2590,7 @@ build_net_isolation() {
     _NET_HOST_DESC=()
     _NET_PUBLISH_ADDR_EFFECTIVE=""
 
-    # Host network (no pasta, or --local-net): the previous behaviour.
+    # Host network (no pasta, or --share-net): the previous behaviour.
     if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
         BWRAP_ARGS+=(
             --ro-bind-try /etc/resolv.conf /etc/resolv.conf
@@ -2700,8 +2700,8 @@ _net_print_report() {
     local _launcher="${0##*/}" _spec _line
     local _n_fwd=$((${#_NET_PUBLISH_DESC[@]} + ${#_NET_HOST_DESC[@]}))
     if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
-        if [[ "${NET_LOCAL}" -eq 1 && -t 2 ]]; then
-            printf '%s: network: shared with the host (--local-net)\n' "${_launcher}" >&2
+        if [[ "${NET_SHARE}" -eq 1 && -t 2 ]]; then
+            printf '%s: network: shared with the host (--share-net)\n' "${_launcher}" >&2
         fi
         return 0
     fi
@@ -3735,8 +3735,8 @@ _bwrap_context_network() {
     local _nl=$'\n' _d _t=""
     _t+="## Network${_nl}${_nl}"
     if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
-        if [[ "${NET_LOCAL}" -eq 1 ]]; then
-            _t+="This sandbox shares the host's network (the user chose \`--local-net\`)."
+        if [[ "${NET_SHARE}" -eq 1 ]]; then
+            _t+="This sandbox shares the host's network (the user chose \`--share-net\`)."
         else
             _t+="This sandbox shares the host's network (no private network namespace is available on this host)."
         fi

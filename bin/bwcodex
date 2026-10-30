@@ -113,7 +113,7 @@
 #                   Make the host's 127.0.0.1:PORT reachable in the sandbox at
 #                   host.internal:SANDBOXPORT.  May be repeated.
 #   --net-log FILE  Log every network flow to FILE on the host.
-#   --local-net     Share the host network instead (the behaviour without
+#   --share-net     Share the host network instead (the behaviour without
 #                   pasta); not with the three options above.
 #
 # Network: the sandbox has its own network namespace from pasta (package
@@ -229,8 +229,8 @@ parse_wrapper_args() {
                 net_add_host_port "$2"
                 shift 2
                 ;;
-            --local-net)
-                net_set_local
+            --share-net)
+                net_set_share
                 shift
                 ;;
             --net-log)
