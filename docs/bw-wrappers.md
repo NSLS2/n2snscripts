@@ -104,7 +104,7 @@ Every `bw*` wrapper accepts these options:
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`) for `--publish` instead of the derived address, for example `127.0.0.1` for OAuth redirects |
 | `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal:SANDBOXPORT`. May be repeated |
 | `--net-log FILE` | Log every network flow to `FILE` on the host (`pasta --debug`) |
-| `--local-net` | Share the host network instead of a private namespace (the behaviour without `pasta`); not with the forwarding options |
+| `--share-net` | Share the host network instead of a private namespace (the behaviour without `pasta`); not with the forwarding options |
 
 `--ro-path` and `--rw-path` may be nested: a path nested under another
 overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
@@ -307,7 +307,7 @@ env -i ... pasta [options] -- bash <descriptor relay> -- bwrap [options] -- <too
   forwarding options (`--publish`, `--publish-addr`, `--host-port`,
   `--net-log`) need the private namespace: with them the launch stops instead
   (exit status 3). `--dry-run` assumes an installed `pasta` works.
-- **`--local-net`** chooses the host network explicitly, even where `pasta`
+- **`--share-net`** chooses the host network explicitly, even where `pasta`
   works, without the warning: an escape hatch for workflows that need the host's
   loopback services or ports. It cannot be combined with the forwarding
   options (exit status 1). Prefer `--host-port` / `--publish` for single ports.
