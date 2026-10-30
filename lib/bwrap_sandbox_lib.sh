@@ -71,13 +71,15 @@ EXTRA_RW_PATHS=()
 # launchers' parse_wrapper_args through net_add_publish, net_add_host_port,
 # net_set_publish_addr, net_set_log_file and net_set_share; turned into pasta
 # arguments by build_net_isolation.  NET_SHARE=1 (--share-net) keeps the
-# sandbox on the host network.  NET_PUBLISH and NET_HOST_PORTS hold validated specs
+# sandbox on the host network; NET_BACKEND_FORCE (--net-backend) restricts the
+# choice to one backend.  NET_PUBLISH and NET_HOST_PORTS hold validated specs
 # "PORTS[:SANDBOXPORTS]" (PORTS is N or LOW-HIGH).
 NET_PUBLISH=()
 NET_PUBLISH_ADDR=""
 NET_HOST_PORTS=()
 NET_LOG_FILE=""
 NET_SHARE=0
+NET_BACKEND_FORCE=""
 PASTA_ARGS=()
 
 # N2C access tokens requested with --n2c-token (names, or "all").
@@ -2122,7 +2124,8 @@ build_etc_mounts() {
 # ═══════════════════════════════════════════════════════════════════
 # Network isolation
 # ═══════════════════════════════════════════════════════════════════
-# The sandbox gets its own network namespace from pasta (package passt):
+# The sandbox gets its own network namespace from the first usable backend:
+# pasta (package passt), else slirp4netns (see "slirp4netns backend" below).
 #
 #   env -i ... pasta [PASTA_ARGS] -- bash <fd relay> -- bwrap [BWRAP_ARGS] -- tool
 #
@@ -2137,8 +2140,9 @@ build_etc_mounts() {
 #   --publish PORT[:SANDBOXPORT]    sandbox server -> host 127.H1.H2.S:PORT
 #   --host-port PORT[:SANDBOXPORT]  host 127.0.0.1:PORT -> sandbox
 #                                   host.internal:SANDBOXPORT (127.0.42.1)
-# Without a usable backend (pasta not installed, as on RHEL 8, no
+# Without a usable backend (neither pasta nor slirp4netns installed, no
 # /dev/net/tun, or no unprivileged user namespaces) the launch stops (exit 3).
+# --net-backend NAME restricts the choice to one backend (for testing).
 # Only --share-net makes the sandbox share the host network as before: no
 # backend, the host's resolv.conf and hosts mounted, and no forwarding
 # options (exit 1 with them).
@@ -2170,6 +2174,8 @@ _NET_PUBLISH_ADDR_EFFECTIVE=""
 _NET_HOST_INTERNAL_ADDR="127.0.42.1"
 _NET_HOST_INTERNAL_NAME="host.internal"
 _NET_DNS_FORWARD_ADDR="169.254.1.1"
+# The sandbox's nameserver address with the chosen backend.
+_NET_DNS_EFFECTIVE=""
 # Host loopback ports that --host-port refuses: services that trust loopback
 # clients completely.  CUPS, Docker (plain and TLS), X11, the Tailscale local
 # API, and the OpenCode 2 background service (runs tools outside any sandbox).
@@ -2188,7 +2194,8 @@ _NET_HP_HI=()
 #   Print the network options for a launcher's --help.
 net_print_help() {
     cat << 'NET_HELP_EOF'
-Network: the sandbox has its own network namespace (pasta, package passt).
+Network: the sandbox has its own network namespace (pasta, package passt,
+or else slirp4netns).
 Outbound connections work as on the host; services on the host's loopback
 (127.0.0.1) are NOT reachable, and nothing the agent listens on is reachable
 from the host, unless opened below.  If no private network namespace can be
@@ -2198,6 +2205,10 @@ in 1024-65535; N or LOW-HIGH ranges are accepted.
                   private namespaces): host loopback services are reachable
                   from the sandbox and its listeners are reachable on the
                   host.  Cannot be combined with the options below.
+  --net-backend pasta|slirp4netns
+                  Use only this backend for the private namespace (normally
+                  pasta, else slirp4netns).  slirp4netns supports --publish
+                  but not --host-port or --net-log.
   --publish PORT[:SANDBOXPORT]
                   Make a server inside the sandbox (port SANDBOXPORT, default
                   PORT) reachable on the host at http://127.H1.H2.S:PORT/, an
@@ -2238,6 +2249,18 @@ _net_baseline_args() {
     fi
 }
 
+# net_set_backend NAME
+#   --net-backend: use only backend NAME (pasta or slirp4netns).
+net_set_backend() {
+    case "$1" in
+        pasta | slirp4netns) NET_BACKEND_FORCE="$1" ;;
+        *)
+            echo "Error: --net-backend: '$1' is not a backend (pasta or slirp4netns)." >&2
+            exit 1
+            ;;
+    esac
+}
+
 # net_set_share
 #   --share-net: share the host network, without a private namespace.
 net_set_share() {
@@ -2262,7 +2285,7 @@ _net_forward_options() {
 #   the first usable backend.  With none usable, stop (exit 3): the sandbox
 #   never shares the host network unless --share-net asks for it.
 detect_net_capabilities() {
-    local _fwd _pasta_reason=""
+    local _fwd _want="${NET_BACKEND_FORCE}" _pasta_reason _slirp_reason
     _NET_PRIVATE=0
     _NET_BACKEND=none
     _NET_SHARED_REASON=""
@@ -2272,22 +2295,45 @@ detect_net_capabilities() {
             echo "Error: --share-net cannot be combined with the forwarding options (${_fwd}): they need the private network namespace." >&2
             exit 1
         fi
+        if [[ -n "${_want}" ]]; then
+            echo "Error: --share-net cannot be combined with --net-backend." >&2
+            exit 1
+        fi
         _NET_SHARED_REASON="--share-net was given"
         return 0
     fi
-    if _net_try_pasta; then
-        _NET_BACKEND=pasta
-        _NET_PRIVATE=1
-        return 0
+
+    _pasta_reason="not tried (--net-backend ${_want})"
+    if [[ -z "${_want}" || "${_want}" == pasta ]]; then
+        if _net_try_pasta; then
+            _NET_BACKEND=pasta
+            _NET_PRIVATE=1
+            return 0
+        fi
+        _pasta_reason="${_NET_TRY_REASON}"
+        _PASTA_BIN=""
+        PASTA_ARGS=()
     fi
-    _pasta_reason="${_NET_TRY_REASON}"
-    _PASTA_BIN=""
-    PASTA_ARGS=()
+
+    _slirp_reason="not tried (--net-backend ${_want})"
+    if [[ -z "${_want}" || "${_want}" == slirp4netns ]]; then
+        if [[ ${#NET_HOST_PORTS[@]} -gt 0 || -n "${NET_LOG_FILE}" ]]; then
+            _slirp_reason="does not support --host-port or --net-log (pasta only)"
+        elif _net_try_slirp; then
+            _NET_BACKEND=slirp4netns
+            _NET_PRIVATE=1
+            return 0
+        else
+            _slirp_reason="${_NET_TRY_REASON}"
+        fi
+    fi
+
     printf 'Error: %s: no private network namespace is available, and the sandbox does not share\n' "${0##*/}" >&2
     printf '       the host network unless asked to.\n' >&2
-    printf '         pasta: %s\n' "${_pasta_reason}" >&2
-    printf '       Install passt (RHEL 9 and later), or run with --share-net to share the host\n' >&2
-    printf '       network (services on the host loopback are then reachable from the sandbox).\n' >&2
+    printf '         pasta:       %s\n' "${_pasta_reason}" >&2
+    printf '         slirp4netns: %s\n' "${_slirp_reason}" >&2
+    printf '       Install passt (RHEL 9 and later) or slirp4netns (RHEL 8), or run with --share-net\n' >&2
+    printf '       to share the host network (services on the host loopback are then reachable).\n' >&2
     exit 3
 }
 
@@ -2321,6 +2367,334 @@ _net_try_pasta() {
         return 1
     fi
     return 0
+}
+
+# ── slirp4netns backend ──────────────────────────────────────────
+# Used when pasta is not usable (RHEL 8 has slirp4netns but no passt).
+# slirp4netns cannot start the command itself; it attaches to an existing
+# network namespace.  The launch therefore has two steps, while the launcher
+# still execs in the foreground (so the tty, job control, exit status and
+# --die-with-parent are unchanged):
+#
+#   launcher ─┬─ helper (background subshell, _net_slirp_helper)
+#             │    waits until the launcher's pid ($$) is in its new network
+#             │    namespace, starts `setsid slirp4netns ... $$ tap0`, waits
+#             │    for it to be ready, adds the --publish forwards through its
+#             │    API socket, then releases the sandbox (--block-fd) and exits
+#             └─ exec env -i ... unshare --user --map-root-user --net --
+#                  bash <fd relay> -- bwrap --unshare-user --uid U --gid G
+#                  --info-fd 90 --block-fd 91 --sync-fd 92 ... -- tool
+#
+# On a failure the helper kills the still-blocked sandbox (its pid comes
+# from --info-fd) and then bwrap: bwrap's --die-with-parent refers to the
+# user's shell, so killing bwrap alone would leave the sandbox, which the
+# closed --block-fd would then release.
+#
+# The namespaces come from unshare (util-linux), not from bwrap's
+# --unshare-net: bwrap mounting /dev (devpts) puts the sandbox in a second
+# user namespace nested in the one that owns the network namespace, and
+# slirp4netns, which joins the target process's user namespace, would then
+# have no rights over the network.  With unshare the launcher's own process
+# holds a single-level user namespace that owns the network namespace.  It is
+# mapped to uid 0 (as with pasta), so bwrap runs the sandbox as the real
+# user with --unshare-user --uid/--gid.
+#
+# The tool does not start before the network is ready.  slirp4netns runs in
+# its own session (Ctrl-C does not reach it) with a scrubbed environment, and
+# its --exit-fd is the read end of bwrap's --sync-fd pipe, so it exits with
+# the sandbox.  Settings:
+#   --disable-host-loopback  mandatory: otherwise the gateway (.2) reaches the
+#                            host's 127.0.0.1 on every port.
+#   built-in DNS (.3)        forwarded to the host's first nameserver, port 53
+#                            only (libslirp >= 4.3.0, checked), so a loopback
+#                            resolver such as systemd-resolved keeps working.
+#   --cidr                   192.168.254.0/24 (BNL uses 10/8, slirp's default
+#                            range); sandbox .100, gateway .2, DNS .3.
+#   --enable-sandbox/--enable-seccomp  as podman does, when /etc/resolv.conf
+#                            resolves inside /etc or /run (required by it).
+# --publish works through the API socket (add_hostfwd, IPv4 TCP, one port per
+# request); --host-port and --net-log have no slirp4netns equivalent.
+
+_SLIRP_BIN=""
+_SLIRP_ARGS=()
+_UNSHARE_BIN=""
+_NET_SLIRP_NET="192.168.254"
+_NET_SLIRP_CIDR="${_NET_SLIRP_NET}.0/24"
+_NET_SLIRP_DNS="${_NET_SLIRP_NET}.3"
+# "HOSTADDR,HOSTPORT,SANDBOXPORT" for each published port; at most
+# _NET_SLIRP_MAX_FWDS (one API request each).
+_NET_SLIRP_FWDS=()
+_NET_SLIRP_MAX_FWDS=64
+_NET_SLIRP_DIR=""
+_NET_PY_BIN=""
+# Descriptors of the two-step launch.  bwrap gets 90-92; the helper keeps
+# 93-99.  The descriptor relay's numbers stay below 90.
+_NET_FD_INFO_W=90
+_NET_FD_BLOCK_R=91
+_NET_FD_SYNC_W=92
+_NET_FD_INFO_R=93
+_NET_FD_BLOCK_W=94
+_NET_FD_SYNC_R=95
+_NET_FD_READY_W=96
+_NET_FD_READY_R=97
+_NET_FD_LOG_W=98
+_NET_FD_LOG_R=99
+
+# The API client: one add_hostfwd request per argument "ADDR,HOSTPORT,PORT".
+_NET_SLIRP_API_CLIENT='
+import json, socket, sys
+path = sys.argv[1]
+for spec in sys.argv[2:]:
+    addr, hport, gport = spec.split(",")
+    req = {"execute": "add_hostfwd", "arguments": {"proto": "tcp",
+           "host_addr": addr, "host_port": int(hport), "guest_port": int(gport)}}
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(path)
+    s.sendall(json.dumps(req).encode())
+    s.shutdown(socket.SHUT_WR)
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    try:
+        reply = json.loads(data.decode() or "{}")
+    except ValueError:
+        reply = {"error": data.decode(errors="replace")}
+    if "return" not in reply:
+        sys.exit("%s:%s -> sandbox port %s: %s" % (addr, hport, gport, reply.get("error", reply)))
+'
+
+# _net_try_slirp
+#   Return 0 when slirp4netns can be used (set _SLIRP_BIN, _SLIRP_ARGS and,
+#   for --publish, _NET_PY_BIN), else 1 with the reason in _NET_TRY_REASON.
+#   There is no test run (it would need a second sandbox); a failure at
+#   launch stops the sandbox before the tool starts (see _net_slirp_helper).
+_net_try_slirp() {
+    local _out _sver="" _lver="" _resolv _n
+    _NET_TRY_REASON=""
+    _SLIRP_BIN="$(command -v slirp4netns 2> /dev/null || true)"
+    if [[ -z "${_SLIRP_BIN}" || ! -x "${_SLIRP_BIN}" ]]; then
+        _NET_TRY_REASON="not found on PATH (package slirp4netns)"
+        return 1
+    fi
+    _UNSHARE_BIN="$(command -v unshare 2> /dev/null || true)"
+    if [[ -z "${_UNSHARE_BIN}" || ! -x "${_UNSHARE_BIN}" ]] ||
+        ! "${_UNSHARE_BIN}" --help 2>&1 | grep -q -e '--map-root-user'; then
+        _NET_TRY_REASON="needs unshare (util-linux) with --map-root-user"
+        return 1
+    fi
+    if ! _out="$("${_SLIRP_BIN}" --version 2>&1)"; then
+        _NET_TRY_REASON="'slirp4netns --version' failed"
+        return 1
+    fi
+    [[ ! "${_out}" =~ slirp4netns\ version\ ([0-9][0-9.]*) ]] || _sver="${BASH_REMATCH[1]}"
+    [[ ! "${_out}" =~ libslirp:\ ([0-9][0-9.]*) ]] || _lver="${BASH_REMATCH[1]}"
+    if [[ -z "${_sver}" ]] || ! _version_ge "${_sver}" 0.4.0; then
+        _NET_TRY_REASON="version ${_sver:-unknown} is too old (0.4.0 or later is needed)"
+        return 1
+    fi
+    # Before libslirp 4.3.0 the DNS address forwarded every port to the host's
+    # resolver address, which is often on loopback.
+    if [[ -z "${_lver}" ]] || ! _version_ge "${_lver}" 4.3.0; then
+        _NET_TRY_REASON="libslirp ${_lver:-version unknown} is too old (4.3.0 or later is needed)"
+        return 1
+    fi
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        if [[ ! -c /dev/net/tun ]]; then
+            _NET_TRY_REASON="/dev/net/tun is missing on the host"
+            return 1
+        fi
+        _n="$(cat /proc/sys/user/max_user_namespaces 2> /dev/null || echo 1)"
+        if [[ "${_n}" == 0 ]]; then
+            _NET_TRY_REASON="unprivileged user namespaces are disabled (user.max_user_namespaces = 0)"
+            return 1
+        fi
+    fi
+    _NET_PY_BIN=""
+    if [[ ${#NET_PUBLISH[@]} -gt 0 ]]; then
+        for _n in /usr/libexec/platform-python "$(command -v python3 2> /dev/null || true)"; do
+            if [[ -n "${_n}" && -x "${_n}" ]]; then
+                _NET_PY_BIN="${_n}"
+                break
+            fi
+        done
+        if [[ -z "${_NET_PY_BIN}" ]]; then
+            _NET_TRY_REASON="--publish needs python3 (or /usr/libexec/platform-python) to configure it"
+            return 1
+        fi
+    fi
+    _SLIRP_ARGS=(
+        --configure
+        --mtu=65520
+        --disable-host-loopback
+        --cidr="${_NET_SLIRP_CIDR}"
+    )
+    _resolv="$(readlink -f /etc/resolv.conf 2> /dev/null || true)"
+    if [[ "${_resolv}" == /etc/* || "${_resolv}" == /run/* ]]; then
+        _SLIRP_ARGS+=(--enable-sandbox --enable-seccomp)
+    fi
+    return 0
+}
+
+# _net_slirp_publish_fwds
+#   Fill _NET_SLIRP_FWDS from NET_PUBLISH and the publish address, one entry
+#   per port.  Exit 1 above _NET_SLIRP_MAX_FWDS ports.
+_net_slirp_publish_fwds() {
+    local _spec _h _g _hlo _hhi _glo _p
+    _NET_SLIRP_FWDS=()
+    for _spec in ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"}; do
+        _h="${_spec%%:*}"
+        _g="${_spec#*:}"
+        _hlo="${_h%-*}"
+        _hhi="${_h#*-}"
+        _glo="${_g%-*}"
+        for ((_p = _hlo; _p <= _hhi; _p++)); do
+            if [[ ${#_NET_SLIRP_FWDS[@]} -ge ${_NET_SLIRP_MAX_FWDS} ]]; then
+                echo "Error: --publish: at most ${_NET_SLIRP_MAX_FWDS} ports can be published with slirp4netns." >&2
+                exit 1
+            fi
+            _NET_SLIRP_FWDS+=("${_NET_PUBLISH_ADDR_EFFECTIVE},${_p},$((_glo + _p - _hlo))")
+        done
+    done
+}
+
+# _net_slirp_start
+#   Called by launch_sandbox just before it execs bwrap: create the pipes
+#   (FIFOs in a private directory, removed once open), start the helper in
+#   the background and close the helper's descriptors in the launcher.
+_net_slirp_start() {
+    local _rt="${XDG_RUNTIME_DIR:-}" _f
+    if [[ -z "${_rt}" || ! -d "${_rt}" || ! -w "${_rt}" || ! -O "${_rt}" ]]; then
+        _rt="${TMPDIR:-/tmp}"
+    fi
+    if ! _NET_SLIRP_DIR="$(mktemp -d "${_rt}/bwrap-net.XXXXXXXX")"; then
+        echo "Error: cannot create a private directory in ${_rt} for slirp4netns." >&2
+        exit 3
+    fi
+    for _f in info block sync ready; do
+        mkfifo -m 0600 "${_NET_SLIRP_DIR}/${_f}"
+    done
+    # Each FIFO is opened read-write first, so the read-only open after it
+    # does not block.
+    exec 90<> "${_NET_SLIRP_DIR}/info"
+    exec 93< "${_NET_SLIRP_DIR}/info"
+    exec 94<> "${_NET_SLIRP_DIR}/block"
+    exec 91< "${_NET_SLIRP_DIR}/block"
+    exec 92<> "${_NET_SLIRP_DIR}/sync"
+    exec 95< "${_NET_SLIRP_DIR}/sync"
+    exec 96<> "${_NET_SLIRP_DIR}/ready"
+    exec 97< "${_NET_SLIRP_DIR}/ready"
+    exec 98> "${_NET_SLIRP_DIR}/log"
+    exec 99< "${_NET_SLIRP_DIR}/log"
+    rm -f "${_NET_SLIRP_DIR}/info" "${_NET_SLIRP_DIR}/block" "${_NET_SLIRP_DIR}/sync" \
+        "${_NET_SLIRP_DIR}/ready" "${_NET_SLIRP_DIR}/log"
+    if [[ ${#_NET_SLIRP_FWDS[@]} -eq 0 ]]; then
+        rmdir "${_NET_SLIRP_DIR}"
+    fi
+
+    _net_slirp_helper &
+    exec 93<&- 94>&- 95<&- 96>&- 97<&- 98>&- 99<&-
+}
+
+# _net_slirp_helper
+#   The background half of the two-step launch (see "slirp4netns backend").
+#   Runs in a subshell; $$ is still the launcher, which is bwrap by then.
+#   _ENV_BIN is launch_sandbox's local (bash scoping is dynamic).
+_net_slirp_helper() {
+    local _own _ns="" _map="" _pid="$$" _r _out _i
+    local -a _api=()
+    set +e
+    exec 90>&- 91<&- 92>&-
+    trap '' INT QUIT TSTP
+
+    # Wait (up to 10 s) until the launcher process has run unshare: a network
+    # namespace of its own, with the uid map written.
+    _own="$(readlink /proc/self/ns/net)"
+    for ((_i = 0; _i < 500; _i++)); do
+        _ns="$(readlink "/proc/${_pid}/ns/net" 2> /dev/null)"
+        _map="$(cat "/proc/${_pid}/uid_map" 2> /dev/null)"
+        [[ -z "${_ns}" || "${_ns}" == "${_own}" || -z "${_map}" ]] || break
+        sleep 0.02
+    done
+    if [[ -z "${_ns}" || "${_ns}" == "${_own}" || -z "${_map}" ]]; then
+        _net_slirp_fail "the sandbox did not get its network namespace"
+    fi
+
+    [[ ${#_NET_SLIRP_FWDS[@]} -eq 0 ]] || _api=(--api-socket="${_NET_SLIRP_DIR}/api.sock")
+    _net_slirp_run "${_pid}" ${_api[@]+"${_api[@]}"} > /dev/null 2>&98 93<&- 94>&- 97<&- 99<&- &
+    exec 95<&- 96>&- 98>&-
+
+    if ! IFS= read -r -t 30 -n 1 _r <&97 || [[ "${_r}" != 1 ]]; then
+        _net_slirp_fail "slirp4netns did not become ready"
+    fi
+    if [[ ${#_NET_SLIRP_FWDS[@]} -gt 0 ]]; then
+        if ! _out="$("${_NET_PY_BIN}" -I -c "${_NET_SLIRP_API_CLIENT}" \
+            "${_NET_SLIRP_DIR}/api.sock" "${_NET_SLIRP_FWDS[@]}" 2>&1)"; then
+            _net_slirp_fail "publishing a port failed: ${_out##*$'\n'}"
+        fi
+        rm -rf "${_NET_SLIRP_DIR}"
+    fi
+    printf 1 >&94
+    exit 0
+}
+
+# _net_slirp_run PID [--api-socket=PATH]
+#   Exec slirp4netns for the network namespace of PID, in its own session,
+#   with a scrubbed environment and default signal handling.  Run by
+#   _net_slirp_helper in the background.
+_net_slirp_run() {
+    local _pid="$1"
+    shift
+    trap - INT QUIT TSTP
+    exec setsid "${_ENV_BIN}" -i PATH=/usr/bin:/bin \
+        "${_SLIRP_BIN}" "${_SLIRP_ARGS[@]}" \
+        --ready-fd=96 --exit-fd=95 "$@" "${_pid}" tap0
+}
+
+# _net_slirp_fail MESSAGE
+#   Report a failed network setup, kill the still-blocked sandbox (the tool
+#   has not started; its pid is read from bwrap's --info-fd) and then the
+#   launcher process ($$, by now bwrap), and exit the helper while it still
+#   holds the --block-fd pipe.  slirp4netns, if started, exits with bwrap
+#   (--exit-fd).
+_net_slirp_fail() {
+    local _msg="$1" _info="" _line
+    printf '%s: network setup failed (slirp4netns): %s\n' "${0##*/}" "${_msg}" >&2
+    tail -n 5 <&99 2> /dev/null | sed 's/^/    /' >&2
+    printf '    The sandbox was stopped. Run with --share-net to start without network isolation.\n' >&2
+    while IFS= read -r -t 5 _line <&93; do
+        _info+="${_line}"
+        [[ "${_line}" != *"}"* ]] || break
+    done
+    if [[ "${_info}" =~ \"child-pid\":\ *([0-9]+) ]]; then
+        kill -KILL "${BASH_REMATCH[1]}" 2> /dev/null
+    fi
+    kill -KILL "$$" 2> /dev/null
+    [[ -z "${_NET_SLIRP_DIR}" ]] || rm -rf "${_NET_SLIRP_DIR}"
+    exit 1
+}
+
+# _net_slirp_print_dry_run
+#   Describe the helper's part of the launch as comments for --dry-run.
+_net_slirp_print_dry_run() {
+    local _a _b _c _f
+    printf '\n# Network (slirp4netns): before exec, the launcher starts a helper that waits\n'
+    printf '# until the launcher pid is in the network namespace made by unshare, then runs\n'
+    printf '#   setsid env -i PATH=/usr/bin:/bin %s' "${_SLIRP_BIN}"
+    for _a in "${_SLIRP_ARGS[@]}"; do printf ' %s' "${_a}"; done
+    printf ' --ready-fd=%s --exit-fd=%s' "${_NET_FD_READY_W}" "${_NET_FD_SYNC_R}"
+    [[ ${#_NET_SLIRP_FWDS[@]} -eq 0 ]] || printf ' --api-socket=<private dir>/api.sock'
+    printf ' <launcher pid> tap0\n'
+    for _f in ${_NET_SLIRP_FWDS[@]+"${_NET_SLIRP_FWDS[@]}"}; do
+        IFS=, read -r _a _b _c <<< "${_f}"
+        printf '#   add_hostfwd tcp %s:%s -> sandbox port %s\n' "${_a}" "${_b}" "${_c}"
+    done
+    printf '# and writes to descriptor %s (bwrap --block-fd %s) to start the sandbox.\n' "${_NET_FD_BLOCK_W}" "${_NET_FD_BLOCK_R}"
+    printf '# On a failure it kills the sandbox (pid from bwrap --info-fd %s) before it starts.\n' "${_NET_FD_INFO_W}"
+    printf '# slirp4netns exits when bwrap closes descriptor %s (bwrap --sync-fd).\n' "${_NET_FD_SYNC_W}"
 }
 
 # _net_parse_range OPTION TEXT
@@ -2600,7 +2974,7 @@ build_net_isolation() {
     _NET_HOST_DESC=()
     _NET_PUBLISH_ADDR_EFFECTIVE=""
 
-    # Host network (no pasta, or --share-net): the previous behaviour.
+    # Host network (--share-net): the previous behaviour.
     if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
         BWRAP_ARGS+=(
             --ro-bind-try /etc/resolv.conf /etc/resolv.conf
@@ -2615,28 +2989,48 @@ build_net_isolation() {
         )
         return 0
     fi
-    [[ ${#PASTA_ARGS[@]} -gt 0 ]] || _net_baseline_args
-
-    # pasta maps the caller to uid 0 in its user namespace: run the sandbox as
-    # the real user in a nested one, and undo pasta's hostname change.
-    BWRAP_ARGS+=(
-        --unshare-user
-        --uid "$(id -u)"
-        --gid "$(id -g)"
-        --unshare-uts
-        --hostname "$(uname -n)"
-    )
+    local _dns="${_NET_DNS_FORWARD_ADDR}"
+    if [[ "${_NET_BACKEND}" == pasta ]]; then
+        [[ ${#PASTA_ARGS[@]} -gt 0 ]] || _net_baseline_args
+        # pasta maps the caller to uid 0 in its user namespace: run the
+        # sandbox as the real user in a nested one, and undo pasta's hostname
+        # change.
+        BWRAP_ARGS+=(
+            --unshare-user
+            --uid "$(id -u)"
+            --gid "$(id -g)"
+            --unshare-uts
+            --hostname "$(uname -n)"
+        )
+    else
+        # unshare creates the namespaces (mapping the caller to uid 0) and
+        # slirp4netns attaches to them; the launch descriptors are opened by
+        # _net_slirp_start.
+        _dns="${_NET_SLIRP_DNS}"
+        BWRAP_ARGS+=(
+            --unshare-user
+            --uid "$(id -u)"
+            --gid "$(id -g)"
+            --info-fd "${_NET_FD_INFO_W}"
+            --block-fd "${_NET_FD_BLOCK_R}"
+            --sync-fd "${_NET_FD_SYNC_W}"
+        )
+    fi
 
     if [[ -n "${NET_PUBLISH_ADDR}" && ${#NET_PUBLISH[@]} -eq 0 ]]; then
         echo "Warning: --publish-addr has no effect without --publish." >&2
     fi
     if [[ ${#NET_PUBLISH[@]} -gt 0 ]]; then
         _net_derive_publish_addr
-        for _i in "${!PASTA_ARGS[@]}"; do
-            if [[ "${PASTA_ARGS[${_i}]}" == -t ]]; then
-                PASTA_ARGS[_i + 1]="${_NET_PUBLISH_ADDR_EFFECTIVE}/$(_net_join "${NET_PUBLISH[@]}")"
-            fi
-        done
+        if [[ "${_NET_BACKEND}" == pasta ]]; then
+            for _i in "${!PASTA_ARGS[@]}"; do
+                if [[ "${PASTA_ARGS[${_i}]}" == -t ]]; then
+                    PASTA_ARGS[_i + 1]="${_NET_PUBLISH_ADDR_EFFECTIVE}/$(_net_join "${NET_PUBLISH[@]}")"
+                fi
+            done
+        else
+            _net_slirp_publish_fwds
+        fi
         for _spec in "${NET_PUBLISH[@]}"; do
             _host="${_spec%%:*}"
             _sbx="${_spec#*:}"
@@ -2672,13 +3066,14 @@ build_net_isolation() {
         PASTA_ARGS+=(--log-file "${NET_LOG_FILE}" --debug)
     fi
 
-    # DNS: pasta forwards queries for _NET_DNS_FORWARD_ADDR to the host's first
-    # nameserver.  Only IPv4 is forwarded.
+    # DNS: pasta forwards queries for _NET_DNS_FORWARD_ADDR, slirp4netns for
+    # _NET_SLIRP_DNS, to the host's first nameserver.  Only IPv4.
     if [[ -r /etc/resolv.conf ]] &&
         ! grep -Eq '^[[:space:]]*nameserver[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /etc/resolv.conf; then
         echo "Warning: /etc/resolv.conf has no IPv4 nameserver: name resolution will not work in the sandbox." >&2
     fi
-    _resolv="nameserver ${_NET_DNS_FORWARD_ADDR}"$'\n'"options edns0"
+    _NET_DNS_EFFECTIVE="${_dns}"
+    _resolv="nameserver ${_dns}"$'\n'"options edns0"
     bwrap_fd_from_data "generated /etc/resolv.conf" "${_resolv}"
     BWRAP_ARGS+=(--ro-bind-data "${_BWRAP_FD}" /etc/resolv.conf)
 
@@ -2738,7 +3133,8 @@ _net_print_report() {
 #   the network mode is always a decision, never an accident.
 _net_require_configured() {
     if [[ "${_NET_CONFIGURED}" -ne 1 ]] ||
-        [[ "${_NET_PRIVATE}" -eq 1 && -z "${_PASTA_BIN}" ]]; then
+        [[ "${_NET_BACKEND}" == pasta && -z "${_PASTA_BIN}" ]] ||
+        [[ "${_NET_BACKEND}" == slirp4netns && -z "${_SLIRP_BIN}" ]]; then
         echo "Error: ${0##*/}: network isolation was not set up (detect_net_capabilities / build_net_isolation missing)." >&2
         exit 1
     fi
@@ -3755,11 +4151,15 @@ _bwrap_context_network() {
     fi
     _t+="This sandbox has its own network namespace (${_NET_BACKEND})."
     _t+=" Outbound connections work and leave from the host's address;"
-    _t+=" DNS goes to \`${_NET_DNS_FORWARD_ADDR}\`, which is forwarded to the host's resolver."
+    _t+=" DNS goes to \`${_NET_DNS_EFFECTIVE}\`, which is forwarded to the host's resolver."
     _t+=" Services listening on the host's loopback (\`127.0.0.1\`, \`localhost\`) are not reachable from here,"
     _t+=" and nothing you listen on here is reachable from the host, except as listed below."
     _t+=" \`127.0.0.1\` here is the sandbox's own loopback."
-    _t+=" ICMP (\`ping\`) may not work.${_nl}${_nl}"
+    _t+=" ICMP (\`ping\`) may not work."
+    if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+        _t+=" IPv4 only. Host services cannot be made reachable with this backend (no \`--host-port\`)."
+    fi
+    _t+="${_nl}${_nl}"
 
     _t+="Published ports (a server you run here, reachable from the host):"
     if [[ ${#_NET_PUBLISH_DESC[@]} -eq 0 ]]; then
@@ -4079,6 +4479,16 @@ _bwrap_toml_string() {
 #              exec'ing bwrap.  Not for secrets: the variable stays in
 #              pasta's environment for the whole session.
 
+# _bwrap_fd_check_room
+#   Exit 1 when the reserved numbers would reach 90, where the slirp4netns
+#   launch keeps its own descriptors (_NET_FD_*).
+_bwrap_fd_check_room() {
+    if [[ ${_BWRAP_FD_NEXT} -ge 90 ]]; then
+        echo "Error: too many files to pass to the sandbox by descriptor." >&2
+        exit 1
+    fi
+}
+
 # bwrap_fd_from_file PATH
 #   Reserve a descriptor that the relay opens on PATH and set _BWRAP_FD to its
 #   number.  Exits 1 when PATH cannot be read now.
@@ -4088,6 +4498,7 @@ bwrap_fd_from_file() {
         echo "Error: cannot read '${_path}'." >&2
         exit 1
     fi
+    _bwrap_fd_check_room
     _BWRAP_FD="${_BWRAP_FD_NEXT}"
     _BWRAP_FD_NEXT=$((_BWRAP_FD_NEXT + 1))
     _BWRAP_FD_RELAY+=("${_BWRAP_FD}" file "${_path}")
@@ -4104,6 +4515,7 @@ bwrap_fd_from_data() {
         echo "Error: the ${_label} is too large to pass to the sandbox (${#_text} characters)." >&2
         exit 1
     fi
+    _bwrap_fd_check_room
     _BWRAP_FD="${_BWRAP_FD_NEXT}"
     _BWRAP_FD_NEXT=$((_BWRAP_FD_NEXT + 1))
     _BWRAP_FD_RELAY+=("${_BWRAP_FD}" data)
@@ -4268,7 +4680,8 @@ print_dry_run() {
 
     # Mirror the exact invocation used by launch_sandbox:
     #   exec <env_bin> -i <base vars> <SANDBOX_ENV> <relay data>
-    #     [<pasta_bin> <PASTA_ARGS> --]      (private network only)
+    #     [<pasta_bin> <PASTA_ARGS> --]      (pasta backend only)
+    #     [<unshare> --user --map-root-user --net --]  (slirp4netns only)
     #     <bash_bin> -c <relay> bwrap-fd-relay <relay entries> --
     #     <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
     # Values of secret-looking variables (_is_secret_env_name) are printed as
@@ -4295,8 +4708,8 @@ print_dry_run() {
         printf "  _BWRAP_FD_DATA_%s='<%s, shown below>' \\\\\n" "${_n}" "${_BWRAP_FD_LABEL["${_n}"]}"
     done
     local _p=0
-    [[ "${_NET_PRIVATE}" -ne 1 ]] || printf "  %s \\\\\n" "${_PASTA_BIN}"
-    while [[ "${_NET_PRIVATE}" -eq 1 && ${_p} -lt ${#PASTA_ARGS[@]} ]]; do
+    [[ "${_NET_BACKEND}" != pasta ]] || printf "  %s \\\\\n" "${_PASTA_BIN}"
+    while [[ "${_NET_BACKEND}" == pasta && ${_p} -lt ${#PASTA_ARGS[@]} ]]; do
         case "${PASTA_ARGS[${_p}]}" in
             -t | -u | -T | -U | --dns-forward | --search | --log-file)
                 printf "    %s %q \\\\\n" "${PASTA_ARGS[${_p}]}" "${PASTA_ARGS[$((_p + 1))]}"
@@ -4308,7 +4721,10 @@ print_dry_run() {
                 ;;
         esac
     done
-    [[ "${_NET_PRIVATE}" -ne 1 ]] || printf "    -- \\\\\n"
+    [[ "${_NET_BACKEND}" != pasta ]] || printf "    -- \\\\\n"
+    if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+        printf "  %s --user --map-root-user --net -- \\\\\n" "${_UNSHARE_BIN}"
+    fi
     printf "  %s -c '<_BWRAP_FD_RELAY_SHIM from bwrap_sandbox_lib.sh>' bwrap-fd-relay \\\\\n" "${_BASH_BIN}"
     local _r=0
     while [[ ${_r} -lt ${#_BWRAP_FD_RELAY[@]} ]]; do
@@ -4354,6 +4770,7 @@ print_dry_run() {
     local _arg
     for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do printf " %q" "${_arg}"; done
     printf "\n"
+    [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_print_dry_run
     for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
         printf '\n# Descriptor %s, filled by the relay with the %s:\n#\n' "${_n}" "${_BWRAP_FD_LABEL["${_n}"]}"
         printf '%s\n' "${_BWRAP_FD_DATA["${_n}"]}" | sed 's/^/# /; s/ *$//'
@@ -4388,8 +4805,10 @@ launch_sandbox() {
     _BASH_BIN="$(resolve_bash_bin)"
 
     local -a _data_env=() _net_prefix=()
-    if [[ "${_NET_PRIVATE}" -eq 1 ]]; then
+    if [[ "${_NET_BACKEND}" == pasta ]]; then
         _net_prefix=("${_PASTA_BIN}" "${PASTA_ARGS[@]}" --)
+    elif [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+        _net_prefix=("${_UNSHARE_BIN}" --user --map-root-user --net --)
     fi
     _bwrap_fd_data_numbers
     for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
@@ -4397,6 +4816,7 @@ launch_sandbox() {
     done
 
     _net_print_report
+    [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_start
     exec "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
         USER="${_USER}" \
