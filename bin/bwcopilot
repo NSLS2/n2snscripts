@@ -69,6 +69,17 @@
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
 #                   A nested --ro-path/--rw-path overrides the one it sits under,
 #                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
+#   --no-sandbox-context
+#                   Do not generate the sandbox context file (see below).
+#
+# Sandbox context: a short markdown file describing this sandbox (what is
+# mounted read-only or read-write, what is lost at exit, which tools are
+# disabled) is built from the final mounts and mounted read-only at
+# ~/.sandbox/AGENTS.md, and BWRAP_SANDBOX / BWRAP_SANDBOX_CONTEXT are set.
+# Copilot loads it through COPILOT_CUSTOM_INSTRUCTIONS_DIRS=~/.sandbox, which
+# adds that directory's AGENTS.md to the instruction files it already reads (a
+# host value of the variable is not forwarded, so nothing is replaced).
+# Not added to a --exec command.
 
 set -euo pipefail
 
@@ -128,6 +139,11 @@ parse_wrapper_args() {
                 fi
                 add_n2c_token "$2"
                 shift 2
+                ;;
+            --no-sandbox-context)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+                SANDBOX_CONTEXT_ENABLED=0
+                shift
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -206,6 +222,13 @@ Wrapper options (consumed before copilot sees the command line):
                   Off by default.  When set, use per-command token selection:
                     GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
                     GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
+  --no-sandbox-context
+                  Do not tell the agent about the sandbox.  By default a short
+                  description of what is mounted (read-only or read-write), what
+                  is lost at exit and which tools are disabled is mounted at
+                  ~/.sandbox/AGENTS.md and added to Copilot's
+                  instructions (your own instruction files are kept).
+                  Use --dry-run to see it.
 
 All other arguments are passed through to copilot unchanged.
 
@@ -431,6 +454,19 @@ build_copilot_env() {
 # Main
 # ═══════════════════════════════════════════════════════════════════
 
+# ── Sandbox context ──────────────────────────────────────────────
+# Mount the context file (see build_sandbox_context) and make Copilot load it:
+# COPILOT_CUSTOM_INSTRUCTIONS_DIRS lists extra directories whose AGENTS.md is
+# read in addition to the usual instruction files.  A host value of the
+# variable is not forwarded (it never was), so nothing is replaced.
+build_copilot_context() {
+    # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+    SANDBOX_CONTEXT_NOTES=()
+    build_sandbox_context bwcopilot
+    [[ -n "${SANDBOX_CONTEXT_PATH}" && -z "${TEST_CMD}" ]] || return 0
+    SANDBOX_ENV+=("COPILOT_CUSTOM_INSTRUCTIONS_DIRS=${SANDBOX_CONTEXT_PATH%/*}")
+}
+
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
@@ -487,6 +523,7 @@ main() {
     # Environment variables
     build_env_vars
     build_copilot_env
+    build_copilot_context
 
     # Mask dangerous binaries as the very last step: a mask is hidden by any
     # later bind that covers it (e.g. --ro-path /usr or /usr/bin).

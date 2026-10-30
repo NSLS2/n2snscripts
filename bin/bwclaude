@@ -84,6 +84,17 @@
 #                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
 #                   A nested --ro-path/--rw-path overrides the one it sits under,
 #                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
+#   --no-sandbox-context
+#                   Do not generate the sandbox context file (see below).
+#
+# Sandbox context: a short markdown file describing this sandbox (what is
+# mounted read-only or read-write, what is lost at exit, which tools are
+# disabled) is built from the final mounts and mounted read-only at
+# ~/.sandbox/AGENTS.md, and BWRAP_SANDBOX / BWRAP_SANDBOX_CONTEXT are set.
+# Claude Code loads it with --append-system-prompt-file, which adds to the
+# default system prompt and leaves CLAUDE.md alone (verified with 2.1.310);
+# skipped, with a warning, when the user passes --append-system-prompt[-file].
+# Not added to a --exec command.
 
 set -euo pipefail
 
@@ -148,6 +159,11 @@ parse_wrapper_args() {
                 fi
                 add_n2c_token "$2"
                 shift 2
+                ;;
+            --no-sandbox-context)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+                SANDBOX_CONTEXT_ENABLED=0
+                shift
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -231,6 +247,13 @@ Wrapper options (consumed before claude sees the command line):
                   Off by default.  When set, use per-command token selection:
                     GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
                     GH_TOKEN="$GH_TOKEN_PERSONAL" gh issue list -R user/repo
+  --no-sandbox-context
+                  Do not tell the agent about the sandbox.  By default a short
+                  description of what is mounted (read-only or read-write), what
+                  is lost at exit and which tools are disabled is mounted at
+                  ~/.sandbox/AGENTS.md and is added to Claude Code's
+                  system prompt (CLAUDE.md is kept).
+                  Use --dry-run to see it.
 
 All other arguments are passed through to claude unchanged.
 
@@ -532,6 +555,33 @@ build_claude_bin_mount() {
 # Main
 # ═══════════════════════════════════════════════════════════════════
 
+# ── Sandbox context ──────────────────────────────────────────────
+# Mount the context file (see build_sandbox_context) and make Claude Code load
+# it.  --append-system-prompt-file adds to the default system prompt and leaves
+# CLAUDE.md alone.  The user's own --append-system-prompt[-file] wins: two
+# appends are not known to combine, so the file is then only mounted.  Must run
+# after build_claude_env (which may prepend --debug --verbose).
+build_claude_context() {
+    # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+    SANDBOX_CONTEXT_NOTES=()
+    build_sandbox_context bwclaude
+    [[ -n "${SANDBOX_CONTEXT_PATH}" && -z "${TEST_CMD}" ]] || return 0
+
+    local _arg
+    for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do
+        case "${_arg}" in
+            --)
+                break
+                ;;
+            --append-system-prompt | --append-system-prompt=* | --append-system-prompt-file | --append-system-prompt-file=*)
+                echo "Warning: bwclaude: ${_arg%%=*} was given, so Claude Code is not told to load ${SANDBOX_CONTEXT_PATH} (the file is still mounted)." >&2
+                return 0
+                ;;
+        esac
+    done
+    TOOL_ARGS=(--append-system-prompt-file "${SANDBOX_CONTEXT_PATH}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
+}
+
 main() {
     bwrap_check_account
     parse_wrapper_args "$@"
@@ -580,6 +630,7 @@ main() {
     # Environment variables
     build_env_vars
     build_claude_env
+    build_claude_context
 
     # Mask dangerous binaries as the very last step: a mask is hidden by any
     # later bind that covers it (e.g. --ro-path /usr or /usr/bin).

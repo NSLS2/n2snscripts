@@ -63,6 +63,18 @@ EXTRA_RW_PATHS=()
 # Populated by add_n2c_token; mounted by build_n2c_token_mounts.
 N2C_TOKENS=()
 
+# Sandbox context file (see "Sandbox context" below).  The launchers set
+# SANDBOX_CONTEXT_ENABLED=0 for --no-sandbox-context and fill
+# SANDBOX_CONTEXT_NOTES with tool-specific markdown lines before calling
+# build_sandbox_context.  SANDBOX_CONTEXT_PATH is the path of the file inside
+# the sandbox once build_sandbox_context has emitted it (empty otherwise).
+# shellcheck disable=SC2034  # used by tool wrappers that source this library
+SANDBOX_CONTEXT_ENABLED=1
+# shellcheck disable=SC2034  # used by tool wrappers that source this library
+SANDBOX_CONTEXT_NOTES=()
+SANDBOX_CONTEXT_PATH=""
+_SANDBOX_CONTEXT_TEXT=""
+
 # Tool binary (set by bwrap_resolve_tool)
 _TOOL_BIN=""
 _TOOL_CMD=()
@@ -1926,23 +1938,26 @@ build_base_sandbox() {
 #   Keyring       – kernel keyring manipulation
 #   Priv-escalation – sudo/su/pkexec
 #   Namespace     – sandbox escape via nsenter/unshare/chroot
+#
+# _MASKED_BINS is also listed in the sandbox context file (see
+# build_sandbox_context), so it lives at file scope.
+_MASKED_BINS=(
+    # SSH
+    ssh scp sftp ssh-agent ssh-add ssh-keygen ssh-keyscan
+    # Network
+    telnet nc ncat netcat rsync rsh rlogin rexec
+    # Kerberos
+    kinit klist kdestroy kswitch
+    # Keyring
+    keyctl
+    # Privilege escalation
+    sudo su pkexec
+    # Namespace / sandbox escape
+    nsenter unshare chroot
+)
 build_binary_masks() {
     [[ "${HAS_BIND_OVER_RO}" -eq 1 ]] || return 0
 
-    local _MASKED_BINS=(
-        # SSH
-        ssh scp sftp ssh-agent ssh-add ssh-keygen ssh-keyscan
-        # Network
-        telnet nc ncat netcat rsync rsh rlogin rexec
-        # Kerberos
-        kinit klist kdestroy kswitch
-        # Keyring
-        keyctl
-        # Privilege escalation
-        sudo su pkexec
-        # Namespace / sandbox escape
-        nsenter unshare chroot
-    )
     # Canonicalize + dedupe the search prefixes once.  On merged-/usr systems
     # /bin, /sbin, /usr/bin, /usr/sbin resolve to the same directory; collapsing
     # them here avoids re-checking (and re-resolving) the same candidate under
@@ -2881,6 +2896,438 @@ build_env_vars() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
+# Sandbox context
+# ═══════════════════════════════════════════════════════════════════
+# An agent that does not know it runs in a sandbox guesses: it takes a
+# read-only bind mount of a resolved symlink for a hard link, or expects
+# ~/.ssh to exist.  build_sandbox_context writes a short markdown description
+# of THIS sandbox, built from the final BWRAP_ARGS so it always matches the
+# real mounts, and mounts it read-only at ~/.sandbox/AGENTS.md.  Each launcher
+# then makes its tool load the file in addition to the user's own
+# instruction files (never in place of them; no user file is touched).
+#
+# The file travels as --ro-bind-data on a file descriptor, so nothing is
+# written to the host.  Variables set inside the sandbox:
+#   BWRAP_SANDBOX          launcher name (for example bwopencode2)
+#   BWRAP_SANDBOX_CONTEXT  path of the context file
+
+# Row data collected from BWRAP_ARGS by _bwrap_context_collect, keyed by the
+# raw destination path, so that two different paths never share a key.
+# _CTX_DESTS keeps first-seen order.  A later mount at a destination replaces
+# the earlier one and hides everything mounted below it (mode "hidden"), as in
+# bwrap.  Paths are only cleaned where they are written into the text.
+declare -A _CTX_MODE=()
+declare -A _CTX_SRC=()
+_CTX_DESTS=()
+_CTX_HOME=""
+_CTX_AT=""
+# Characters that would break the markdown (control characters, | and a
+# backtick) are shown as ? in every path in the text.  Lists of paths are
+# sorted and read NUL-delimited, because a path may hold a newline.
+_CTX_BAD='[[:cntrl:]|`]'
+
+# _bwrap_context_collect
+#   Walk BWRAP_ARGS and record every bind, file copy, tmpfs and symlink
+#   destination with its mode: ro, rw, copy (--file and --bind-data: a
+#   writable copy that is lost at exit), tmpfs or link.  *-try binds whose
+#   source is missing are skipped (bwrap skips them too), as is anything bound
+#   from /dev/null (the tty mask and, later, the binary masks).
+_bwrap_context_collect() {
+    _CTX_DESTS=()
+    _CTX_MODE=()
+    _CTX_SRC=()
+    _CTX_HOME="${_HOME}"
+    local _i=0 _flag _a1 _a2 _mode _src _dest _e
+    while [[ ${_i} -lt ${#BWRAP_ARGS[@]} ]]; do
+        _flag="${BWRAP_ARGS[${_i}]}"
+        _bwrap_flag_arity "${_flag}"
+        _a1="${BWRAP_ARGS[$((_i + 1))]:-}"
+        _a2="${BWRAP_ARGS[$((_i + 2))]:-}"
+        _i=$((_i + 1 + _BWRAP_FLAG_ARITY))
+        _src=""
+        case "${_flag}" in
+            --ro-bind | --ro-bind-try)
+                _mode="ro"
+                _src="${_a1}"
+                _dest="${_a2}"
+                ;;
+            --bind | --bind-try)
+                _mode="rw"
+                _src="${_a1}"
+                _dest="${_a2}"
+                ;;
+            --ro-bind-data)
+                _mode="ro"
+                _dest="${_a2}"
+                ;;
+            --file | --bind-data)
+                _mode="copy"
+                _dest="${_a2}"
+                ;;
+            --tmpfs)
+                _mode="tmpfs"
+                _dest="${_a1}"
+                ;;
+            --symlink)
+                _mode="link"
+                _src="${_a1}"
+                _dest="${_a2}"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        case "${_flag}" in
+            *-try) [[ -e "${_src}" ]] || continue ;;
+        esac
+        [[ "${_src}" == /dev/null ]] && continue
+        for _e in "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}"; do
+            [[ "${_e}" == "${_dest}"/* ]] && _CTX_MODE["${_e}"]="hidden"
+        done
+        [[ -n "${_CTX_MODE["${_dest}"]+x}" ]] || _CTX_DESTS+=("${_dest}")
+        _CTX_MODE["${_dest}"]="${_mode}"
+        _CTX_SRC["${_dest}"]="${_src}"
+    done
+}
+
+# _bwrap_context_display PATH
+#   Print PATH cleaned, with a leading $HOME shown as ~.
+_bwrap_context_display() {
+    local _p="$1" _s
+    if [[ "${_p}" == "${_CTX_HOME}" ]]; then
+        printf '~'
+    elif [[ "${_p}" == "${_CTX_HOME}"/* ]]; then
+        _s="${_p#"${_CTX_HOME}"/}"
+        # shellcheck disable=SC2088  # a literal tilde is wanted
+        printf '~/%s' "${_s//${_CTX_BAD}/?}"
+    else
+        printf '%s' "${_p//${_CTX_BAD}/?}"
+    fi
+}
+
+# _bwrap_context_access MODE
+#   Print the wording used for a mount mode in the context file.
+_bwrap_context_access() {
+    case "$1" in
+        ro) printf 'ro' ;;
+        rw) printf 'rw' ;;
+        copy) printf 'copy' ;;
+        tmpfs) printf 'tmpfs' ;;
+        link) printf 'symlink' ;;
+    esac
+}
+
+# _bwrap_context_mode_at PATH
+#   Set _CTX_AT to the mode of the deepest visible mount that is PATH or one of
+#   its ancestors (empty when none).
+_bwrap_context_mode_at() {
+    local _p="$1"
+    _CTX_AT=""
+    while [[ -n "${_p}" ]]; do
+        if [[ -n "${_CTX_MODE["${_p}"]+x}" && "${_CTX_MODE["${_p}"]}" != hidden ]]; then
+            _CTX_AT="${_CTX_MODE["${_p}"]}"
+            return 0
+        fi
+        _p="${_p%/*}"
+    done
+}
+
+# _bwrap_context_touched PATH
+#   Return 0 when a visible mount is PATH, lies below it, or is a bind that
+#   contains it (a tmpfs does not count: $HOME itself is one).
+_bwrap_context_touched() {
+    local _p="$1" _d _m
+    for _d in "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}"; do
+        _m="${_CTX_MODE["${_d}"]}"
+        [[ "${_m}" == hidden ]] && continue
+        [[ "${_d}" == "${_p}" || "${_d}" == "${_p}"/* ]] && return 0
+        case "${_m}" in
+            ro | rw | copy) [[ "${_p}" == "${_d}"/* ]] && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# _bwrap_context_under_writable PATH
+#   Return 0 when a visible rw, copy or tmpfs mount is an ancestor of PATH: a
+#   read-only mount there is an exception to it and must be listed.
+_bwrap_context_under_writable() {
+    local _p="$1" _d
+    for _d in "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}"; do
+        case "${_CTX_MODE["${_d}"]}" in
+            rw | copy | tmpfs) [[ "${_p}" == "${_d}"/* ]] && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# _bwrap_context_render TOOL DEST
+#   Build the context file text for launcher TOOL (to be mounted at DEST) in
+#   _SANDBOX_CONTEXT_TEXT, from BWRAP_ARGS, SANDBOX_ENV and the launcher's
+#   SANDBOX_CONTEXT_NOTES.  Must run after every mount has been emitted
+#   except the binary masks (the masked names come from _MASKED_BINS).
+_bwrap_context_render() {
+    local _tool="$1" _dest_file="$2" _nl=$'\n'
+    local _t="" _d _key _mode _line _n _c _tab=$'\t' _gn _acc _p
+
+    _bwrap_context_collect
+
+    local -a _sorted=()
+    while IFS= read -r -d '' _d; do
+        _sorted+=("${_d}")
+    done < <(printf '%s\0' "${_CTX_DESTS[@]+"${_CTX_DESTS[@]}"}" | LC_ALL=C sort -z)
+
+    # Home rows are grouped by (parent directory, mode).  System mounts are
+    # collapsed; a mount outside $HOME that is not read-only, or not part of
+    # the system trees, is listed on its own.
+    local -a _gkeys=() _sys=() _etc=() _other=()
+    declare -A _gnames=() _gcount=() _gfirst=() _seen=()
+    local _par
+    for _d in "${_sorted[@]+"${_sorted[@]}"}"; do
+        [[ -n "${_d}" ]] || continue
+        _mode="${_CTX_MODE["${_d}"]}"
+        [[ "${_mode}" == hidden ]] && continue
+        case "${_d}" in
+            "${_CTX_HOME}") continue ;;
+            "${_CTX_HOME}"/*)
+                _par="${_d%/*}"
+                _key="${_par}${_tab}${_mode}"
+                if [[ -z "${_gcount["${_key}"]:-}" ]]; then
+                    _gkeys+=("${_key}")
+                    _gcount["${_key}"]=0
+                    _gnames["${_key}"]=""
+                    _gfirst["${_key}"]="${_d}"
+                fi
+                _gnames["${_key}"]+="${_gnames["${_key}"]:+,}${_d##*/}"
+                _c="${_gcount["${_key}"]}"
+                _gcount["${_key}"]=$((_c + 1))
+                ;;
+            /tmp)
+                [[ "${_mode}" == tmpfs ]] || _other+=("${_d}")
+                ;;
+            /sys/*)
+                [[ "${_mode}" == ro ]] || _other+=("${_d}")
+                ;;
+            /usr | /bin | /sbin | /lib | /lib64)
+                if [[ "${_mode}" == rw || "${_mode}" == copy ]]; then
+                    _other+=("${_d}")
+                else
+                    _sys+=("${_d}")
+                fi
+                ;;
+            /usr/* | /etc/*)
+                if [[ "${_mode}" != ro ]] || _bwrap_context_under_writable "${_d}"; then
+                    _other+=("${_d}")
+                elif [[ "${_d}" == /etc/* ]]; then
+                    _n="${_d#/etc/}"
+                    _n="${_n%%/*}"
+                    if [[ -z "${_seen["etc:${_n}"]:-}" ]]; then
+                        _seen["etc:${_n}"]=1
+                        _etc+=("${_n}")
+                    fi
+                fi
+                ;;
+            *) _other+=("${_d}") ;;
+        esac
+    done
+
+    _t+="# Sandbox context${_nl}${_nl}"
+    _t+="This session runs inside a bubblewrap (bwrap) sandbox started by \`${_tool}\`"
+    _t+=" at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+    _t+=" This file describes this session; trust it over assumptions about the host.${_nl}${_nl}"
+
+    _t+="## What this means${_nl}${_nl}"
+    _t+="- \`\$HOME\` (~ = ${_CTX_HOME//${_CTX_BAD}/?}) is an empty tmpfs. Only the paths listed below exist in it;"
+    _t+=" anything else you write there is lost when the session ends.${_nl}"
+    _t+="- Read-only files under \`\$HOME\` that look like links are bind mounts, not hard links."
+    _t+=" The launcher resolves host symlinks and mounts the target at the expected path,"
+    _t+=" so a path can be a read-only mount of a file that is a symlink on the host,"
+    _t+=" and two paths can show the same inode."
+    _t+=" \`findmnt -T <path>\` shows the source and \`ro\`/\`rw\`.${_nl}"
+    _t+="- Edit such a file at its source (for example a dotfiles repository), not at the mount point,"
+    _t+=" and only if the source is mounted read-write below."
+    _t+=" \"Read-only file system\" on a mount point is expected.${_nl}"
+    _t+="- \`ln -s\` creates ordinary symlinks, in writable locations only.${_nl}"
+    _t+="- The network is shared with the host. Host processes are not visible (private PID namespace)."
+    _t+=" There are no SSH or GPG agents and no sudo.${_nl}${_nl}"
+
+    _bwrap_context_mode_at "${_PWD}"
+    case "${_CTX_AT}" in
+        rw) _acc="read-write" ;;
+        ro) _acc="read-only" ;;
+        copy) _acc="a writable copy (lost at exit)" ;;
+        tmpfs) _acc="an empty tmpfs (lost at exit)" ;;
+        *) _acc="not mounted" ;;
+    esac
+    _t+="## Working directory${_nl}${_nl}"
+    _t+="\`$(_bwrap_context_display "${_PWD}")\`, ${_acc}."
+    if [[ -n "${_GIT_ROOT}" ]]; then
+        if [[ "${_PWD}" == "${_GIT_ROOT}" ]]; then
+            _t+=" It is the root of a git repository, which is mounted whole;"
+        else
+            _t+=" It is inside the git repository \`$(_bwrap_context_display "${_GIT_ROOT}")\`, which is mounted whole;"
+        fi
+        _t+=" sibling directories of the repository are not mounted."
+    else
+        _t+=" It is not a git repository, so only this directory is mounted."
+    fi
+    _t+="${_nl}${_nl}"
+
+    _t+="## Mounts${_nl}${_nl}"
+    _t+="\`rw\` is the real host files (often NFS): changes persist and show on the host at once."
+    _t+=" \`ro\` is read-only. \`copy\` is a writable copy of a host file: changes are lost at exit."
+    _t+=" \`tmpfs\` is empty and lost at exit, except the mounts listed under it.${_nl}${_nl}"
+
+    _t+="### Under \`\$HOME\`${_nl}${_nl}"
+    _t+="| Path | Access |${_nl}| --- | --- |${_nl}"
+    if [[ ${#_gkeys[@]} -eq 0 ]]; then
+        _t+="| (none) | |${_nl}"
+    else
+        while IFS= read -r -d '' _key; do
+            _mode="${_key##*"${_tab}"}"
+            if [[ "${_gcount["${_key}"]}" -eq 1 ]]; then
+                _d="${_gfirst["${_key}"]}"
+                _line="| \`$(_bwrap_context_display "${_d}")\` | $(_bwrap_context_access "${_mode}")"
+                if [[ "${_mode}" == link ]]; then
+                    _line+=" to \`$(_bwrap_context_display "${_CTX_SRC["${_d}"]}")\`"
+                elif [[ -n "${_CTX_SRC["${_d}"]}" && "${_CTX_SRC["${_d}"]}" != "${_d}" ]]; then
+                    _line+=" (host source \`$(_bwrap_context_display "${_CTX_SRC["${_d}"]}")\`)"
+                fi
+            else
+                _par="${_key%"${_tab}"*}"
+                _gn="${_gnames["${_key}"]}"
+                _line="| \`$(_bwrap_context_display "${_par}")/{${_gn//${_CTX_BAD}/?}}\` | $(_bwrap_context_access "${_mode}")"
+            fi
+            _t+="${_line} |${_nl}"
+        done < <(printf '%s\0' "${_gkeys[@]}" | LC_ALL=C sort -z)
+    fi
+    _t+="${_nl}"
+
+    _t+="### Elsewhere${_nl}${_nl}"
+    if [[ ${#_sys[@]} -gt 0 ]]; then
+        _line=""
+        for _d in "${_sys[@]}"; do _line+="${_line:+, }\`${_d}\`"; done
+        _t+="- System, read-only: ${_line}.${_nl}"
+    fi
+    if [[ ${#_etc[@]} -gt 0 ]]; then
+        _line=""
+        for _n in "${_etc[@]}"; do _line+="${_line:+, }\`${_n//${_CTX_BAD}/?}\`"; done
+        _t+="- \`/etc\`, read-only, selected entries only: ${_line}.${_nl}"
+    fi
+    for _d in "${_other[@]+"${_other[@]}"}"; do
+        _t+="- \`$(_bwrap_context_display "${_d}")\`: $(_bwrap_context_access "${_CTX_MODE["${_d}"]}").${_nl}"
+    done
+    _bwrap_context_mode_at /tmp
+    if [[ "${_CTX_AT}" == tmpfs ]]; then
+        _t+="- \`/tmp\` is a private tmpfs (lost at exit)."
+    else
+        _t+="- \`/tmp\` is NOT private here (see its mount above): what you write there may persist on the host."
+    fi
+    _t+=" \`/proc\` and \`/dev\` are private to the sandbox unless listed above.${_nl}${_nl}"
+
+    _t+="## Not available${_nl}${_nl}"
+    _line=""
+    for _n in .ssh .gnupg .aws .kube .docker .netrc .config/gh .bashrc .bash_profile .zshrc .profile; do
+        _p="${_CTX_HOME}/${_n}"
+        _bwrap_context_touched "${_p}" || _line+="${_line:+, }\`~/${_n}\`"
+    done
+    _t+="- Not mounted: everything under \`\$HOME\` that is not listed above"
+    [[ -z "${_line}" ]] || _t+=", for example ${_line}"
+    _t+=".${_nl}"
+    if [[ "${HAS_BIND_OVER_RO}" -eq 1 ]]; then
+        _line=""
+        for _n in "${_MASKED_BINS[@]}"; do _line+="${_line:+, }\`${_n}\`"; done
+        _t+="- Disabled (replaced by an empty file, so they fail when run): ${_line}.${_nl}"
+    else
+        _t+="- The ssh, sudo and network tools are NOT disabled here (the bwrap on this host is too old to mask them).${_nl}"
+    fi
+    _t+="${_nl}"
+
+    _t+="## Environment${_nl}${_nl}"
+    local -a _names=()
+    local _entry
+    for _entry in ${SANDBOX_ENV[@]+"${SANDBOX_ENV[@]}"}; do
+        _names+=("${_entry%%=*}")
+    done
+    if [[ ${#_names[@]} -gt 0 ]]; then
+        _line=""
+        while IFS= read -r _n; do _line+="${_line:+, }\`${_n}\`"; done \
+            < <(printf '%s\n' "${_names[@]}" | LC_ALL=C sort -u)
+        _t+="Variables passed in from the host (names only): ${_line}.${_nl}"
+    else
+        _t+="No host variables are passed in beyond the standard ones (HOME, USER, PATH, TERM).${_nl}"
+    fi
+    _t+="\`BWRAP_SANDBOX=${_tool}\` and \`BWRAP_SANDBOX_CONTEXT=${_dest_file}\` identify this sandbox.${_nl}"
+
+    if [[ ${#SANDBOX_CONTEXT_NOTES[@]} -gt 0 ]]; then
+        _t+="${_nl}## Notes for ${_tool}${_nl}${_nl}"
+        for _line in "${SANDBOX_CONTEXT_NOTES[@]}"; do
+            _t+="- ${_line}${_nl}"
+        done
+    fi
+
+    _SANDBOX_CONTEXT_TEXT="${_t}"
+}
+
+# build_sandbox_context TOOL
+#   Generate the context file for launcher TOOL and emit its mount.  Call it
+#   after every other mount builder and after build_env_vars and the tool's
+#   own environment builder (it lists SANDBOX_ENV), and before
+#   build_binary_masks.  Does nothing under --no-sandbox-context.  Sets
+#   SANDBOX_CONTEXT_PATH (and _SANDBOX_CONTEXT_TEXT) when the file is mounted.
+build_sandbox_context() {
+    local _tool="$1"
+    local _dir="${_HOME}/.sandbox" _file="${_HOME}/.sandbox/AGENTS.md" _fd
+    SANDBOX_CONTEXT_PATH=""
+    [[ "${SANDBOX_CONTEXT_ENABLED}" -eq 1 ]] || return 0
+
+    if _bwrap_dest_in_args "${_dir}"; then
+        echo "Warning: ${_dir} is already used by another mount; the sandbox context file is not provided." >&2
+        return 0
+    fi
+
+    _bwrap_context_render "${_tool}" "${_file}"
+
+    # The descriptor stays open in this shell until launch_sandbox execs
+    # bwrap, which reads it for --ro-bind-data and closes it.
+    exec {_fd}<<< "${_SANDBOX_CONTEXT_TEXT}"
+    BWRAP_ARGS+=(
+        --dir "${_dir}"
+        --ro-bind-data "${_fd}" "${_file}"
+    )
+    SANDBOX_ENV+=(
+        "BWRAP_SANDBOX=${_tool}"
+        "BWRAP_SANDBOX_CONTEXT=${_file}"
+    )
+    SANDBOX_CONTEXT_PATH="${_file}"
+}
+
+# _bwrap_json_quote STRING
+#   Print STRING as a JSON string.  Return 1 (printing nothing) when STRING
+#   holds a control character.
+_bwrap_json_quote() {
+    local _s="$1"
+    [[ "${_s}" =~ [[:cntrl:]] ]] && return 1
+    _s="${_s//\\/\\\\}"
+    _s="${_s//\"/\\\"}"
+    printf '"%s"' "${_s}"
+}
+
+# _bwrap_toml_string STRING
+#   Print STRING as a single-line TOML basic string.  Return 1 (printing
+#   nothing) when STRING holds a control character other than newline or tab.
+_bwrap_toml_string() {
+    local _s="$1"
+    _s="${_s//$'\r'/}"
+    _s="${_s//\\/\\\\}"
+    _s="${_s//\"/\\\"}"
+    _s="${_s//$'\n'/\\n}"
+    _s="${_s//$'\t'/\\t}"
+    [[ "${_s}" =~ [[:cntrl:]] ]] && return 1
+    printf '"%s"' "${_s}"
+}
+
+# ═══════════════════════════════════════════════════════════════════
 # Shared launch functions
 # ═══════════════════════════════════════════════════════════════════
 
@@ -3015,6 +3462,11 @@ print_dry_run() {
     local _arg
     for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do printf " %q" "${_arg}"; done
     printf "\n"
+    if [[ -n "${SANDBOX_CONTEXT_PATH}" ]]; then
+        printf '\n# --ro-bind-data above reads a file descriptor that a real run fills with this\n'
+        printf '# sandbox context file, mounted at %s:\n#\n' "${SANDBOX_CONTEXT_PATH}"
+        printf '%s\n' "${_SANDBOX_CONTEXT_TEXT}" | sed 's/^/# /; s/ *$//'
+    fi
     exit 0
 }
 

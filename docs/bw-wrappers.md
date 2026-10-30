@@ -94,6 +94,7 @@ Every `bw*` wrapper accepts these options:
 | `--rw-path PATH` | Read-write mount an existing path; its canonical target is mounted at the same canonical destination. Use only narrow paths. |
 | `--n2c-token NAME` | Mount the N2C access token `NAME` read-only so skills in the sandbox can call NSLS-II APIs. May be repeated; `--n2c-token all` mounts every token present. Off by default. See [N2C access tokens](#n2c-access-tokens) |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
+| `--no-sandbox-context` | Do not generate the [sandbox context file](#sandbox-context) that tells the agent what is mounted |
 
 `--ro-path` and `--rw-path` may be nested: a path nested under another
 overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
@@ -143,6 +144,58 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   the host uses a non-default location. Nothing is set when no token is mounted.
 
 Example: `bwopencode2 --n2c-token observability --n2c-token epics`.
+
+## Sandbox context
+
+An agent that does not know it runs in a sandbox guesses: it takes a read-only
+bind mount of a resolved symlink for a hard link, or expects `~/.ssh` to exist.
+Every launcher therefore writes a short markdown description of the session
+and makes the tool load it.
+
+- **Built from the real mounts.** `build_sandbox_context` walks the final
+  `bwrap` arguments, so the text always matches the session, including
+  `--ro-path` / `--rw-path` mounts and a working directory outside `$HOME`.
+- **Mounted at `~/.sandbox/AGENTS.md`**, read-only, with `--ro-bind-data` on a
+  file descriptor. Nothing is written to the host, and no user file is
+  overwritten. `BWRAP_SANDBOX` (launcher name) and `BWRAP_SANDBOX_CONTEXT`
+  (the path) are set in the sandbox for scripts and skills.
+- **Contents** (about 50 lines): `$HOME` is a tmpfs; same-inode files are bind
+  mounts, not hard links, and are edited at their source; the working directory
+  (its access taken from the effective mounts) and whether it is a git root; a
+  table of every mount under `$HOME` marked `rw` / `ro` / `copy` (a writable
+  copy of a host file, lost at exit) / `tmpfs`; the system mounts collapsed
+  into one line each, with writable exceptions such as `--rw-path /usr/local`
+  (and read-only exceptions below them) listed on their own, and `/tmp`
+  described from its effective mount (`--rw-path /tmp` makes it the host's); what is not mounted (credential and rc files are named
+  only when no mount exposes them); the disabled binaries; the *names* of
+  passed-in variables (never values); and tool-specific notes (`bwopencode2`:
+  use `--standalone`, plans in `~/.opencode/plan` are lost). A mount hidden by
+  a later mount over its parent (for example `--ro-path` on the working
+  directory) is left out. Control characters, `|` and backticks in paths are
+  shown as `?`.
+- **Snapshot.** The file is written at launch; the mounts of a running sandbox
+  cannot change, so it stays correct for the whole session.
+
+How each tool loads the file, always in addition to the user's own instruction
+files:
+
+| Launcher | Mechanism | If the user already sets the same thing |
+| --- | --- | --- |
+| `bwopencode`, `bwopencode2` | `OPENCODE_CONFIG_CONTENT='{"instructions":["<file>"]}'`; the list is added to the user's `instructions` (tested with 1.19.4 and 2.1.4, including a project `opencode.json`). A host value of this variable is dropped, as before. | Not applicable: lists are combined |
+| `bwclaude` | `--append-system-prompt-file <file>`; adds to the default system prompt and leaves `CLAUDE.md` alone | A user `--append-system-prompt[-file]` wins; warning, file only mounted |
+| `bwcodex` | `-c developer_instructions=<text>`; a separate message that leaves `AGENTS.md` alone | `developer_instructions` in any form (also a quoted, dotted or profile key, or an inline table) in the system, user or any project `config.toml` from the repository root down, or anywhere in the arguments, wins; warning, file only mounted |
+| `bwcopilot` | `COPILOT_CUSTOM_INSTRUCTIONS_DIRS=~/.sandbox`; Copilot reads that directory's `AGENTS.md` in addition to its usual files | A host value is not forwarded (it never was), so nothing is replaced |
+
+`--exec` mounts the file and sets the two variables but adds no loader, since
+the command is not the agent.
+
+`--dry-run` prints the generated file after the command (the
+`--ro-bind-data` descriptor number is only meaningful in a real run).
+`--no-sandbox-context` removes the file, the variables and the loader.
+
+To check by hand, ask the agent a question only the file can answer ("is a
+read-only file under `$HOME` with the same inode as a dotfiles file a hard
+link?"), or for Copilot run `bwcopilot instruction list`.
 
 ## Account check
 
@@ -588,4 +641,5 @@ the entire Codex process tree, not just agent-issued commands.
 Shared sandbox-building primitives sourced by all `bw*` wrappers. Not
 intended to be executed directly. The library header documents the
 public function surface (sandbox construction, dynamic mount discovery,
-binary masking, environment scrubbing).
+binary masking, environment scrubbing, and `build_sandbox_context` with its
+`SANDBOX_CONTEXT_*` variables; see [Sandbox context](#sandbox-context)).
