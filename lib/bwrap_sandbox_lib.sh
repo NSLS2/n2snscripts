@@ -1717,27 +1717,36 @@ build_n2c_token_mounts() {
 #   (npm and pixi caches, ccache, tool data and cache directories) are only
 #   checked for being blocked themselves, so with N2C_STATE_DIR set inside one of
 #   them the session directory would be mounted along with it.  This looks at the
-#   finished mount list, so it covers every mount whatever added it.  Nothing is
-#   checked while the directory does not exist.
+#   finished mount list, so it covers every mount whatever added it.  A bind
+#   counts when its source, as written or with symlinks resolved, is the session
+#   directory, contains it or lies inside it, compared against the session
+#   directory as written and resolved.  Nothing is checked while the directory
+#   does not exist.
 #
 #   Called by print_dry_run and launch_sandbox, after all mounts are built.
 verify_n2c_state_not_exposed() {
-    local state canon src flag i=0
+    local state state_canon src src_canon flag s t i=0
     state="$(_n2c_state_dir)"
     [[ -e "${state}" ]] || return 0
-    canon="$(readlink -f -- "${state}" 2> /dev/null || true)"
+    state_canon="$(readlink -f -- "${state}" 2> /dev/null || true)"
     while [[ ${i} -lt ${#BWRAP_ARGS[@]} ]]; do
         flag="${BWRAP_ARGS[${i}]}"
         _bwrap_flag_arity "${flag}"
         case "${flag}" in
             --bind | --bind-try | --ro-bind | --ro-bind-try | --dev-bind | --dev-bind-try)
                 src="${BWRAP_ARGS[$((i + 1))]}"
-                if _is_prefix_of "${src}" "${state}" ||
-                    { [[ -n "${canon}" ]] && _is_prefix_of "${src}" "${canon}"; }; then
-                    echo "Error: the mount of '${src}' would expose the N2C session directory '${state}' (it holds the refresh token)." >&2
-                    echo "       Move N2C_STATE_DIR out of directories that the launcher mounts (for example ~/.npm, ~/.pixi, ~/.ccache)." >&2
-                    exit 1
-                fi
+                src_canon="$(readlink -f -- "${src}" 2> /dev/null || true)"
+                for s in "${src}" "${src_canon}"; do
+                    [[ -n "${s}" ]] || continue
+                    for t in "${state}" "${state_canon}"; do
+                        [[ -n "${t}" ]] || continue
+                        if _is_prefix_of "${s}" "${t}" || _is_prefix_of "${t}" "${s}"; then
+                            echo "Error: the mount of '${src}' would expose the N2C session directory '${state}' (it holds the refresh token)." >&2
+                            echo "       Move N2C_STATE_DIR out of directories that the launcher mounts (for example ~/.npm, ~/.pixi, ~/.ccache)." >&2
+                            exit 1
+                        fi
+                    done
+                done
                 ;;
         esac
         i=$((i + 1 + _BWRAP_FLAG_ARITY))
