@@ -69,10 +69,10 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 - `bash` >= 4.x (the `bw*` wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0 for the `bw*` wrappers
   - 0.6.3+ enables bind-over-ro-bind binary masking
-- optional: `pasta` (package `passt`, RHEL 9+), `/dev/net/tun` and
-  unprivileged user namespaces, with which the `bw*` wrappers run every sandbox
-  in a private network namespace; without them (RHEL 8) the sandbox shares the
-  host network, with a warning
+- `pasta` (package `passt`, RHEL 9+) or `slirp4netns` (RHEL 8 AppStream),
+  with `/dev/net/tun` and unprivileged user namespaces, for the private network
+  namespace of the `bw*` wrappers; without either they stop unless run with
+  `--share-net`
 - `gpg(1)` for `gpg-passwd.sh`
 - `openssl(1)` for `pemdecompose`
 - `python3 >= 3.9` (stdlib only, no pip dependencies) for `azoidcapp`
@@ -96,7 +96,7 @@ Common wrapper options:
 | Option | Effect |
 | --- | --- |
 | `--help`, `-h` | Show wrapper help, then the underlying tool's help when the tool is installed |
-| `--dry-run` | Print the command (`pasta`, descriptor relay, `bwrap`) without executing it |
+| `--dry-run` | Print the command (network backend, descriptor relay, `bwrap`) without executing it |
 | `--exec CMD [ARGS...]` | Run `CMD` inside the sandbox instead of the tool. `CMD` is split on whitespace; following arguments are passed unchanged, e.g. `--exec bash -c 'env \| sort'` |
 | `--init-auth` | Persist auth credentials to the host (first-time setup) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
@@ -107,7 +107,8 @@ Common wrapper options:
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`, e.g. `127.0.0.1` for OAuth) for `--publish` |
 | `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal` |
 | `--net-log FILE` | Log every network flow to `FILE` on the host |
-| `--share-net` | Share the host network instead of a private namespace (the behaviour without `pasta`) |
+| `--share-net` | Share the host network instead of a private namespace (the behaviour before private namespaces) |
+| `--net-backend pasta\|slirp4netns` | Use only this network backend |
 
 `bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
 persists in its data directory), always runs OpenCode 2 with `--standalone`
