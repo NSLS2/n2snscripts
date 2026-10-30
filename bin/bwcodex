@@ -113,14 +113,14 @@
 #                   Make the host's 127.0.0.1:PORT reachable in the sandbox at
 #                   host.internal:SANDBOXPORT.  May be repeated.
 #   --net-log FILE  Log every network flow to FILE on the host.
-#   --share-net     Share the host network instead (the behaviour without
-#                   pasta); not with the three options above.
+#   --share-net     Share the host network instead (the behaviour before
+#                   private namespaces); not with the options above.
 #
 # Network: the sandbox has its own network namespace from pasta (package
 # passt).  Outbound connections work; services on the host's loopback are
 # unreachable and the sandbox's listeners are invisible to the host, except
-# for the ports opened with --publish and --host-port.  Without a working
-# pasta (e.g. RHEL 8) the sandbox shares the host network, with a warning.
+# for the ports opened with --publish and --host-port.  Without a usable
+# private namespace the launch stops (exit 3) unless --share-net is given.
 #
 # Sandbox context: a short markdown file describing this sandbox (what is
 # mounted read-only or read-write, what is lost at exit, which tools are

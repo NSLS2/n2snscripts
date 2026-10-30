@@ -2137,12 +2137,11 @@ build_etc_mounts() {
 #   --publish PORT[:SANDBOXPORT]    sandbox server -> host 127.H1.H2.S:PORT
 #   --host-port PORT[:SANDBOXPORT]  host 127.0.0.1:PORT -> sandbox
 #                                   host.internal:SANDBOXPORT (127.0.42.1)
-# Without a working pasta (not installed, as on RHEL 8, no /dev/net/tun, or
-# no unprivileged user namespaces), or with --share-net, the sandbox shares
-# the host network as before: pasta is not used, the host's resolv.conf and
-# hosts are mounted, and a warning is printed unless --share-net asked for
-# it.  --publish, --host-port and --net-log need pasta and then stop the
-# launch (exit 3).
+# Without a usable backend (pasta not installed, as on RHEL 8, no
+# /dev/net/tun, or no unprivileged user namespaces) the launch stops (exit 3).
+# Only --share-net makes the sandbox share the host network as before: no
+# backend, the host's resolv.conf and hosts mounted, and no forwarding
+# options (exit 1 with them).
 #
 # Points that are easy to get wrong:
 #   - --no-map-gw: pasta's default maps the gateway address to the host's
@@ -2162,9 +2161,10 @@ build_etc_mounts() {
 _PASTA_BIN=""
 _PASTA_HAS_NO_PIDNS=0
 _NET_CONFIGURED=0
-# 1 when the sandbox gets a private network namespace; otherwise
-# _NET_SHARED_REASON says why it shares the host network.
+# _NET_BACKEND is the backend that provides the private network namespace,
+# or none with --share-net; _NET_PRIVATE is 1 unless it is none.
 _NET_PRIVATE=0
+_NET_BACKEND=none
 _NET_SHARED_REASON=""
 _NET_PUBLISH_ADDR_EFFECTIVE=""
 _NET_HOST_INTERNAL_ADDR="127.0.42.1"
@@ -2191,13 +2191,13 @@ net_print_help() {
 Network: the sandbox has its own network namespace (pasta, package passt).
 Outbound connections work as on the host; services on the host's loopback
 (127.0.0.1) are NOT reachable, and nothing the agent listens on is reachable
-from the host, unless opened below.  Without pasta (for example on RHEL 8) the
-sandbox shares the host network, with a warning.  Ports must be in
-1024-65535; N or LOW-HIGH ranges are accepted.
-  --share-net     Share the host network (the behaviour without pasta): host
-                  loopback services are reachable from the sandbox and its
-                  listeners are reachable on the host.  Cannot be combined
-                  with the options below.
+from the host, unless opened below.  If no private network namespace can be
+set up, the launch stops (exit 3) unless --share-net is given.  Ports must be
+in 1024-65535; N or LOW-HIGH ranges are accepted.
+  --share-net     Share the host network instead (the behaviour before
+                  private namespaces): host loopback services are reachable
+                  from the sandbox and its listeners are reachable on the
+                  host.  Cannot be combined with the options below.
   --publish PORT[:SANDBOXPORT]
                   Make a server inside the sandbox (port SANDBOXPORT, default
                   PORT) reachable on the host at http://127.H1.H2.S:PORT/, an
@@ -2239,7 +2239,7 @@ _net_baseline_args() {
 }
 
 # net_set_share
-#   --share-net: share the host network, without pasta.
+#   --share-net: share the host network, without a private namespace.
 net_set_share() {
     NET_SHARE=1
 }
@@ -2257,16 +2257,14 @@ _net_forward_options() {
 }
 
 # detect_net_capabilities
-#   Decide between a private network namespace and the host network.  With
-#   --share-net, the host network.  Otherwise find pasta and check that it can
-#   create a namespace here (one probe run, about 50 ms); when it cannot, warn
-#   and fall back to the host network.  The forward options need pasta: with
-#   them, --share-net is an error (exit 1) and a missing pasta stops the launch
-#   (exit 3).  Under --dry-run nothing is run: an installed pasta is assumed
-#   to work.
+#   Choose the network for the sandbox and set _NET_BACKEND: none with
+#   --share-net (the forwarding options are then an error, exit 1); otherwise
+#   the first usable backend.  With none usable, stop (exit 3): the sandbox
+#   never shares the host network unless --share-net asks for it.
 detect_net_capabilities() {
-    local _reason="" _out="" _fwd
+    local _fwd _pasta_reason=""
     _NET_PRIVATE=0
+    _NET_BACKEND=none
     _NET_SHARED_REASON=""
     _fwd="$(_net_forward_options)"
     if [[ "${NET_SHARE}" -eq 1 ]]; then
@@ -2277,40 +2275,52 @@ detect_net_capabilities() {
         _NET_SHARED_REASON="--share-net was given"
         return 0
     fi
-    _PASTA_BIN="$(command -v pasta 2> /dev/null || true)"
-    if [[ -z "${_PASTA_BIN}" || ! -x "${_PASTA_BIN}" ]]; then
-        _PASTA_BIN=""
-        _reason="pasta not found on PATH (install package: passt)"
-    else
-        # --no-pidns (2026-09) is not in RHEL 9 / EPEL builds; without it
-        # pasta adds a PID namespace, inside which bwrap nests its own.
-        if "${_PASTA_BIN}" --help 2>&1 | grep -q -e '--no-pidns'; then
-            _PASTA_HAS_NO_PIDNS=1
-        fi
-        _net_baseline_args
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-            :
-        elif [[ ! -c /dev/net/tun ]]; then
-            _reason="/dev/net/tun is missing on the host"
-        elif ! _out="$("${_PASTA_BIN}" "${PASTA_ARGS[@]}" -- "$(command -v true)" 2>&1)"; then
-            _out="${_out%%$'\n'*}"
-            _reason="a test run of pasta failed${_out:+: ${_out}} (are unprivileged user namespaces disabled?)"
-        fi
-    fi
-    if [[ -n "${_reason}" ]]; then
-        if [[ -n "${_fwd}" ]]; then
-            printf 'Error: %s: the forwarding options (%s) need a private network namespace, which is not available: %s\n' "${0##*/}" "${_fwd}" "${_reason}" >&2
-            exit 3
-        fi
-        _PASTA_BIN=""
-        PASTA_ARGS=()
-        _NET_SHARED_REASON="${_reason}"
-        printf 'Warning: %s: no private network namespace: %s.\n' "${0##*/}" "${_reason}" >&2
-        printf '         The sandbox shares the host network: services on the host loopback are reachable from it.\n' >&2
-        printf '         Use --share-net to choose this explicitly and silence the warning.\n' >&2
+    if _net_try_pasta; then
+        _NET_BACKEND=pasta
+        _NET_PRIVATE=1
         return 0
     fi
-    _NET_PRIVATE=1
+    _pasta_reason="${_NET_TRY_REASON}"
+    _PASTA_BIN=""
+    PASTA_ARGS=()
+    printf 'Error: %s: no private network namespace is available, and the sandbox does not share\n' "${0##*/}" >&2
+    printf '       the host network unless asked to.\n' >&2
+    printf '         pasta: %s\n' "${_pasta_reason}" >&2
+    printf '       Install passt (RHEL 9 and later), or run with --share-net to share the host\n' >&2
+    printf '       network (services on the host loopback are then reachable from the sandbox).\n' >&2
+    exit 3
+}
+
+# _net_try_pasta
+#   Return 0 when pasta can be used (set _PASTA_BIN and PASTA_ARGS), else 1
+#   with the reason in _NET_TRY_REASON.  Under --dry-run an installed pasta is
+#   assumed to work.
+_NET_TRY_REASON=""
+_net_try_pasta() {
+    local _out
+    _NET_TRY_REASON=""
+    _PASTA_BIN="$(command -v pasta 2> /dev/null || true)"
+    if [[ -z "${_PASTA_BIN}" || ! -x "${_PASTA_BIN}" ]]; then
+        _NET_TRY_REASON="not found on PATH (package passt)"
+        return 1
+    fi
+    # --no-pidns (2026-09) is not in RHEL 9 / EPEL builds; without it pasta
+    # adds a PID namespace, inside which bwrap nests its own.
+    if "${_PASTA_BIN}" --help 2>&1 | grep -q -e '--no-pidns'; then
+        _PASTA_HAS_NO_PIDNS=1
+    fi
+    _net_baseline_args
+    [[ "${DRY_RUN}" -eq 0 ]] || return 0
+    if [[ ! -c /dev/net/tun ]]; then
+        _NET_TRY_REASON="/dev/net/tun is missing on the host"
+        return 1
+    fi
+    if ! _out="$("${_PASTA_BIN}" "${PASTA_ARGS[@]}" -- "$(command -v true)" 2>&1)"; then
+        _out="${_out%%$'\n'*}"
+        _NET_TRY_REASON="a test run failed${_out:+: ${_out}} (are unprivileged user namespaces disabled?)"
+        return 1
+    fi
+    return 0
 }
 
 # _net_parse_range OPTION TEXT
@@ -2580,7 +2590,7 @@ _net_join() {
 #   add the bwrap namespace options pasta needs, generate /etc/resolv.conf and
 #   /etc/hosts, and export BWRAP_NET_*.  On the host network (see
 #   detect_net_capabilities) only mount the host's resolv.conf and hosts and
-#   set BWRAP_NET_MODE=host.  Call after
+#   set BWRAP_NET_BACKEND=none.  Call after
 #   detect_net_capabilities and build_etc_mounts, and before
 #   build_sandbox_context (the context file describes the forwards).
 build_net_isolation() {
@@ -2597,7 +2607,7 @@ build_net_isolation() {
             --ro-bind-try /etc/hosts /etc/hosts
         )
         SANDBOX_ENV+=(
-            "BWRAP_NET_MODE=host"
+            "BWRAP_NET_BACKEND=none"
             "BWRAP_NET_PUBLISH="
             "BWRAP_NET_PUBLISH_ADDR="
             "BWRAP_NET_HOST_PORTS="
@@ -2684,7 +2694,7 @@ build_net_isolation() {
     BWRAP_ARGS+=(--ro-bind-data "${_BWRAP_FD}" /etc/hosts)
 
     SANDBOX_ENV+=(
-        "BWRAP_NET_MODE=private"
+        "BWRAP_NET_BACKEND=${_NET_BACKEND}"
         "BWRAP_NET_PUBLISH=$(_net_join ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"})"
         "BWRAP_NET_PUBLISH_ADDR=${_NET_PUBLISH_ADDR_EFFECTIVE}"
         "BWRAP_NET_HOST_PORTS=$(_net_join ${NET_HOST_PORTS[@]+"${NET_HOST_PORTS[@]}"})"
@@ -2706,7 +2716,7 @@ _net_print_report() {
         return 0
     fi
     if [[ ${_n_fwd} -gt 0 || -t 2 ]]; then
-        _line="${_launcher}: network: private namespace (pasta)"
+        _line="${_launcher}: network: private namespace (${_NET_BACKEND})"
         [[ -z "${_NET_PUBLISH_ADDR_EFFECTIVE}" ]] || _line+="; publish address ${_NET_PUBLISH_ADDR_EFFECTIVE}"
         printf '%s\n' "${_line}" >&2
     fi
@@ -3735,11 +3745,7 @@ _bwrap_context_network() {
     local _nl=$'\n' _d _t=""
     _t+="## Network${_nl}${_nl}"
     if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
-        if [[ "${NET_SHARE}" -eq 1 ]]; then
-            _t+="This sandbox shares the host's network (the user chose \`--share-net\`)."
-        else
-            _t+="This sandbox shares the host's network (no private network namespace is available on this host)."
-        fi
+        _t+="This sandbox shares the host's network (the user chose \`--share-net\`)."
         _t+=" Services listening on the host's loopback (\`127.0.0.1\`, \`localhost\`) are reachable from here,"
         _t+=" and they are not yours to use unless the user asks: they may belong to other users."
         _t+=" Anything you listen on is reachable from the host, and on \`0.0.0.0\` from the network:"
@@ -3747,7 +3753,7 @@ _bwrap_context_network() {
         _CTX_NET="${_t}"
         return 0
     fi
-    _t+="This sandbox has its own network namespace (pasta)."
+    _t+="This sandbox has its own network namespace (${_NET_BACKEND})."
     _t+=" Outbound connections work and leave from the host's address;"
     _t+=" DNS goes to \`${_NET_DNS_FORWARD_ADDR}\`, which is forwarded to the host's resolver."
     _t+=" Services listening on the host's loopback (\`127.0.0.1\`, \`localhost\`) are not reachable from here,"
@@ -3777,7 +3783,7 @@ _bwrap_context_network() {
         done
         _t+="${_nl}Your own \`127.0.0.1\` is unaffected: a server you start on the same port is separate.${_nl}${_nl}"
     fi
-    _t+="\`BWRAP_NET_MODE\` is \`private\`; \`BWRAP_NET_PUBLISH\`, \`BWRAP_NET_PUBLISH_ADDR\`, \`BWRAP_NET_HOST_PORTS\` and \`BWRAP_NET_HOST_ADDR\` hold the same information.${_nl}${_nl}"
+    _t+="\`BWRAP_NET_BACKEND\` is \`${_NET_BACKEND}\`; \`BWRAP_NET_PUBLISH\`, \`BWRAP_NET_PUBLISH_ADDR\`, \`BWRAP_NET_HOST_PORTS\` and \`BWRAP_NET_HOST_ADDR\` hold the same information.${_nl}${_nl}"
     _CTX_NET="${_t}"
 }
 
