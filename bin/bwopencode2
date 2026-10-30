@@ -111,6 +111,22 @@
 #   --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox.
 #   --no-sandbox-context
 #                   Do not generate the sandbox context file (see below).
+#   --publish PORT[:SANDBOXPORT]
+#                   Make a server in the sandbox reachable on the host at a
+#                   per-user, per-session loopback address (127.H1.H2.S:PORT).
+#                   May be repeated.
+#   --publish-addr ADDR
+#                   Use ADDR (in 127.0.0.0/8) for --publish instead.
+#   --host-port PORT[:SANDBOXPORT]
+#                   Make the host's 127.0.0.1:PORT reachable in the sandbox at
+#                   host.internal:SANDBOXPORT.  May be repeated.
+#   --net-log FILE  Log every network flow to FILE on the host.
+#
+# Network: the sandbox has its own network namespace from pasta (package
+# passt; required, there is no fallback to the host network).  Outbound
+# connections work; services on the host's loopback are unreachable and the
+# sandbox's listeners are invisible to the host, except for the ports opened
+# with --publish and --host-port.
 #
 # Sandbox context: a short markdown file describing this sandbox (what is
 # mounted read-only or read-write, what is lost at exit, which tools are
@@ -182,6 +198,38 @@ parse_wrapper_args() {
                 # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
                 SANDBOX_CONTEXT_ENABLED=0
                 shift
+                ;;
+            --publish)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_publish "$2"
+                shift 2
+                ;;
+            --publish-addr)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish-addr requires an address in 127.0.0.0/8." >&2
+                    exit 1
+                fi
+                net_set_publish_addr "$2"
+                shift 2
+                ;;
+            --host-port)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --host-port requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_host_port "$2"
+                shift 2
+                ;;
+            --net-log)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --net-log requires a file name." >&2
+                    exit 1
+                fi
+                net_set_log_file "$2"
+                shift 2
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -290,6 +338,7 @@ git credentials file (only a few files of the XDG git directory are mounted).
 All other arguments are passed through to opencode2 unchanged.
 
 HELP_EOF
+    net_print_help
     # Delegate to opencode2 --help inside the sandbox so the user sees the full
     # opencode2 option set in the same invocation.  We re-exec this script with
     # --exec so the sandbox is fully constructed; opencode2 --help is passed
@@ -299,8 +348,11 @@ HELP_EOF
 
 # ── Sandbox-escape guard (arguments) ─────────────────────────────
 # The OpenCode 2 background service listens on a fixed, shared port and runs
-# tools outside any sandbox.  Because the sandbox shares the host network, a
-# CLI started without --standalone would delegate tool execution to it.
+# tools outside any sandbox.  A CLI started without --standalone would
+# delegate tool execution to it.  The sandbox's private network namespace
+# already keeps the host's loopback (and so the service) out of reach, and
+# --host-port refuses the port; this guard is kept as a second line of
+# defence, and so that the CLI does not hang looking for the service.
 #
 # guard_tool_args scans TOOL_ARGS and either refuses the invocation or
 # injects --standalone:
@@ -658,9 +710,10 @@ build_opencode2_state_dir() {
 # Pass through ONLY the allowlisted OPENCODE_* env vars (harmless behaviour
 # switches).  Every other OPENCODE_* variable is dropped, because the
 # OpenCode 2 binary reads several sensitive ones, e.g.:
-#   OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD  password of a v2 server; the
-#       sandbox shares the host network, so holding it would let the agent
-#       connect to an UNSANDBOXED server (port 49374) and run tools outside
+#   OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD  password of a v2 server;
+#       with a route to it (the private network namespace normally gives
+#       none) it would let the agent drive an UNSANDBOXED server (port
+#       49374) and run tools outside
 #   OPENCODE_SSH_ASKPASS_TOKEN / _PORT, OPENCODE_EDITOR_SSE_PORT,
 #   OPENCODE_PTY_HANDOFF  host-side helper channels
 #   OPENCODE_DB, OPENCODE_TEST_HOME, OPENCODE_CONFIG*, OPENCODE_MODELS_PATH/URL
@@ -793,6 +846,7 @@ main() {
 
     detect_bwrap_capabilities
     detect_kernel_capabilities
+    detect_net_capabilities
     resolve_common_paths
     resolve_opencode2_paths
     # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
@@ -811,6 +865,7 @@ main() {
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
+    build_net_isolation
     build_managed_config
     build_managed_skills
     build_managed_extras
