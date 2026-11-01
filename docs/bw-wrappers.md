@@ -129,10 +129,13 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   the launch stops with an error if any bind mount would contain the N2C session
   directory, for example with `N2C_STATE_DIR` set inside `~/.npm`. The default
   location, under `/run/user/<uid>`, is never inside such a directory.
-- **The directories are checked.** The creds directory and each token directory
-  must be real directories (not symlinks), owned by you, with mode `0700`, and
-  a token must be a regular file, not a symlink; otherwise the launch stops with
-  an error. `n2c-token` creates them that way.
+- **The directories are checked.** When the creds directory is owned by you
+  (the layout `n2c-token` makes), the creds directory and each token directory
+  must be real directories (not symlinks) with mode `0700`, and a token must be
+  a regular file, not a symlink; otherwise the launch stops with an error. A
+  creds directory owned by root is a service account's, see
+  [Service accounts](#service-accounts-system-managed-tokens) below. Any other
+  owner is an error.
 - **A missing or empty token only warns**; run `n2c-token login` on the host. A
   token that expires while the sandbox runs is refreshed in place by the
   `n2c-token` timer (`n2c-token install` on the host).
@@ -144,6 +147,45 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   the host uses a non-default location. Nothing is set when no token is mounted.
 
 Example: `bwopencode2 --n2c-token observability --n2c-token epics`.
+
+### Service accounts (system-managed tokens)
+
+A service account has no `n2c-token` session. A root service on the host (for
+example a timer that gets app-only tokens with a certificate) writes the same
+`creds/NAME/token` files, and the account only reads them. The launcher picks
+this layout when **the creds directory is owned by root**. There is no flag:
+point `N2SN_CREDS_DIR` at the directory and use `--n2c-token` as usual.
+
+```bash
+N2SN_CREDS_DIR=/run/nsls2/agent/creds bwopencode2 --n2c-token all
+```
+
+Because nobody but root may change these files, the checks differ from the user
+layout. The launch stops with an error unless all of these hold:
+
+- the creds directory, every directory above it up to `/`, and each token
+  directory are real directories (not symlinks), owned by root and not
+  writable by group or others (otherwise a parent could be renamed and replaced
+  by someone else's tree);
+- you can enter the token directory, and each token is a regular file (not a
+  symlink), owned by root, not writable by group or others, and readable by
+  you.
+
+Differences from the user layout:
+
+- **An empty token is mounted**, with a warning. The service creates the file
+  at boot and rewrites it in place, so a mounted file shows the token as soon
+  as it is written. A token with no file yet is skipped with a warning.
+- **`--n2c-token all` skips token directories you cannot enter** (another
+  service's tokens in the same directory), while naming one you cannot enter is
+  an error.
+- **The hint is different**: there is no `n2c-token login` to run, so the
+  warnings say the tokens are kept by a root service on the host.
+
+A service that keeps tokens for this layout should create the directories as
+`root:GROUP` with mode `0750` and the files as `root:GROUP` with mode `0440`,
+where `GROUP` is the group of the account that runs the sandbox, and rewrite a
+token in place (same file) rather than replace it.
 
 ## Sandbox context
 

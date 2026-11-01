@@ -1622,6 +1622,104 @@ _n2c_require_private() {
     fi
 }
 
+# System-managed credentials.  A service account has no n2c-token session: a root
+# service on the host (for example a timer that gets app-only tokens) keeps the
+# same creds/NAME/token files up to date and the account only reads them.  That
+# layout is chosen when the credentials directory is owned by root, and is safe
+# as long as nobody but root can change the directories or files on the way, so
+# these checks replace "owned by you, mode 0700".
+
+# _n2c_owner_mode PATH
+#   Print "UID MODE" for PATH (MODE is the octal permission bits, for example
+#   "0 750"), or nothing when PATH cannot be read.  A function of its own so
+#   that the checks below can be tested without root-owned files.
+_n2c_owner_mode() {
+    stat -c '%u %a' -- "$1" 2> /dev/null || true
+}
+
+# _n2c_my_uid
+#   Print the numeric user id (a function so tests can change it).
+_n2c_my_uid() {
+    id -u
+}
+
+# _n2c_root_owned_sealed PATH
+#   Return 0 when PATH is owned by root and neither its group nor others can
+#   write to it.
+_n2c_root_owned_sealed() {
+    local om mode
+    om="$(_n2c_owner_mode "$1")"
+    [[ -n "${om}" && "${om%% *}" == "0" ]] || return 1
+    mode="${om##* }"
+    [[ "${mode}" =~ ^[0-7]+$ ]] || return 1
+    ((($((8#${mode})) & 8#022) == 0))
+}
+
+# _n2c_creds_layout DIR
+#   Print "user" when DIR is owned by the current user (n2c-token's own
+#   credentials) or "system" when it is owned by root (system-managed
+#   credentials).  Return 1 with a message for a symlink, a missing
+#   directory or any other owner.
+_n2c_creds_layout() {
+    local dir om uid
+    dir="$(_n2c_strip_slashes "$1")"
+    if [[ -L "${dir}" ]] || [[ ! -d "${dir}" ]]; then
+        echo "Error: N2C credentials directory '${dir}' must be a real directory (not a symlink). Refusing to mount N2C tokens." >&2
+        return 1
+    fi
+    om="$(_n2c_owner_mode "${dir}")"
+    uid="${om%% *}"
+    if [[ -n "${om}" && "${uid}" == "$(_n2c_my_uid)" ]]; then
+        echo "user"
+    elif [[ -n "${om}" && "${uid}" == "0" ]]; then
+        echo "system"
+    else
+        echo "Error: N2C credentials directory '${dir}' must be owned by you (n2c-token) or by root (system-managed tokens). Refusing to mount N2C tokens." >&2
+        return 1
+    fi
+}
+
+# _n2c_require_system_dir DIR WHAT
+#   Exit 1 unless DIR is a real directory (not a symlink), owned by root, not
+#   writable by its group or others, and one the current user can enter.
+_n2c_require_system_dir() {
+    local dir what="$2"
+    dir="$(_n2c_strip_slashes "$1")"
+    if [[ -L "${dir}" ]] || [[ ! -d "${dir}" ]]; then
+        echo "Error: ${what} '${dir}' must be a real directory (not a symlink). Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+    if ! _n2c_root_owned_sealed "${dir}"; then
+        echo "Error: ${what} '${dir}' must be owned by root and not writable by its group or others. Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+    if [[ ! -x "${dir}" ]]; then
+        echo "Error: ${what} '${dir}' cannot be entered by you (check its group). Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+}
+
+# _n2c_require_sealed_ancestors DIR WHAT
+#   Exit 1 unless every directory above DIR (DIR resolved, up to "/") is owned
+#   by root and not writable by its group or others.  Otherwise someone could
+#   rename a parent and put their own tree in its place.
+_n2c_require_sealed_ancestors() {
+    local what="$2" p
+    p="$(readlink -f -- "$1" 2> /dev/null || true)"
+    if [[ -z "${p}" ]]; then
+        echo "Error: cannot resolve ${what} '$1'. Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+    while [[ "${p}" != "/" ]]; do
+        p="${p%/*}"
+        [[ -n "${p}" ]] || p="/"
+        if ! _n2c_root_owned_sealed "${p}"; then
+            echo "Error: '${p}' above ${what} '$1' must be owned by root and not writable by its group or others. Refusing to mount N2C tokens." >&2
+            exit 1
+        fi
+    done
+}
+
 # build_n2c_token_mounts
 #   Add the token files requested with --n2c-token to EXTRA_RO_PATHS, so
 #   build_extra_path_mounts validates and mounts each one read-only at its own
@@ -1635,6 +1733,16 @@ _n2c_require_private() {
 #   login`).  A credentials directory or token directory that is a symlink, is
 #   owned by someone else or is not mode 0700, or a token file that is a
 #   symlink or not a regular file, is an error: the launch stops.
+#
+#   Two layouts, chosen by who owns the credentials directory:
+#     user    owned by you: n2c-token's own files, directories mode 0700.
+#     system  owned by root: tokens kept up to date by a root service, for a
+#             service account.  Every directory from "/" down must be owned by
+#             root and not writable by group or others, and each token must be
+#             a regular root-owned file that others cannot write and you can
+#             read.  An empty token is mounted too (the service fills the file
+#             in place, so it shows up as soon as it is written), and `all`
+#             skips token directories you cannot enter.
 #
 #   Must be called BEFORE build_extra_path_mounts.
 build_n2c_token_mounts() {
@@ -1655,10 +1763,19 @@ build_n2c_token_mounts() {
     done
 
     if [[ ! -e "${root}" && ! -L "${root}" ]]; then
-        echo "Warning: N2C credentials directory '${root}' does not exist; no tokens mounted. Run: n2c-token login" >&2
+        echo "Warning: N2C credentials directory '${root}' does not exist; no tokens mounted. Run: n2c-token login (or, for a service account, check that its token service has run)" >&2
         return 0
     fi
-    _n2c_require_private "${root}" "N2C credentials directory"
+    local layout hint
+    layout="$(_n2c_creds_layout "${root}")" || exit 1
+    if [[ "${layout}" == "system" ]]; then
+        hint="These tokens are kept by a root service on this host; ask its administrator."
+        _n2c_require_system_dir "${root}" "N2C credentials directory"
+        _n2c_require_sealed_ancestors "${root}" "N2C credentials directory"
+    else
+        hint="Run: n2c-token login"
+        _n2c_require_private "${root}" "N2C credentials directory"
+    fi
 
     if [[ ${want_all} -eq 1 ]]; then
         names=()
@@ -1667,6 +1784,7 @@ build_n2c_token_mounts() {
             tdir="${tdir%/}"
             name="${tdir##*/}"
             [[ "${name}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || continue
+            [[ "${layout}" == "system" && ! -x "${tdir}" ]] && continue
             names+=("${name}")
         done
     fi
@@ -1678,14 +1796,34 @@ build_n2c_token_mounts() {
             echo "Warning: no N2C token '${name}' (${tdir} does not exist); not mounted." >&2
             continue
         fi
-        _n2c_require_private "${tdir}" "N2C token directory"
+        if [[ "${layout}" == "system" ]]; then
+            _n2c_require_system_dir "${tdir}" "N2C token directory"
+        else
+            _n2c_require_private "${tdir}" "N2C token directory"
+        fi
         if [[ -L "${tfile}" ]] || { [[ -e "${tfile}" ]] && [[ ! -f "${tfile}" ]]; }; then
             echo "Error: N2C token '${tfile}' must be a regular file, not a symlink. Refusing to mount N2C tokens." >&2
             exit 1
         fi
-        if [[ ! -s "${tfile}" ]]; then
+        if [[ "${layout}" == "system" ]]; then
+            if [[ ! -e "${tfile}" ]]; then
+                echo "Warning: N2C token '${name}' has no file yet (${tfile}); not mounted. ${hint}" >&2
+                continue
+            fi
+            if ! _n2c_root_owned_sealed "${tfile}"; then
+                echo "Error: N2C token '${tfile}' must be owned by root and not writable by its group or others. Refusing to mount N2C tokens." >&2
+                exit 1
+            fi
+            if [[ ! -r "${tfile}" ]]; then
+                echo "Error: N2C token '${tfile}' cannot be read by you (check its group). Refusing to mount N2C tokens." >&2
+                exit 1
+            fi
+            if [[ ! -s "${tfile}" ]]; then
+                echo "Warning: N2C token '${name}' is empty for now; mounted, it shows up when written. ${hint}" >&2
+            fi
+        elif [[ ! -s "${tfile}" ]]; then
             if [[ ${want_all} -eq 0 ]]; then
-                echo "Warning: N2C token '${name}' is missing or empty; not mounted. Run: n2c-token login" >&2
+                echo "Warning: N2C token '${name}' is missing or empty; not mounted. ${hint}" >&2
             fi
             continue
         fi
@@ -1693,7 +1831,7 @@ build_n2c_token_mounts() {
     done
 
     if [[ ${want_all} -eq 1 && ${#found[@]} -eq 0 ]]; then
-        echo "Warning: no N2C tokens found in '${root}'; none mounted. Run: n2c-token login" >&2
+        echo "Warning: no N2C tokens found in '${root}'; none mounted. ${hint}" >&2
     fi
     for tfile in "${found[@]+"${found[@]}"}"; do
         EXTRA_RO_PATHS+=("${tfile}")
