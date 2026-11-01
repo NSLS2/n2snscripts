@@ -115,8 +115,8 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
 
 - **Nothing is mounted by default.** `--n2c-token NAME` mounts
   `creds/NAME/token` read-only at the same path; repeat it for several tokens.
-  `--n2c-token all` mounts every non-empty token in the directory. `all`
-  together with names means all.
+  `--n2c-token all` mounts every token in the directory that you can enter.
+  `all` together with names means all.
 - **Only token files are mounted**, one file each. `n2c-token` rewrites a token
   in place, so a mounted file sees every refresh while the timer runs.
 - **The refresh token is never mounted.** The MSAL cache (`cache.json`) lives
@@ -129,16 +129,13 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   the launch stops with an error if any bind mount would contain the N2C session
   directory, for example with `N2C_STATE_DIR` set inside `~/.npm`. The default
   location, under `/run/user/<uid>`, is never inside such a directory.
-- **The directories are checked.** When the creds directory is owned by you
-  (the layout `n2c-token` makes), the creds directory and each token directory
-  must be real directories (not symlinks) with mode `0700`, and a token must be
-  a regular file, not a symlink; otherwise the launch stops with an error. A
-  creds directory owned by root is a service account's, see
-  [Service accounts](#service-accounts-system-managed-tokens) below. Any other
-  owner is an error.
-- **A missing or empty token only warns**; run `n2c-token login` on the host. A
-  token that expires while the sandbox runs is refreshed in place by the
-  `n2c-token` timer (`n2c-token install` on the host).
+- **The tokens are checked like an ssh private key** (see
+  [Checks](#checks-on-the-credentials) below): a directory or token that
+  someone else could read or replace stops the launch.
+- **A missing token only warns**; run `n2c-token login` on the host. An empty
+  token is mounted, with a warning: it is filled in place, so a mounted file
+  shows the token as soon as it is written and every refresh after that,
+  while the `n2c-token` timer runs (`n2c-token install` on the host).
 - **Locations.** `N2SN_CREDS_DIR` and `N2C_STATE_DIR` override the two
   directories, as they do for `n2c-token`.
 - **The sandbox is told where the tokens are.** The sandbox environment is
@@ -148,48 +145,45 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
 
 Example: `bwopencode2 --n2c-token observability --n2c-token epics`.
 
-### Service accounts (system-managed tokens)
+### Checks on the credentials
+
+The launcher refuses to mount tokens that someone else could read or replace,
+the way `ssh` refuses a private key that others can read. Each of these stops
+the launch with an error:
+
+- `N2SN_CREDS_DIR` is an absolute path with no symlink, `.`, `..` or doubled
+  `/` in it, so use the real path (`/run/...`, not `/var/run/...`): a symlink
+  could be changed between the check and the mount.
+- The creds directory, each token directory and each token are **owned by you
+  or by root**, are **not writable by their group**, and have **no permission
+  at all for others** (mode `0750`, `0700`, `0640`, `0600` or `0440` pass;
+  `0755`, `0775` or `0644` do not). Group read, and group enter for a
+  directory, are allowed.
+- The directories are real directories, you can enter a token directory and
+  read its token, and a token is a regular file, not a symlink.
+
+Directories above the creds directory are not checked: keep `N2SN_CREDS_DIR`
+somewhere nobody else can write, such as `/run/user/<uid>/...` or `/run/...`.
+`--n2c-token all` skips token directories you cannot enter.
+
+### Service accounts
 
 A service account has no `n2c-token` session. A root service on the host (for
-example a timer that gets app-only tokens with a certificate) writes the same
-`creds/NAME/token` files, and the account only reads them. The launcher picks
-this layout when **the creds directory is owned by root**. There is no flag:
-point `N2SN_CREDS_DIR` at the directory and use `--n2c-token` as usual.
+example a timer that gets app-only tokens with a certificate) keeps the same
+`creds/NAME/token` files up to date, and the account only reads them. Nothing
+extra is needed: the creds directory is owned by root, and the launcher uses
+the same checks.
 
 ```bash
 N2SN_CREDS_DIR=/run/nsls2/agent/creds bwopencode2 --n2c-token all
 ```
 
-Because nobody but root may change these files, the checks differ from the user
-layout. The launch stops with an error unless all of these hold:
-
-- the creds directory is given as an absolute path with no symlink in it (and
-  no `.`, `..` or doubled `/`), so use the real path, for example `/run/...`
-  and not `/var/run/...`: a symlink could be changed between the check and the
-  mount;
-- the creds directory, every directory above it up to `/`, and each token
-  directory are real directories, owned by root and not writable by group or
-  others (otherwise a parent could be renamed and replaced by someone else's
-  tree);
-- you can enter the token directory, and each token is a regular file (not a
-  symlink), owned by root, not writable by group or others, and readable by
-  you.
-
-Differences from the user layout:
-
-- **An empty token is mounted**, with a warning. The service creates the file
-  at boot and rewrites it in place, so a mounted file shows the token as soon
-  as it is written. A token with no file yet is skipped with a warning.
-- **`--n2c-token all` skips token directories you cannot enter** (another
-  service's tokens in the same directory), while naming one you cannot enter is
-  an error.
-- **The hint is different**: there is no `n2c-token login` to run, so the
-  warnings say the tokens are kept by a root service on the host.
-
-A service that keeps tokens for this layout should create the directories as
-`root:GROUP` with mode `0750` and the files as `root:GROUP` with mode `0440`,
-where `GROUP` is the group of the account that runs the sandbox, and rewrite a
-token in place (same file) rather than replace it.
+The warnings then say the tokens are kept by a root service instead of "Run:
+n2c-token login". A service that keeps tokens this way should create the
+creds directory and each token directory as `root:GROUP` with mode `0750`, and
+each token as `root:GROUP` with mode `0440`, where `GROUP` is the group of the
+account that runs the sandbox, and rewrite a token in place (the same file)
+rather than replace it, because the sandbox mounts the file itself.
 
 ## Sandbox context
 
