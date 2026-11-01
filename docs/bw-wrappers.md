@@ -163,10 +163,14 @@ N2SN_CREDS_DIR=/run/nsls2/agent/creds bwopencode2 --n2c-token all
 Because nobody but root may change these files, the checks differ from the user
 layout. The launch stops with an error unless all of these hold:
 
+- the creds directory is given as an absolute path with no symlink in it (and
+  no `.`, `..` or doubled `/`), so use the real path, for example `/run/...`
+  and not `/var/run/...`: a symlink could be changed between the check and the
+  mount;
 - the creds directory, every directory above it up to `/`, and each token
-  directory are real directories (not symlinks), owned by root and not
-  writable by group or others (otherwise a parent could be renamed and replaced
-  by someone else's tree);
+  directory are real directories, owned by root and not writable by group or
+  others (otherwise a parent could be renamed and replaced by someone else's
+  tree);
 - you can enter the token directory, and each token is a regular file (not a
   symlink), owned by root, not writable by group or others, and readable by
   you.

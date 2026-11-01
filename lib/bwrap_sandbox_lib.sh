@@ -1700,14 +1700,22 @@ _n2c_require_system_dir() {
 }
 
 # _n2c_require_sealed_ancestors DIR WHAT
-#   Exit 1 unless every directory above DIR (DIR resolved, up to "/") is owned
-#   by root and not writable by its group or others.  Otherwise someone could
-#   rename a parent and put their own tree in its place.
+#   Exit 1 unless DIR is an absolute path with no symlink (and no "." or ".."
+#   or doubled slash) in it, and every directory above it, up to "/", is owned
+#   by root and not writable by its group or others.  The path is checked as
+#   written, not only after resolving it: a symlink anywhere in the path could
+#   be changed between this check and the mount, which resolves the path again,
+#   and a writable parent could be renamed and replaced by someone else's tree.
 _n2c_require_sealed_ancestors() {
-    local what="$2" p
-    p="$(readlink -f -- "$1" 2> /dev/null || true)"
-    if [[ -z "${p}" ]]; then
-        echo "Error: cannot resolve ${what} '$1'. Refusing to mount N2C tokens." >&2
+    local what="$2" p canon
+    p="$(_n2c_strip_slashes "$1")"
+    if [[ "${p}" != /* ]]; then
+        echo "Error: ${what} '${p}' must be an absolute path. Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+    canon="$(readlink -f -- "${p}" 2> /dev/null || true)"
+    if [[ "${canon}" != "${p}" ]]; then
+        echo "Error: ${what} '${p}' goes through a symlink or has a '.', '..' or doubled '/' in it (it resolves to '${canon}'). Give the real path. Refusing to mount N2C tokens." >&2
         exit 1
     fi
     while [[ "${p}" != "/" ]]; do
