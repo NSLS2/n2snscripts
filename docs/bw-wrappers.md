@@ -154,16 +154,20 @@ the launch with an error:
 - `N2SN_CREDS_DIR` is an absolute path with no symlink, `.`, `..` or doubled
   `/` in it, so use the real path (`/run/...`, not `/var/run/...`): a symlink
   could be changed between the check and the mount.
-- The creds directory, each token directory and each token are **owned by you
-  or by root**, are **not writable by their group**, and have **no permission
-  at all for others** (mode `0750`, `0700`, `0640`, `0600` or `0440` pass;
-  `0755`, `0775` or `0644` do not). Group read, and group enter for a
-  directory, are allowed.
+- Every directory above it, up to `/`, is owned by you or by root and is not
+  writable by its group or others. Otherwise someone could rename a parent and
+  put their own tree, with a token you did not check, in its place. A
+  directory such as `/tmp`, which others can write to, is refused.
+- The creds directory is **owned by you or by root**. Each token directory and
+  each token has **the same owner**, so a tree is yours throughout (n2c-token)
+  or root's throughout (a service account's tokens).
+- The creds directory, each token directory and each token are **not writable
+  by their group** and have **no permission at all for others** (mode `0750`,
+  `0700`, `0640`, `0600` or `0440` pass; `0755`, `0775` or `0644` do not).
+  Group read, and group enter for a directory, are allowed.
 - The directories are real directories, you can enter a token directory and
   read its token, and a token is a regular file, not a symlink.
 
-Directories above the creds directory are not checked: keep `N2SN_CREDS_DIR`
-somewhere nobody else can write, such as `/run/user/<uid>/...` or `/run/...`.
 `--n2c-token all` skips token directories you cannot enter.
 
 ### Service accounts
