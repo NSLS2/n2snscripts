@@ -10,6 +10,13 @@
 # zizmor, which has no standard auto-discovery and takes an explicit
 # --config argument.
 
+# Node-based hooks (markdownlint) get a pinned Node. Unpinned, nodeenv
+# resolves "latest" to a pre-release such as 27.0.0-alpha.0.0.0, which it
+# cannot parse, and the hook environment fails to build. Keep this on the
+# same major line as nodejs in pixi.toml.
+default_language_version:
+  node: 26.13.0
+
 repos:
   # ────────────────────────────────────────────────────────────
   # Generic hygiene + syntax checks
