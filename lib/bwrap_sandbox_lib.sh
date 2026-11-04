@@ -1606,41 +1606,152 @@ add_n2c_token() {
     N2C_TOKENS+=("${name}")
 }
 
-# _n2c_require_private DIR WHAT
-#   Exit 1 unless DIR is a real directory (not a symlink) owned by the
-#   current user with mode 0700.
-_n2c_require_private() {
-    local dir what="$2"
-    dir="$(_n2c_strip_slashes "$1")"
-    if [[ -L "${dir}" ]] || [[ ! -d "${dir}" ]] || [[ ! -O "${dir}" ]]; then
-        echo "Error: ${what} '${dir}' must be a real directory owned by you (not a symlink). Refusing to mount N2C tokens." >&2
+# The credentials are checked the way ssh checks a private key: a directory or
+# token that someone else could read or replace is refused.  The credentials
+# directory belongs to you (n2c-token keeps your own session tokens there) or
+# to root (a root service, for example a timer that gets app-only tokens with a
+# certificate, keeps them up to date for a service account that only reads
+# them).
+
+# _n2c_owner_mode PATH
+#   Print "UID MODE" for PATH (MODE is the octal permission bits, for example
+#   "0 750"), or nothing when PATH cannot be read.  A function of its own so
+#   that the checks below can be tested without root-owned files.
+_n2c_owner_mode() {
+    stat -c '%u %a' -- "$1" 2> /dev/null || true
+}
+
+# _n2c_my_uid
+#   Print the numeric user id (a function so tests can change it).
+_n2c_my_uid() {
+    id -u
+}
+
+# _n2c_require_plain_path DIR WHAT
+#   Exit 1 unless DIR is an absolute path with no symlink, ".", ".." or doubled
+#   slash in it.  The path is checked as written: a symlink anywhere in it could
+#   be changed between this check and the mount, which resolves the path again.
+_n2c_require_plain_path() {
+    local p what="$2" canon
+    p="$(_n2c_strip_slashes "$1")"
+    if [[ "${p}" != /* ]]; then
+        echo "Error: ${what} '${p}' must be an absolute path. Refusing to mount N2C tokens." >&2
         exit 1
     fi
-    if [[ "$(stat -c '%a' -- "${dir}" 2> /dev/null || true)" != "700" ]]; then
-        echo "Error: ${what} '${dir}' must have mode 0700. Refusing to mount N2C tokens." >&2
+    canon="$(readlink -f -- "${p}" 2> /dev/null || true)"
+    if [[ "${canon}" != "${p}" ]]; then
+        echo "Error: ${what} '${p}' goes through a symlink or has a '.', '..' or doubled '/' in it (it resolves to '${canon}'). Give the real path. Refusing to mount N2C tokens." >&2
         exit 1
     fi
+}
+
+# _n2c_require_strict PATH WHAT [UID]
+#   Exit 1 unless PATH is owned by you or by root (or by UID, when given), is
+#   not writable by its group and has no permission at all for others.  Read
+#   and enter by the group are allowed: that is how a service account reads
+#   tokens that root writes.
+_n2c_require_strict() {
+    local path="$1" what="$2" want_uid="${3:-}" om uid mode
+    om="$(_n2c_owner_mode "${path}")"
+    if [[ -z "${om}" ]]; then
+        echo "Error: cannot read the owner and mode of ${what} '${path}'. Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+    uid="${om%% *}"
+    mode="${om##* }"
+    if [[ -n "${want_uid}" ]]; then
+        if [[ "${uid}" != "${want_uid}" ]]; then
+            echo "Error: ${what} '${path}' must have the same owner as the credentials directory (uid ${want_uid}), not uid ${uid}. Refusing to mount N2C tokens." >&2
+            exit 1
+        fi
+    elif [[ "${uid}" != "0" && "${uid}" != "$(_n2c_my_uid)" ]]; then
+        echo "Error: ${what} '${path}' must be owned by you or by root. Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+    if [[ ! "${mode}" =~ ^[0-7]+$ ]] || (($((8#${mode})) & 8#027)); then
+        echo "Error: ${what} '${path}' has mode ${mode}: it must not be writable by its group or have any permission for others. Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+}
+
+# _n2c_require_private_dir DIR WHAT [UID]
+#   Exit 1 unless DIR is a real directory (not a symlink) that passes
+#   _n2c_require_strict (with UID, when given) and that you can enter.
+_n2c_require_private_dir() {
+    local dir="$1" what="$2" want_uid="${3:-}"
+    if [[ -L "${dir}" ]] || [[ ! -d "${dir}" ]]; then
+        echo "Error: ${what} '${dir}' must be a real directory (not a symlink). Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+    _n2c_require_strict "${dir}" "${what}" "${want_uid}"
+    if [[ ! -x "${dir}" ]]; then
+        echo "Error: ${what} '${dir}' cannot be entered by you (check its group). Refusing to mount N2C tokens." >&2
+        exit 1
+    fi
+}
+
+# _n2c_require_sealed_ancestors DIR WHAT
+#   Exit 1 unless every directory above DIR, up to "/", is owned by you or by
+#   root and not writable by its group or others.  DIR must already have passed
+#   _n2c_require_plain_path, so these are its real parents.  Otherwise someone
+#   could rename a parent and put their own tree, and an unchecked token, in its
+#   place before the mount resolves the path again.  A directory such as /tmp,
+#   which others can write to (even with the sticky bit), is refused.
+_n2c_require_sealed_ancestors() {
+    local p="$1" what="$2" om uid mode me bad
+    me="$(_n2c_my_uid)"
+    while [[ "${p}" != "/" ]]; do
+        p="${p%/*}"
+        [[ -n "${p}" ]] || p="/"
+        om="$(_n2c_owner_mode "${p}")"
+        uid="${om%% *}"
+        mode="${om##* }"
+        bad=0
+        [[ -n "${om}" && ("${uid}" == "0" || "${uid}" == "${me}") ]] || bad=1
+        [[ "${mode}" =~ ^[0-7]+$ ]] || bad=1
+        if [[ ${bad} -eq 0 ]] && (($((8#${mode})) & 8#022)); then
+            bad=1
+        fi
+        if [[ ${bad} -eq 1 ]]; then
+            echo "Error: '${p}' above ${what} must be owned by you or by root and not writable by its group or others. Refusing to mount N2C tokens." >&2
+            exit 1
+        fi
+    done
 }
 
 # build_n2c_token_mounts
 #   Add the token files requested with --n2c-token to EXTRA_RO_PATHS, so
 #   build_extra_path_mounts validates and mounts each one read-only at its own
 #   path.  Nothing is mounted unless --n2c-token was given.  "all" selects every
-#   non-empty token under the credentials directory.  n2c-token rewrites a token
-#   in place, so a mounted file sees every refresh.  When at least one token is
-#   mounted, N2SN_CREDS_DIR (the canonical credentials directory) is set in the
-#   sandbox environment, because the host's location variables are not passed in.
+#   token directory under the credentials directory that you can enter.  A
+#   token is rewritten in place (by n2c-token, or by the root service for a
+#   service account), so a mounted file sees every refresh.  When at least one
+#   token is mounted, N2SN_CREDS_DIR (the canonical credentials directory) is
+#   set in the sandbox environment, because the host's location variables are
+#   not passed in.
 #
-#   A requested token that is missing or empty only warns (run `n2c-token
-#   login`).  A credentials directory or token directory that is a symlink, is
-#   owned by someone else or is not mode 0700, or a token file that is a
-#   symlink or not a regular file, is an error: the launch stops.
+#   Checks, all errors that stop the launch:
+#     - N2SN_CREDS_DIR is an absolute path with no symlink in it, and every
+#       directory above it is owned by you or by root and not writable by
+#       group or others;
+#     - the credentials directory is owned by you or by root, and each token
+#       directory and each token has the same owner;
+#     - all of them are not writable by their group and have no permission
+#       for others (like ssh and a private key); a token directory can be
+#       entered by you, and a token read by you;
+#     - the directories are real directories, and a token is a regular file,
+#       not a symlink.
+#
+#   A token with no file yet only warns.  An empty token is mounted with a
+#   warning: the file is filled in place, so it shows up as soon as it is
+#   written.  The hint in the warnings depends on who owns the credentials
+#   directory.
 #
 #   Must be called BEFORE build_extra_path_mounts.
 build_n2c_token_mounts() {
     [[ -z "${N2C_TOKENS[*]+x}" ]] && return 0
 
-    local root name tdir tfile want_all=0
+    local root name tdir tfile want_all=0 hint om root_uid
     local -a names=() found=()
     local -A seen=()
     root="$(_n2c_creds_root)"
@@ -1655,10 +1766,19 @@ build_n2c_token_mounts() {
     done
 
     if [[ ! -e "${root}" && ! -L "${root}" ]]; then
-        echo "Warning: N2C credentials directory '${root}' does not exist; no tokens mounted. Run: n2c-token login" >&2
+        echo "Warning: N2C credentials directory '${root}' does not exist; no tokens mounted. Run: n2c-token login (or, for a service account, check that its token service has run)" >&2
         return 0
     fi
-    _n2c_require_private "${root}" "N2C credentials directory"
+    _n2c_require_plain_path "${root}" "N2C credentials directory"
+    _n2c_require_sealed_ancestors "${root}" "the N2C credentials directory"
+    _n2c_require_private_dir "${root}" "N2C credentials directory"
+    om="$(_n2c_owner_mode "${root}")"
+    root_uid="${om%% *}"
+    if [[ "${root_uid}" == "$(_n2c_my_uid)" ]]; then
+        hint="Run: n2c-token login"
+    else
+        hint="These tokens are kept by a root service on this host; ask its administrator."
+    fi
 
     if [[ ${want_all} -eq 1 ]]; then
         names=()
@@ -1667,6 +1787,7 @@ build_n2c_token_mounts() {
             tdir="${tdir%/}"
             name="${tdir##*/}"
             [[ "${name}" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || continue
+            [[ -x "${tdir}" ]] || continue
             names+=("${name}")
         done
     fi
@@ -1678,22 +1799,28 @@ build_n2c_token_mounts() {
             echo "Warning: no N2C token '${name}' (${tdir} does not exist); not mounted." >&2
             continue
         fi
-        _n2c_require_private "${tdir}" "N2C token directory"
+        _n2c_require_private_dir "${tdir}" "N2C token directory" "${root_uid}"
         if [[ -L "${tfile}" ]] || { [[ -e "${tfile}" ]] && [[ ! -f "${tfile}" ]]; }; then
             echo "Error: N2C token '${tfile}' must be a regular file, not a symlink. Refusing to mount N2C tokens." >&2
             exit 1
         fi
-        if [[ ! -s "${tfile}" ]]; then
-            if [[ ${want_all} -eq 0 ]]; then
-                echo "Warning: N2C token '${name}' is missing or empty; not mounted. Run: n2c-token login" >&2
-            fi
+        if [[ ! -e "${tfile}" ]]; then
+            echo "Warning: N2C token '${name}' has no file yet (${tfile}); not mounted. ${hint}" >&2
             continue
+        fi
+        _n2c_require_strict "${tfile}" "N2C token" "${root_uid}"
+        if [[ ! -r "${tfile}" ]]; then
+            echo "Error: N2C token '${tfile}' cannot be read by you (check its group). Refusing to mount N2C tokens." >&2
+            exit 1
+        fi
+        if [[ ! -s "${tfile}" ]]; then
+            echo "Warning: N2C token '${name}' is empty for now; mounted, it shows up when written. ${hint}" >&2
         fi
         found+=("${tfile}")
     done
 
     if [[ ${want_all} -eq 1 && ${#found[@]} -eq 0 ]]; then
-        echo "Warning: no N2C tokens found in '${root}'; none mounted. Run: n2c-token login" >&2
+        echo "Warning: no N2C tokens found in '${root}'; none mounted. ${hint}" >&2
     fi
     for tfile in "${found[@]+"${found[@]}"}"; do
         EXTRA_RO_PATHS+=("${tfile}")
@@ -1717,27 +1844,36 @@ build_n2c_token_mounts() {
 #   (npm and pixi caches, ccache, tool data and cache directories) are only
 #   checked for being blocked themselves, so with N2C_STATE_DIR set inside one of
 #   them the session directory would be mounted along with it.  This looks at the
-#   finished mount list, so it covers every mount whatever added it.  Nothing is
-#   checked while the directory does not exist.
+#   finished mount list, so it covers every mount whatever added it.  A bind
+#   counts when its source, as written or with symlinks resolved, is the session
+#   directory, contains it or lies inside it, compared against the session
+#   directory as written and resolved.  Nothing is checked while the directory
+#   does not exist.
 #
 #   Called by print_dry_run and launch_sandbox, after all mounts are built.
 verify_n2c_state_not_exposed() {
-    local state canon src flag i=0
+    local state state_canon src src_canon flag s t i=0
     state="$(_n2c_state_dir)"
     [[ -e "${state}" ]] || return 0
-    canon="$(readlink -f -- "${state}" 2> /dev/null || true)"
+    state_canon="$(readlink -f -- "${state}" 2> /dev/null || true)"
     while [[ ${i} -lt ${#BWRAP_ARGS[@]} ]]; do
         flag="${BWRAP_ARGS[${i}]}"
         _bwrap_flag_arity "${flag}"
         case "${flag}" in
             --bind | --bind-try | --ro-bind | --ro-bind-try | --dev-bind | --dev-bind-try)
                 src="${BWRAP_ARGS[$((i + 1))]}"
-                if _is_prefix_of "${src}" "${state}" ||
-                    { [[ -n "${canon}" ]] && _is_prefix_of "${src}" "${canon}"; }; then
-                    echo "Error: the mount of '${src}' would expose the N2C session directory '${state}' (it holds the refresh token)." >&2
-                    echo "       Move N2C_STATE_DIR out of directories that the launcher mounts (for example ~/.npm, ~/.pixi, ~/.ccache)." >&2
-                    exit 1
-                fi
+                src_canon="$(readlink -f -- "${src}" 2> /dev/null || true)"
+                for s in "${src}" "${src_canon}"; do
+                    [[ -n "${s}" ]] || continue
+                    for t in "${state}" "${state_canon}"; do
+                        [[ -n "${t}" ]] || continue
+                        if _is_prefix_of "${s}" "${t}" || _is_prefix_of "${t}" "${s}"; then
+                            echo "Error: the mount of '${src}' would expose the N2C session directory '${state}' (it holds the refresh token)." >&2
+                            echo "       Move N2C_STATE_DIR out of directories that the launcher mounts (for example ~/.npm, ~/.pixi, ~/.ccache)." >&2
+                            exit 1
+                        fi
+                    done
+                done
                 ;;
         esac
         i=$((i + 1 + _BWRAP_FLAG_ARITY))

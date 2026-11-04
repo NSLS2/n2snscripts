@@ -115,8 +115,8 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
 
 - **Nothing is mounted by default.** `--n2c-token NAME` mounts
   `creds/NAME/token` read-only at the same path; repeat it for several tokens.
-  `--n2c-token all` mounts every non-empty token in the directory. `all`
-  together with names means all.
+  `--n2c-token all` mounts every token in the directory that you can enter.
+  `all` together with names means all.
 - **Only token files are mounted**, one file each. `n2c-token` rewrites a token
   in place, so a mounted file sees every refresh while the timer runs.
 - **The refresh token is never mounted.** The MSAL cache (`cache.json`) lives
@@ -126,16 +126,18 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
 - **Automatic mounts cannot expose it either.** Directories the launcher mounts
   whole (the npm and pixi caches, ccache, the tool data and cache directories)
   are only checked for being blocked themselves. So, after all mounts are built,
-  the launch stops with an error if any bind mount would contain the N2C session
-  directory, for example with `N2C_STATE_DIR` set inside `~/.npm`. The default
+  the launch stops with an error if any bind mount's source (as written or with
+  symlinks resolved) is, contains or lies inside the N2C session directory, for
+  example with `N2C_STATE_DIR` set inside `~/.npm`, or `~/.npm` being a symlink to
+  a directory that holds it. The default
   location, under `/run/user/<uid>`, is never inside such a directory.
-- **The directories are checked.** The creds directory and each token directory
-  must be real directories (not symlinks), owned by you, with mode `0700`, and
-  a token must be a regular file, not a symlink; otherwise the launch stops with
-  an error. `n2c-token` creates them that way.
-- **A missing or empty token only warns**; run `n2c-token login` on the host. A
-  token that expires while the sandbox runs is refreshed in place by the
-  `n2c-token` timer (`n2c-token install` on the host).
+- **The tokens are checked like an ssh private key** (see
+  [Checks](#checks-on-the-credentials) below): a directory or token that
+  someone else could read or replace stops the launch.
+- **A missing token only warns**; run `n2c-token login` on the host. An empty
+  token is mounted, with a warning: it is filled in place, so a mounted file
+  shows the token as soon as it is written and every refresh after that,
+  while the `n2c-token` timer runs (`n2c-token install` on the host).
 - **Locations.** `N2SN_CREDS_DIR` and `N2C_STATE_DIR` override the two
   directories, as they do for `n2c-token`.
 - **The sandbox is told where the tokens are.** The sandbox environment is
@@ -144,6 +146,72 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   the host uses a non-default location. Nothing is set when no token is mounted.
 
 Example: `bwopencode2 --n2c-token observability --n2c-token epics`.
+
+### Checks on the credentials
+
+The launcher refuses to mount tokens that someone else could read or replace,
+the way `ssh` refuses a private key that others can read. Each of these stops
+the launch with an error:
+
+- `N2SN_CREDS_DIR` is an absolute path with no symlink, `.`, `..` or doubled
+  `/` in it, so use the real path (`/run/...`, not `/var/run/...`): a symlink
+  could be changed between the check and the mount.
+- Every directory above it, up to `/`, is owned by you or by root and is not
+  writable by its group or others. Otherwise someone could rename a parent and
+  put their own tree, with a token you did not check, in its place. A
+  directory such as `/tmp`, which others can write to, is refused.
+- The creds directory is **owned by you or by root**. Each token directory and
+  each token has **the same owner**, so a tree is yours throughout (n2c-token)
+  or root's throughout (a service account's tokens).
+- The creds directory, each token directory and each token are **not writable
+  by their group** and have **no permission at all for others** (mode `0750`,
+  `0700`, `0640`, `0600` or `0440` pass; `0755`, `0775` or `0644` do not).
+  Group read, and group enter for a directory, are allowed.
+- The directories are real directories, you can enter a token directory and
+  read its token, and a token is a regular file, not a symlink.
+
+`--n2c-token all` skips token directories you cannot enter.
+
+### Service accounts
+
+A service account has no `n2c-token` session. A root service on the host (for
+example a timer that gets app-only tokens with a certificate) keeps the same
+`creds/NAME/token` files up to date, and the account only reads them. Nothing
+extra is needed: the creds directory is owned by root, and the launcher uses
+the same checks.
+
+```bash
+N2SN_CREDS_DIR=/run/nsls2/agent/creds bwopencode2 --n2c-token all
+```
+
+The warnings then say the tokens are kept by a root service instead of "Run:
+n2c-token login". A service that keeps tokens this way should create the
+creds directory and each token directory as `root:GROUP` with mode `0750`, and
+each token as `root:GROUP` with mode `0440`, where `GROUP` is the group of the
+account that runs the sandbox, and rewrite a token in place (the same file)
+rather than replace it, because the sandbox mounts the file itself.
+
+#### The AI gateway token
+
+A service account that sends its requests to the AIFAPIM gateway through an
+agents product needs a second credential next to its subscription key
+(`AIFAPIM_API_KEY`, sent as `x-api-key`): an Entra ID token, sent as
+`Authorization: Bearer`. The root service keeps that token in the same layout,
+as the token named `aifapim`, so it is mounted like any other:
+
+```bash
+export N2SN_CREDS_DIR=/run/nsls2/agent/creds
+export AIFAPIM_HOST=aifapim.nsls2.bnl.gov  # gitleaks:allow (a public host name)
+export AIFAPIM_TOKEN_FILE=/run/nsls2/agent/creds/aifapim/token
+bwopencode2 --n2c-token aifapim --n2c-token observability
+```
+
+`bwopencode2` passes `AIFAPIM_TOKEN_FILE` into the sandbox, which is a path and
+not the token. The `aifapim-entra` OpenCode 2 plugin (NSLS2/n2snskills,
+`plugins/`) reads the file on every request, because the token changes every 15
+minutes, and does nothing unless both `AIFAPIM_HOST` and `AIFAPIM_TOKEN_FILE`
+are set. `bwopencode` does not forward the variable: OpenCode 1 does not load
+the plugin.
 
 ## Sandbox context
 
@@ -415,7 +483,10 @@ system-wide `/etc/opencode/opencode.json{,c}` (shared with `bwopencode`), or an
 `~/.config/opencode2/opencode`. If neither exists the wrapper exits with
 status 2. The OpenCode 1 config in `~/.config/opencode` is not used.
 
-Accepts the common options above except `--init-auth`.
+Accepts the common options above except `--init-auth`. Of the host's
+environment it forwards `AIFAPIM_HOST`, `AIFAPIM_API_KEY` and
+`AIFAPIM_TOKEN_FILE` (see "The AI gateway token" above), and only the
+`OPENCODE_*` variables on the allowlist below.
 
 ### Host directories and sandbox locations
 
