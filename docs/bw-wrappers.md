@@ -191,6 +191,28 @@ each token as `root:GROUP` with mode `0440`, where `GROUP` is the group of the
 account that runs the sandbox, and rewrite a token in place (the same file)
 rather than replace it, because the sandbox mounts the file itself.
 
+#### The AI gateway token
+
+A service account that sends its requests to the AIFAPIM gateway through an
+agents product needs a second credential next to its subscription key
+(`AIFAPIM_API_KEY`, sent as `x-api-key`): an Entra ID token, sent as
+`Authorization: Bearer`. The root service keeps that token in the same layout,
+as the token named `aifapim`, so it is mounted like any other:
+
+```bash
+export N2SN_CREDS_DIR=/run/nsls2/agent/creds
+export AIFAPIM_HOST=aifapim.nsls2.bnl.gov  # gitleaks:allow (a public host name)
+export AIFAPIM_TOKEN_FILE=/run/nsls2/agent/creds/aifapim/token
+bwopencode2 --n2c-token aifapim --n2c-token observability
+```
+
+`bwopencode2` passes `AIFAPIM_TOKEN_FILE` into the sandbox, which is a path and
+not the token. The `aifapim-entra` OpenCode 2 plugin (NSLS2/n2snskills,
+`plugins/`) reads the file on every request, because the token changes every 15
+minutes, and does nothing unless both `AIFAPIM_HOST` and `AIFAPIM_TOKEN_FILE`
+are set. `bwopencode` does not forward the variable: OpenCode 1 does not load
+the plugin.
+
 ## Sandbox context
 
 An agent that does not know it runs in a sandbox guesses: it takes a read-only
@@ -461,7 +483,10 @@ system-wide `/etc/opencode/opencode.json{,c}` (shared with `bwopencode`), or an
 `~/.config/opencode2/opencode`. If neither exists the wrapper exits with
 status 2. The OpenCode 1 config in `~/.config/opencode` is not used.
 
-Accepts the common options above except `--init-auth`.
+Accepts the common options above except `--init-auth`. Of the host's
+environment it forwards `AIFAPIM_HOST`, `AIFAPIM_API_KEY` and
+`AIFAPIM_TOKEN_FILE` (see "The AI gateway token" above), and only the
+`OPENCODE_*` variables on the allowlist below.
 
 ### Host directories and sandbox locations
 

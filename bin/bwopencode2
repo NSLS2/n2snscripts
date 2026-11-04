@@ -667,6 +667,8 @@ build_opencode2_state_dir() {
 #       redirect data/config/model sources outside the sandbox layout
 #   OPENCODE_API_KEY  credentials
 # Also pass through AIFAPIM_* env vars for NSLS-II Hermes gateway.
+# AIFAPIM_TOKEN_FILE (the Entra ID token for the gateway, read by the aifapim-entra
+# plugin) is passed through too; the token itself comes in with --n2c-token aifapim.
 # With --github-tokens, also forward GH_TOKEN_* vars so the agent
 # can authenticate gh(1) via per-command:
 #   GH_TOKEN="$GH_TOKEN_NSLS2" gh <subcommand>
@@ -716,6 +718,10 @@ build_opencode2_env() {
     # The API key is passed through unchanged; print_dry_run redacts the value
     # of any variable whose name looks secret (KEY/TOKEN/PASSWORD/...).
     pass_through_if_set AIFAPIM_API_KEY
+    # Path of the gateway's Entra ID token file, for the aifapim-entra plugin. It is a path,
+    # not the token; the file is mounted by --n2c-token aifapim. The plugin does nothing
+    # unless this and AIFAPIM_HOST are both set.
+    pass_through_if_set AIFAPIM_TOKEN_FILE
 
     local _key _allowed _name
     local -a _dropped=()
