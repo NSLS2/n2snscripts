@@ -81,6 +81,7 @@ ensure_agent_dir() {
         mkdir -p "${dir}" || die "cannot create '${dir}'"
         echo "${PROGRAM_NAME}: created ${dir}" >&2
     }
+    reject_symlink "${dir}"
 
     setfacl -m "u:${AGENT_ACCOUNT}:x" "${home}" || _acl_failed
     setfacl -m "u:${AGENT_ACCOUNT}:rwx" -m "d:u:${AGENT_ACCOUNT}:rwx" "${dir}" || _acl_failed
@@ -89,6 +90,17 @@ ensure_agent_dir() {
 
 _acl_failed() {
     die "cannot share the agent directory with ${AGENT_ACCOUNT}: does this filesystem support ACLs?"
+}
+
+# reject_symlink DIR
+#   The agent directory has to be a real directory in the caller's home. A
+#   symlink would move the agent's one writable mount somewhere else, and the
+#   caller owns their home, so only this stops them pointing it anywhere.
+#   Checked again as the agent account, after the caller's last chance to swap
+#   it.
+reject_symlink() {
+    [[ ! -L "$1" ]] ||
+        die "'$1' is a symlink: the agent directory has to be a real directory in your home"
 }
 
 usage() {
@@ -107,14 +119,8 @@ EOF
 }
 
 main() {
-    # Staff run this as themselves; set up the agent directory while we still
-    # are them (they own their home), then re-run as the agent account.
-    if [[ "$(id -un)" != "${AGENT_ACCOUNT}" ]]; then
-        [[ "$(id -un)" != root ]] || die "refusing to run for root"
-        ensure_agent_dir "${HOME}" "$(id -un)"
-        exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_DIR}/${PROGRAM_NAME}" "$@"
-    fi
-
+    # Before anything else, so asking what this is needs no sudo rule and
+    # creates nothing.
     case "${1:-}" in
         '')
             usage >&2
@@ -127,12 +133,22 @@ main() {
     esac
 
     local agent="$1"
-    shift
-    [[ $# -eq 0 ]] || die "no options are accepted after the agent name (got: $*)"
 
+    # All argument checking before anything is created, so a typo does not
+    # leave a directory behind. Named first, or an option in the agent's place
+    # is reported as a stray argument instead of an unknown agent.
     local wrapper="${AGENT_WRAPPERS[${agent}]:-}"
     [[ -n "${wrapper}" ]] ||
         die "unknown agent '${agent}'. Known agents: $(echo "${!AGENT_WRAPPERS[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')"
+    [[ $# -eq 1 ]] || die "no options are accepted after the agent name (got: ${*:2})"
+
+    # Staff run this as themselves; set up the agent directory while we still
+    # are them (they own their home), then re-run as the agent account.
+    if [[ "$(id -un)" != "${AGENT_ACCOUNT}" ]]; then
+        [[ "$(id -un)" != root ]] || die "refusing to run for root"
+        ensure_agent_dir "${HOME}" "$(id -un)"
+        exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_DIR}/${PROGRAM_NAME}" "$@"
+    fi
 
     # The bw* launchers run this too; running it before the audit line keeps a
     # refused account out of the log and away from the key.
@@ -151,6 +167,7 @@ main() {
     # The one writable place: the agent works in a clone here and a person
     # moves changes into the live profile.
     local agent_dir="${home}/${AGENT_SUBDIR}"
+    reject_symlink "${agent_dir}"
     [[ -w "${agent_dir}" ]] || die "'${agent_dir}' is not writable by ${AGENT_ACCOUNT}: check its ACL"
 
     local agent_home="${AGENT_HOME_BASE}-${user}"
@@ -158,9 +175,12 @@ main() {
     chmod 700 "${agent_home}" || die "cannot secure '${agent_home}'"
 
     # Passed in the environment because that is how the wrappers take it; the
-    # file itself is never mounted.
+    # file itself is never mounted. Readability is checked first, or bash
+    # prints its own error about the path before ours.
     local key
-    key="$(< "${AIFAPIM_KEY_PATH}")" || die "cannot read the AI gateway key '${AIFAPIM_KEY_PATH}'"
+    [[ -r "${AIFAPIM_KEY_PATH}" ]] ||
+        die "cannot read the AI gateway key '${AIFAPIM_KEY_PATH}': is the n2c_agent role deployed on this host?"
+    key="$(< "${AIFAPIM_KEY_PATH}")"
     [[ -n "${key}" ]] || die "the AI gateway key '${AIFAPIM_KEY_PATH}' is empty"
 
     # Audit before anything runs: no log line, no agent.
