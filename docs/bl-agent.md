@@ -36,16 +36,20 @@ adds them is only read by a login shell.
   read-only, one file each. `all` rather than a list of names because the
   minter decides which tokens the account gets; the launcher does not need
   changing when that set does.
-- **The working directory.** `~<calling user>/agent`, which must exist and be
-  writable by the agent account. The host setup role creates it and gives the
-  agent account traverse-only access to the home above it.
-- **`HOME`.** `/home/xfagent`, a tmpfs the host setup role mounts. The wrappers
-  create their authoring directories (`~/.config/opencode/{skills,agents,commands}`)
-  there on the host before bind-mounting them into the sandbox, so it has to
-  exist and be writable. On a tmpfs nothing the agent writes outside the
-  caller's agent directory survives a reboot. It cannot be the working
-  directory itself: a wrapper refuses to run where the working directory is
-  `$HOME` or above it, because that would mount the whole home tree.
+- **The working directory.** `~<calling user>/agent`, created on first use
+  along with the ACLs that share it: traverse-only for the agent account on
+  the home, read-write on the agent directory, with default entries for both
+  accounts so each can read what the other writes. This runs as the caller,
+  who owns their home, so it needs no root and no prior ansible run.
+- **`HOME`.** `/tmp/bl-agent-<caller>`, created on first use, mode `0700`. The
+  wrappers create their authoring directories
+  (`~/.config/opencode/{skills,agents,commands}`) there on the host before
+  bind-mounting them into the sandbox, so it has to exist and be writable. The
+  agent account has no home of its own and no XDG runtime directory, and
+  nothing kept here needs to outlive a reboot. It is per caller, so two people
+  using the account do not share a cache. It cannot be the caller's agent
+  directory: a wrapper refuses to run where the working directory is `$HOME`
+  or above it, because that would mount the whole home tree.
 - **`PATH`.** `sudo` replaces it with its `secure_path`, which does not hold
   `/usr/local/bin`, where the agents are installed, so the wrappers would not
   find them.

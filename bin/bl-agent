@@ -44,11 +44,13 @@ readonly AGENT_CREDS_DIR=/run/nsls2/agent/creds
 readonly AIFAPIM_GATEWAY_HOST=aifapim.nsls2.bnl.gov # gitleaks:allow
 readonly ACCOUNT_CHECK=/opt/nsls2/libexec/agent-account-check
 
-# A tmpfs the host setup role mounts, so nothing the agent writes outside the
-# caller's agent directory survives a reboot. The wrappers need it to exist
-# before they start: they create their authoring directories under it on the
-# host and bind-mount those into the sandbox.
-readonly AGENT_HOME=/home/xfagent
+# $HOME for the agent account, per caller. The bw* launchers create their
+# authoring directories under it on the host before bind-mounting them in, so
+# it has to exist and be writable. It cannot be the caller's agent directory:
+# a wrapper refuses to run where the working directory is $HOME or above it.
+# In /tmp because the agent account has no home and no XDG runtime directory,
+# and nothing here needs to outlive a reboot.
+readonly AGENT_HOME_BASE=/tmp/bl-agent
 
 # The live profile collection, relative to the caller's home. $HOME is a tmpfs
 # in the sandbox, so the rest of the home stays hidden and this one directory
@@ -56,9 +58,38 @@ readonly AGENT_HOME=/home/xfagent
 # directory. Not every host has one.
 readonly PROFILE_COLLECTION=.ipython/profile_collection
 
+# The one directory the agent may write in, inside the caller's home.
+readonly AGENT_SUBDIR=agent
+
 die() {
     echo "${PROGRAM_NAME}: $*" >&2
     exit 1
+}
+
+# ensure_agent_dir HOME
+#   Create the agent directory and the ACLs that share it with the agent
+#   account. Runs as the caller, who owns their home, so this needs no root
+#   and no prior ansible run. Idempotent: setfacl -m is a no-op when the entry
+#   is already there.
+#
+#   Traverse-only on the home: the agent reaches its own directory and the
+#   profile collection, nothing else. Both accounts get default entries on the
+#   agent directory, or whichever one did not create a file cannot read it.
+ensure_agent_dir() {
+    local home="$1" dir="$1/${AGENT_SUBDIR}" user="$2"
+
+    [[ -d "${dir}" ]] || {
+        mkdir -p "${dir}" || die "cannot create '${dir}'"
+        echo "${PROGRAM_NAME}: created ${dir}" >&2
+    }
+
+    setfacl -m "u:${AGENT_ACCOUNT}:x" "${home}" || _acl_failed
+    setfacl -m "u:${AGENT_ACCOUNT}:rwx" -m "d:u:${AGENT_ACCOUNT}:rwx" "${dir}" || _acl_failed
+    setfacl -m "d:u:${user}:rwx" "${dir}" || _acl_failed
+}
+
+_acl_failed() {
+    die "cannot share the agent directory with ${AGENT_ACCOUNT}: does this filesystem support ACLs?"
 }
 
 usage() {
@@ -77,9 +108,11 @@ EOF
 }
 
 main() {
-    # Staff run this as themselves; re-run as the agent account. Everything
-    # below this point is already the agent.
+    # Staff run this as themselves; set up the agent directory while we still
+    # are them (they own their home), then re-run as the agent account.
     if [[ "$(id -un)" != "${AGENT_ACCOUNT}" ]]; then
+        [[ "$(id -un)" != root ]] || die "refusing to run for root"
+        ensure_agent_dir "${HOME}" "$(id -un)"
         exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_DIR}/${PROGRAM_NAME}" "$@"
     fi
 
@@ -118,11 +151,12 @@ main() {
 
     # The one writable place: the agent works in a clone here and a person
     # moves changes into the live profile.
-    local agent_dir="${home}/agent"
-    [[ -d "${agent_dir}" ]] || die "'${agent_dir}' does not exist; the host setup role creates it"
-    [[ -w "${agent_dir}" ]] || die "'${agent_dir}' is not writable by this account; check its ACL"
+    local agent_dir="${home}/${AGENT_SUBDIR}"
+    [[ -w "${agent_dir}" ]] || die "'${agent_dir}' is not writable by ${AGENT_ACCOUNT}: check its ACL"
 
-    [[ -w "${AGENT_HOME}" ]] || die "'${AGENT_HOME}' is not writable; the host setup role mounts it"
+    local agent_home="${AGENT_HOME_BASE}-${user}"
+    mkdir -p "${agent_home}" || die "cannot create '${agent_home}'"
+    chmod 700 "${agent_home}" || die "cannot secure '${agent_home}'"
 
     # Passed in the environment because that is how the wrappers take it; the
     # file itself is never mounted.
@@ -140,7 +174,7 @@ main() {
     export AIFAPIM_HOST="${AIFAPIM_GATEWAY_HOST}"
     export AIFAPIM_API_KEY="${key}"
     export PATH="${AGENT_PATH}"
-    export HOME="${AGENT_HOME}"
+    export HOME="${agent_home}"
 
     cd "${agent_dir}" || die "cannot enter '${agent_dir}'"
 
