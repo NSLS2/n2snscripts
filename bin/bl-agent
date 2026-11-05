@@ -17,6 +17,11 @@ set -o pipefail
 
 readonly PROGRAM_NAME="${0##*/}"
 
+# The account the agents run as. Staff run this script as themselves; it
+# re-runs itself through sudo, so nobody has to remember the account name or
+# the sudo line. The sudoers rule still decides who is allowed.
+readonly AGENT_ACCOUNT=xfagent
+
 # The bw* wrappers sit next to this script, and are run by absolute path: sudo
 # replaces PATH with its secure_path, and the profile.d snippet that adds them
 # is only read by a login shell.
@@ -45,6 +50,12 @@ readonly ACCOUNT_CHECK=/opt/nsls2/libexec/agent-account-check
 # host and bind-mount those into the sandbox.
 readonly AGENT_HOME=/home/xfagent
 
+# The live profile collection, relative to the caller's home. $HOME is a tmpfs
+# in the sandbox, so the rest of the home stays hidden and this one directory
+# is mounted read-only; the agent works on a clone of it in the agent
+# directory. Not every host has one.
+readonly PROFILE_COLLECTION=.ipython/profile_collection
+
 die() {
     echo "${PROGRAM_NAME}: $*" >&2
     exit 1
@@ -52,7 +63,7 @@ die() {
 
 usage() {
     cat << EOF
-Usage: sudo -u <agent-account> ${PROGRAM_NAME} <agent>
+Usage: ${PROGRAM_NAME} <agent>
 
 Start a beamline coding agent in its sandbox. It may write only in your agent
 directory, and reaches the AI gateway and the read-only NSLS-II APIs with the
@@ -66,6 +77,12 @@ EOF
 }
 
 main() {
+    # Staff run this as themselves; re-run as the agent account. Everything
+    # below this point is already the agent.
+    if [[ "$(id -un)" != "${AGENT_ACCOUNT}" ]]; then
+        exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_DIR}/${PROGRAM_NAME}" "$@"
+    fi
+
     case "${1:-}" in
         '')
             usage >&2
@@ -92,7 +109,7 @@ main() {
     fi
 
     local user="${SUDO_USER:-}"
-    [[ -n "${user}" ]] || die "SUDO_USER is not set; run this through sudo -u <agent-account>"
+    [[ -n "${user}" ]] || die "cannot tell who you are: run ${PROGRAM_NAME} as yourself, not as ${AGENT_ACCOUNT}"
     [[ "${user}" != root ]] || die "refusing to run for root"
 
     local home
@@ -115,7 +132,7 @@ main() {
 
     # Audit before anything runs: no log line, no agent.
     logger -t "${PROGRAM_NAME}" -p auth.notice \
-        "agent start: user=${user} host=${HOSTNAME%%.*} agent=${agent} dir=${agent_dir}"
+        "agent start: user=${user} host=$(uname -n) agent=${agent} dir=${agent_dir}"
 
     # The tokens come from the root minter, not an n2c-token session this
     # account does not have.
@@ -126,7 +143,15 @@ main() {
     export HOME="${AGENT_HOME}"
 
     cd "${agent_dir}" || die "cannot enter '${agent_dir}'"
-    exec "${SCRIPT_DIR}/${wrapper}" --n2c-token all
+
+    local -a mounts=(--n2c-token all)
+    if [[ -d "${home}/${PROFILE_COLLECTION}" ]]; then
+        mounts+=(--ro-path "${home}/${PROFILE_COLLECTION}")
+    else
+        echo "${PROGRAM_NAME}: no profile collection at '${home}/${PROFILE_COLLECTION}'; starting without it" >&2
+    fi
+
+    exec "${SCRIPT_DIR}/${wrapper}" "${mounts[@]}"
 }
 
 main "$@"
