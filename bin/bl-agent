@@ -75,8 +75,11 @@ main() {
     [[ -n "${wrapper}" ]] ||
         die "unknown agent '${agent}'. Known agents: $(echo "${!AGENT_WRAPPERS[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')"
 
-    # Advisory in the bw* launchers; run here so a refusal comes before setup.
-    [[ ! -x "${ACCOUNT_CHECK}" ]] || "${ACCOUNT_CHECK}" || exit $?
+    # The bw* launchers run this too; running it before the audit line keeps a
+    # refused account out of the log and away from the key.
+    if [[ -f "${ACCOUNT_CHECK}" && -x "${ACCOUNT_CHECK}" ]]; then
+        "${ACCOUNT_CHECK}" || exit $?
+    fi
 
     local user="${SUDO_USER:-}"
     [[ -n "${user}" ]] || die "SUDO_USER is not set; run this through sudo -u <agent-account>"
