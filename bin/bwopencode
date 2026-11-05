@@ -83,6 +83,27 @@
 #                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 #   --no-sandbox-context
 #                   Do not generate the sandbox context file (see below).
+#   --publish PORT[:SANDBOXPORT]
+#                   Make a server in the sandbox reachable on the host at a
+#                   per-user, per-session loopback address (127.H1.H2.S:PORT).
+#                   May be repeated.
+#   --publish-addr ADDR
+#                   Use ADDR (in 127.0.0.0/8) for --publish instead.
+#   --host-port PORT[:SANDBOXPORT]
+#                   Make the host's 127.0.0.1:PORT reachable in the sandbox at
+#                   host.internal:SANDBOXPORT.  May be repeated.
+#   --net-log FILE  Log every network flow to FILE on the host.
+#   --share-net     Share the host network instead (the behaviour before
+#                   private namespaces); not with the options above.
+#   --net-backend pasta|slirp4netns
+#                   Use only this backend for the private namespace.
+#
+# Network: the sandbox has its own network namespace from pasta (package
+# passt), or else slirp4netns (--host-port and --net-log need pasta).
+# Outbound connections work; services on the host's loopback are unreachable
+# and the sandbox's listeners are invisible to the host, except for the ports
+# opened with --publish and --host-port.  Without a usable private namespace
+# the launch stops (exit 3) unless --share-net is given.
 #
 # Sandbox context: a short markdown file describing this sandbox (what is
 # mounted read-only or read-write, what is lost at exit, which tools are
@@ -156,6 +177,50 @@ parse_wrapper_args() {
                 # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
                 SANDBOX_CONTEXT_ENABLED=0
                 shift
+                ;;
+            --publish)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_publish "$2"
+                shift 2
+                ;;
+            --publish-addr)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish-addr requires an address in 127.0.0.0/8." >&2
+                    exit 1
+                fi
+                net_set_publish_addr "$2"
+                shift 2
+                ;;
+            --host-port)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --host-port requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_host_port "$2"
+                shift 2
+                ;;
+            --share-net)
+                net_set_share
+                shift
+                ;;
+            --net-backend)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --net-backend requires pasta or slirp4netns." >&2
+                    exit 1
+                fi
+                net_set_backend "$2"
+                shift 2
+                ;;
+            --net-log)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --net-log requires a file name." >&2
+                    exit 1
+                fi
+                net_set_log_file "$2"
+                shift 2
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -243,6 +308,7 @@ Wrapper options (consumed before opencode sees the command line):
 All other arguments are passed through to opencode unchanged.
 
 HELP_EOF
+    net_print_help
     # Delegate to opencode --help inside the sandbox so the user sees the full
     # opencode option set in the same invocation.  We re-exec this script with
     # --exec so the sandbox is fully constructed; opencode --help is passed
@@ -473,8 +539,9 @@ build_opencode_cache_mount() {
 # Pass through an ALLOWLIST of harmless OPENCODE_* behaviour toggles, and
 # AIFAPIM_* env vars for the NSLS-II Hermes gateway.  Other host OPENCODE_*
 # variables are dropped: some are secrets (OPENCODE_SERVER_PASSWORD would
-# let the agent, which shares the host network, drive an unsandboxed
-# opencode server) and others redirect config/data/DB/model/server locations
+# let the agent drive an unsandboxed opencode server; the private network
+# namespace keeps the host's loopback out of reach, but the password stays
+# out too, in case a server is reachable another way) and others redirect config/data/DB/model/server locations
 # or inject config (OPENCODE_CONFIG*, OPENCODE_PERMISSION) and so would
 # bypass the managed config.  In --dry-run the NAMES (never values) of
 # dropped variables are printed to stderr.
@@ -610,6 +677,7 @@ main() {
 
     detect_bwrap_capabilities
     detect_kernel_capabilities
+    detect_net_capabilities
     resolve_common_paths
     resolve_opencode_paths
     # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
@@ -628,6 +696,7 @@ main() {
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
+    build_net_isolation
     build_managed_config
     build_managed_skills
     build_home_tmpfs

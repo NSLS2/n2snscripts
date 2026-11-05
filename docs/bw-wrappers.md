@@ -17,6 +17,14 @@ option list; the tables below summarise the common surface.
 - `bash` >= 4.x (the wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0
   - 0.6.3+ enables bind-over-ro-bind binary masking
+- For the private network namespace, one of: `pasta` (package `passt`,
+  RHEL 9 and later), or `slirp4netns` >= 0.4.0 with libslirp >= 4.3.0
+  (package `slirp4netns`, RHEL 8 AppStream) and util-linux `unshare`; plus
+  `/dev/net/tun` and unprivileged user namespaces on the host. Without them
+  the wrappers stop (exit status 3) unless run with `--share-net` (see
+  [Network](#network)). `ss` (iproute) is used to find busy ports for
+  `--publish`; with slirp4netns, `--publish` also needs `python3` (or RHEL 8's
+  `/usr/libexec/platform-python`).
 
 ## Managed system paths
 
@@ -86,7 +94,7 @@ Every `bw*` wrapper accepts these options:
 | Option | Effect |
 | --- | --- |
 | `--help`, `-h` | Show wrapper help, then the underlying tool's help when the tool is installed |
-| `--dry-run` | Print the `bwrap` command without executing it |
+| `--dry-run` | Print the command (the network backend, the descriptor relay and `bwrap`) without executing it |
 | `--exec CMD [ARGS...]` | Run `CMD` inside the sandbox instead of the tool. `CMD` is split on whitespace; following arguments are passed unchanged, e.g. `--exec bash -c 'env \| sort'` |
 | `--init-auth` | Persist auth credentials to the host (first-time setup; not available in `bwopencode2`) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
@@ -95,6 +103,12 @@ Every `bw*` wrapper accepts these options:
 | `--n2c-token NAME` | Mount the N2C access token `NAME` read-only so skills in the sandbox can call NSLS-II APIs. May be repeated; `--n2c-token all` mounts every token present. Off by default. See [N2C access tokens](#n2c-access-tokens) |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 | `--no-sandbox-context` | Do not generate the [sandbox context file](#sandbox-context) that tells the agent what is mounted |
+| `--publish PORT[:SANDBOXPORT]` | Make a server in the sandbox reachable on the host at a per-user, per-session loopback address. May be repeated. See [Network](#network) |
+| `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`) for `--publish` instead of the derived address, for example `127.0.0.1` for OAuth redirects |
+| `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal:SANDBOXPORT`. May be repeated (pasta only) |
+| `--net-log FILE` | Log every network flow to `FILE` on the host (`pasta --debug`; pasta only) |
+| `--share-net` | Share the host network instead of a private namespace (the behaviour before private namespaces); not with the forwarding options |
+| `--net-backend pasta\|slirp4netns` | Use only this backend for the private namespace (normally pasta, else slirp4netns) |
 
 `--ro-path` and `--rw-path` may be nested: a path nested under another
 overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
@@ -224,12 +238,16 @@ and makes the tool load it.
   `bwrap` arguments, so the text always matches the session, including
   `--ro-path` / `--rw-path` mounts and a working directory outside `$HOME`.
 - **Mounted at `~/.sandbox/AGENTS.md`**, read-only, with `--ro-bind-data` on a
-  file descriptor. Nothing is written to the host, and no user file is
+  file descriptor (see [Descriptor relay](#descriptor-relay)). Nothing is
+  written to the host, and no user file is
   overwritten. `BWRAP_SANDBOX` (launcher name) and `BWRAP_SANDBOX_CONTEXT`
   (the path) are set in the sandbox for scripts and skills.
 - **Contents** (about 50 lines): `$HOME` is a tmpfs; same-inode files are bind
   mounts, not hard links, and are edited at their source; the working directory
   (its access taken from the effective mounts) and whether it is a git root; a
+  Network section (private namespace, DNS, the published ports with their host
+  URLs and the "bind `0.0.0.0`" rule, the host services under
+  `host.internal`); a
   table of every mount under `$HOME` marked `rw` / `ro` / `copy` (a writable
   copy of a host file, lost at exit) / `tmpfs`; the system mounts collapsed
   into one line each, with writable exceptions such as `--rw-path /usr/local`
@@ -257,13 +275,214 @@ files:
 `--exec` mounts the file and sets the two variables but adds no loader, since
 the command is not the agent.
 
-`--dry-run` prints the generated file after the command (the
-`--ro-bind-data` descriptor number is only meaningful in a real run).
+`--dry-run` prints the generated file after the command, with the other
+generated files (`/etc/resolv.conf`, `/etc/hosts`).
 `--no-sandbox-context` removes the file, the variables and the loader.
 
 To check by hand, ask the agent a question only the file can answer ("is a
 read-only file under `$HOME` with the same inode as a dotfiles file a hard
 link?"), or for Copilot run `bwcopilot instruction list`.
+
+## Network
+
+Every sandbox runs in its own network namespace, provided by the first usable
+backend:
+
+1. [pasta](https://passt.top) (package `passt`, RHEL 9 and later, Fedora);
+2. else [slirp4netns](https://github.com/rootless-containers/slirp4netns)
+   (package `slirp4netns`, RHEL 8 AppStream);
+3. else the launch **stops** (exit status 3), naming what is missing for each
+   backend, unless `--share-net` is given.
+
+So sandboxes are isolated by default, with one explicit escape hatch.
+
+- **Outbound connections work** (model gateway, package installs, docs). Egress
+  is not filtered.
+- **The host's loopback is unreachable.** Services bound to `127.0.0.1` on the
+  host (OpenCode's own server, language servers, CUPS, local databases, Tiled
+  or queueserver dev instances, other users' sessions) cannot be reached from
+  the sandbox, and `ss -ltn` inside shows only the sandbox's own sockets.
+  `127.0.0.1` inside is the sandbox's private loopback.
+- **Nothing the agent listens on is reachable from the host**, unless
+  published (below).
+- **Not hidden:** host services bound to a non-loopback address (sshd on
+  `0.0.0.0:22`, the Tailscale address) stay reachable, as from any other
+  machine.
+- **`--share-net`** shares the host network instead: the behaviour before
+  private namespaces, for workflows that need the host's loopback services or
+  ports, or hosts where neither backend works. The host's `/etc/resolv.conf`
+  and `/etc/hosts` are mounted, host loopback services are reachable, sandbox
+  listeners are visible on the host, and the
+  [sandbox context file](#sandbox-context) says so. It cannot be combined with
+  the forwarding options or `--net-backend` (exit status 1). Prefer
+  `--host-port` / `--publish` for single ports.
+- **`--net-backend pasta|slirp4netns`** uses only that backend (no
+  fallthrough), for testing the slirp4netns path on a host with pasta, or for
+  diagnosis.
+
+`BWRAP_NET_BACKEND` in the sandbox is `pasta`, `slirp4netns` or `none`
+(`--share-net`).
+
+| | pasta | slirp4netns | `--share-net` |
+| --- | --- | --- | --- |
+| Address in the sandbox | the host's | `192.168.254.100` (IPv4 only) | the host's |
+| Outbound traffic leaves from | the host's address | the host's address | the host |
+| DNS | `169.254.1.1`, forwarded to the host's resolver | `192.168.254.3`, forwarded to the host's resolver | the host's `resolv.conf` |
+| `--publish`, `--publish-addr` | yes | yes (at most 64 ports) | no |
+| `--host-port`, `--net-log` | yes | no: the launch stops (exit 3) rather than drop them | no |
+| Speed | close to native | slower (user-mode TCP/IP); fine for API calls | native |
+
+With `--host-port` or `--net-log`, a host without a working pasta stops even
+if slirp4netns would work.
+
+DNS: the host's resolver is usually on loopback (`127.0.0.53`), so the sandbox
+gets a generated `/etc/resolv.conf` naming the backend's DNS address, which the
+backend forwards to the first nameserver in the host's `/etc/resolv.conf`
+(port 53 only), so split DNS (VPN, tailnet) keeps working. Only IPv4
+nameservers are supported; the wrapper warns when the host has none. The host's
+search domains are not passed on, so use fully qualified names. `/etc/hosts` is
+the host's file, plus `host.internal` when `--host-port` is used.
+
+### Opening ports
+
+Both directions are off by default, opt-in per port and per launch, and
+limited to loopback on both ends. Ports are `1024-65535`; a `LOW-HIGH` range
+is accepted, and a mapped range must have the same length.
+
+| Option | Direction | Host side | Sandbox side |
+| --- | --- | --- | --- |
+| `--publish PORT[:SANDBOXPORT]` | sandbox server → host | `127.H1.H2.S:PORT` (or `--publish-addr`) | the server on `SANDBOXPORT` (default `PORT`), which must listen on `0.0.0.0` |
+| `--host-port PORT[:SANDBOXPORT]` | host service → sandbox | `127.0.0.1:PORT` | `host.internal:SANDBOXPORT` (`127.0.42.1`, default `PORT`) |
+
+Forwards are printed to stderr at launch, so they stay in the scrollback above
+the TUI, and listed in the [sandbox context file](#sandbox-context). Inside the
+sandbox `BWRAP_NET_PUBLISH`, `BWRAP_NET_PUBLISH_ADDR`, `BWRAP_NET_HOST_PORTS`
+and `BWRAP_NET_HOST_ADDR` hold the same information.
+
+```text
+bwopencode2: network: private namespace (pasta); publish address 127.65.81.1
+bwopencode2: publish    http://127.65.81.1:8000/  ->  sandbox :8000  (bind 0.0.0.0 inside)
+bwopencode2: host-port  host 127.0.0.1:5432  ->  sandbox host.internal:5432  (host service sees a loopback client)
+```
+
+**`--publish`.** The host address is `127.H1.H2.S`: `H1.H2` comes from a hash
+of your uid (`H1` is 1-254, so `127.0.0.1`, `127.0.0.53` and `127.0.1.1` are
+never used), and `S` is the lowest session index (1-254) whose address has
+none of the requested ports in use. Two users publishing port 8000 get
+different addresses, a second sandbox of the same user gets the next index,
+and your own dev server on `127.0.0.1:8000` does not collide. The address is
+printed as a URL; there is no host name for it. Every `127/8` address is a
+secure context in browsers. The host port is bound for the whole session,
+whether or not a server runs. The server inside must bind `0.0.0.0` (or the
+interface address): both backends deliver forwarded connections to the namespace's
+interface, not its loopback; the context file tells the agent so. A port that
+something on the host already holds on every address (`0.0.0.0:PORT`) is
+refused at launch.
+
+**`--publish-addr ADDR`** replaces the derived address with `ADDR` (in
+`127.0.0.0/8`). Use `127.0.0.1` for OAuth flows whose registered redirect URI
+names it (some agent logins and MCP servers open a browser on the host that
+calls back into the sandbox). The launch then fails if a requested port is
+already in use on `ADDR`.
+
+**`--host-port`** makes one host loopback service visible in the sandbox as
+`host.internal`, so the agent's own `127.0.0.1:PORT` stays free (it can run its
+own Postgres on 5432 next to the host's). The host side is always
+`127.0.0.1`. Nothing checks that the host port is open or who owns it.
+**The host service sees a loopback client and may trust it** (no password for
+local connections, admin APIs): only forward services you would let the agent
+use. These host ports are refused outright: `631` (CUPS), `2375`-`2376`
+(Docker), `6000`-`6063` (X11), `41112` (Tailscale local API) and `49374`
+(OpenCode 2 service, which runs tools outside any sandbox); the list is
+`_NET_HOST_PORT_DENY` in the library.
+
+**Not access control.** Any local user can connect to any `127/8` address, so
+another user can reach your published ports; the per-user addresses prevent
+accidental collisions, not access. Restricting that by uid would need
+root-managed `nftables` rules.
+
+To list the sandbox publications on a host:
+`ss -ltn 'src 127.0.0.0/8' | grep -v ' 127\.0\.'`.
+
+### Network log
+
+`--net-log FILE` passes `--log-file FILE --debug` to pasta: every flow is
+logged on the host, which is the data needed to write an egress allowlist.
+pasta keeps the newest 1 MiB. The wrapper warns when `FILE` is inside a
+read-write mount of the sandbox, where the agent could change it.
+
+### Implementation notes: pasta
+
+- pasta runs outside bwrap, as you, and starts the sandbox. Default pasta
+  behaviour is overridden where it would re-expose the host's loopback:
+  `--no-map-gw` (the gateway address would otherwise map to the host's
+  loopback) and `-T none` / `-U none` (`auto` would forward every port bound
+  on the host's loopback into the namespace). `-t none` / `-u none` keep
+  inbound ports closed unless `--publish` is given.
+- pasta maps you to uid 0 in its user namespace, so bwrap runs the agent in a
+  nested user namespace as your real uid and gid (`--unshare-user --uid
+  --gid`); file ownership looks as before and the agent has no capabilities.
+- pasta renames the host to `pasta-<name>`; bwrap's `--unshare-uts
+  --hostname` restores the real name.
+- `--no-pidns` is passed when the installed pasta supports it (2026-09 and
+  later); older pasta adds a PID namespace, inside which bwrap nests its own.
+- `ping` may not work (ICMP depends on the host's `ping_group_range`).
+- Nested namespaces in the sandbox (rootless podman) still do not work.
+
+### Implementation notes: slirp4netns
+
+slirp4netns cannot start the sandbox; it attaches to an existing network
+namespace. The launch has two steps, and the launcher still `exec`s in the
+foreground, so the terminal, job control, the exit status and
+`--die-with-parent` behave as before:
+
+```text
+launcher ─┬─ helper (background): waits for the namespace, starts slirp4netns,
+          │    adds the --publish forwards, then releases the sandbox
+          └─ exec env -i ... unshare --user --map-root-user --net --
+               bash <descriptor relay> -- bwrap --unshare-user --uid --gid
+               --info-fd --block-fd --sync-fd ... -- <tool>
+```
+
+- **The tool does not start before the network is ready**: bwrap waits on
+  `--block-fd` until the helper writes to it.
+- **`unshare`, not bwrap's `--unshare-net`, creates the namespaces.** Because
+  bwrap mounts `/dev`, it nests the sandbox in a second user namespace inside
+  the one that owns the network namespace. slirp4netns joins the user
+  namespace of the process it is given, so it would have no rights over the
+  network. With `unshare` the launcher process itself holds a single user
+  namespace that owns the network namespace, and slirp4netns attaches to it.
+  `unshare` maps you to uid 0 there, so bwrap runs the agent as your real uid
+  and gid, as with pasta.
+- slirp4netns options: `--disable-host-loopback` (otherwise the gateway
+  address `192.168.254.2` reaches the host's `127.0.0.1` on every port),
+  `--cidr=192.168.254.0/24` (slirp's default, `10.0.2.0/24`, lies inside
+  BNL's 10/8), the built-in DNS at `.3` (forwards port 53 only, with libslirp
+  4.3.0 and later, which the launcher checks), `--mtu=65520`, and
+  `--enable-sandbox --enable-seccomp` when `/etc/resolv.conf` resolves inside
+  `/etc` or `/run`.
+- slirp4netns runs in its own session (Ctrl-C does not reach it) with a
+  scrubbed environment (no API keys). It exits when bwrap does: its
+  `--exit-fd` is the other end of bwrap's `--sync-fd`.
+- `--publish` uses slirp4netns's API socket (`add_hostfwd`, one request per
+  port). The socket is in a private `mktemp -d` directory under
+  `$XDG_RUNTIME_DIR`, removed once the forwards are added, so nothing else can
+  add forwards later.
+- **On a setup failure** (slirp4netns does not start, a port cannot be
+  published) the helper prints the reason and slirp4netns's last messages,
+  kills the still-waiting sandbox (its pid comes from bwrap's `--info-fd`), so
+  the tool never runs, and then bwrap. The exit status is then 137, not 3.
+
+### Descriptor relay
+
+bwrap reads some files from descriptors: `--file` for writable copies of
+credentials and config (`bwclaude`, `bwcopilot`, `bwcodex`), `--ro-bind-data`
+for generated files (the context file, `/etc/resolv.conf`, `/etc/hosts`).
+pasta closes every inherited descriptor above 2, so the launcher does not open
+them itself. It reserves their numbers; a short fixed bash script (the relay,
+`_BWRAP_FD_RELAY_SHIM`) runs as the command of pasta or `unshare`, opens each descriptor at its
+number, from the host file or from generated text carried in an environment
+variable that it then unsets, and execs bwrap. Nothing is staged on the host.
 
 ## Account check
 
@@ -437,9 +656,9 @@ Only an allowlist of harmless `OPENCODE_*` behaviour toggles (46 names) is
 forwarded from the host environment into the sandbox. **Behaviour change:**
 any other host `OPENCODE_*` variable is now dropped (previously all were
 passed). Sensitive or location-changing variables are deliberately excluded:
-`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` (the sandbox shares
-the host network, so an agent holding the password could drive an
-unsandboxed opencode server), `OPENCODE_API_KEY`, `OPENCODE_CONSOLE_TOKEN`,
+`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` (an agent holding the
+password and a route to an unsandboxed opencode server could drive it; the
+private network namespace normally gives no such route), `OPENCODE_API_KEY`, `OPENCODE_CONSOLE_TOKEN`,
 `OPENCODE_CONFIG*` / `OPENCODE_TUI_CONFIG` / `OPENCODE_PERMISSION` (inject
 config or permissions and bypass the managed config), `OPENCODE_AUTH_CONTENT`,
 `OPENCODE_DB` / `OPENCODE_*_DB`, `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH`,
@@ -561,9 +780,10 @@ run).
   `OPENCODE_DISABLE_FFF`, `OPENCODE_DISABLE_PROJECT_CONFIG`,
   `OPENCODE_LOG_LEVEL`, `OPENCODE_PRINT_LOGS`. The
   variables that matter most are the server passwords (`OPENCODE_PASSWORD`,
-  `OPENCODE_SERVER_PASSWORD`): the sandbox shares the host network, so an agent
-  holding one could connect to an unsandboxed server on port 49374 and run
-  tools outside the sandbox. Others dropped include `OPENCODE_SSH_ASKPASS_*`,
+  `OPENCODE_SERVER_PASSWORD`): an agent holding one, with a route to an
+  unsandboxed server on port 49374, could run tools outside the sandbox. The
+  private network namespace normally gives no such route, and `--host-port`
+  refuses 49374. Others dropped include `OPENCODE_SSH_ASKPASS_*`,
   `OPENCODE_EDITOR_SSE_PORT`, `OPENCODE_PTY_HANDOFF`, `OPENCODE_DB`,
   `OPENCODE_TEST_HOME`, `OPENCODE_CONFIG*`, `OPENCODE_MODELS_PATH`/`_URL`, and
   `OPENCODE_API_KEY`. With `--dry-run`, the names (never the values) of the
@@ -572,9 +792,10 @@ run).
 ### `--standalone` is enforced
 
 By default OpenCode 2 connects to a shared background service (fixed port
-49374) that survives the CLI and runs tools **outside** any sandbox. The
-sandbox shares the host network, so a CLI started normally would hand tool
-execution to that unsandboxed server. `bwopencode2` therefore:
+49374) that survives the CLI and runs tools **outside** any sandbox. A CLI
+started normally would hand tool execution to that unsandboxed server. The
+sandbox's private network namespace already keeps the host's loopback, and so
+the service, out of reach; as a second line of defence `bwopencode2`:
 
 - adds `--standalone` (a private in-process server inside the sandbox) when
   `opencode2` is started with no subcommand or a directory argument, or with
@@ -701,7 +922,7 @@ Additional options:
 | Option | Effect |
 | --- | --- |
 | `--debug` | Enable verbose Codex logging (sets `RUST_LOG=debug`) |
-| `--persist-config` | Bind-mount `~/.codex/config.toml` read-write into the sandbox so changes (e.g. project-trust grants) persist across sessions. Without this flag, `config.toml` is staged read-write into a per-session copy that is discarded on exit. Concurrent `--persist-config` sessions may race on writes |
+| `--persist-config` | Bind-mount `~/.codex/config.toml` read-write into the sandbox so changes (e.g. project-trust grants) persist across sessions. Without this flag, `config.toml` is copied read-write into the sandbox's tmpfs for the session and the copy is discarded on exit. Concurrent `--persist-config` sessions may race on writes |
 
 Note: Codex CLI also enforces its own inner Landlock-based sandbox for
 agent tool calls. The outer `bwrap` here is complementary — it scopes
@@ -712,5 +933,8 @@ the entire Codex process tree, not just agent-issued commands.
 Shared sandbox-building primitives sourced by all `bw*` wrappers. Not
 intended to be executed directly. The library header documents the
 public function surface (sandbox construction, dynamic mount discovery,
-binary masking, environment scrubbing, and `build_sandbox_context` with its
-`SANDBOX_CONTEXT_*` variables; see [Sandbox context](#sandbox-context)).
+binary masking, environment scrubbing, `build_sandbox_context` with its
+`SANDBOX_CONTEXT_*` variables (see [Sandbox context](#sandbox-context)), and
+the network functions `detect_net_capabilities`, `net_add_publish`,
+`net_add_host_port`, `net_set_publish_addr`, `net_set_log_file`,
+`net_print_help` and `build_net_isolation` (see [Network](#network)).
