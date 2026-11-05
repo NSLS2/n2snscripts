@@ -32,11 +32,10 @@ readonly SCRIPT_DIR
 # /usr/local/bin, where npm installs them.
 readonly AGENT_PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
-declare -A AGENT_WRAPPERS=(
-    [opencode]=bwopencode
-    [opencode2]=bwopencode2
-    [claude]=bwclaude
-)
+# The agents that may be started, and the wrapper each one runs in. On one
+# line because shfmt's keep_padding indents a multi-line array one space
+# further on every run, so it never settles and CI never goes green.
+declare -A AGENT_WRAPPERS=([opencode]=bwopencode [opencode2]=bwopencode2 [claude]=bwclaude)
 
 # Installed by the n2c_agent role; see its defaults in NSLS2/ansible.
 readonly AIFAPIM_KEY_PATH=/etc/nsls2/agent/aifapim/key
