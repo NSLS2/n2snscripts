@@ -23,6 +23,10 @@ readonly PROGRAM_NAME="${0##*/}"
 SCRIPT_DIR="$(cd -P -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd -P)"
 readonly SCRIPT_DIR
 
+# The wrappers find their agent by name, and sudo's secure_path does not hold
+# /usr/local/bin, where npm installs them.
+readonly AGENT_PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
 declare -A AGENT_WRAPPERS=(
     [opencode]=bwopencode
     [opencode2]=bwopencode2
@@ -34,6 +38,12 @@ readonly AIFAPIM_KEY_PATH=/etc/nsls2/agent/aifapim/key
 readonly AGENT_CREDS_DIR=/run/nsls2/agent/creds
 readonly AIFAPIM_GATEWAY_HOST=aifapim.nsls2.bnl.gov # gitleaks:allow
 readonly ACCOUNT_CHECK=/opt/nsls2/libexec/agent-account-check
+
+# A tmpfs the host setup role mounts, so nothing the agent writes outside the
+# caller's agent directory survives a reboot. The wrappers need it to exist
+# before they start: they create their authoring directories under it on the
+# host and bind-mount those into the sandbox.
+readonly AGENT_HOME=/home/xfagent
 
 die() {
     echo "${PROGRAM_NAME}: $*" >&2
@@ -95,6 +105,8 @@ main() {
     [[ -d "${agent_dir}" ]] || die "'${agent_dir}' does not exist; the host setup role creates it"
     [[ -w "${agent_dir}" ]] || die "'${agent_dir}' is not writable by this account; check its ACL"
 
+    [[ -w "${AGENT_HOME}" ]] || die "'${AGENT_HOME}' is not writable; the host setup role mounts it"
+
     # Passed in the environment because that is how the wrappers take it; the
     # file itself is never mounted.
     local key
@@ -110,6 +122,8 @@ main() {
     export N2SN_CREDS_DIR="${AGENT_CREDS_DIR}"
     export AIFAPIM_HOST="${AIFAPIM_GATEWAY_HOST}"
     export AIFAPIM_API_KEY="${key}"
+    export PATH="${AGENT_PATH}"
+    export HOME="${AGENT_HOME}"
 
     cd "${agent_dir}" || die "cannot enter '${agent_dir}'"
     exec "${SCRIPT_DIR}/${wrapper}" --n2c-token all

@@ -39,6 +39,16 @@ adds them is only read by a login shell.
 - **The working directory.** `~<calling user>/agent`, which must exist and be
   writable by the agent account. The host setup role creates it and gives the
   agent account traverse-only access to the home above it.
+- **`HOME`.** `/home/xfagent`, a tmpfs the host setup role mounts. The wrappers
+  create their authoring directories (`~/.config/opencode/{skills,agents,commands}`)
+  there on the host before bind-mounting them into the sandbox, so it has to
+  exist and be writable. On a tmpfs nothing the agent writes outside the
+  caller's agent directory survives a reboot. It cannot be the working
+  directory itself: a wrapper refuses to run where the working directory is
+  `$HOME` or above it, because that would mount the whole home tree.
+- **`PATH`.** `sudo` replaces it with its `secure_path`, which does not hold
+  `/usr/local/bin`, where the agents are installed, so the wrappers would not
+  find them.
 
 Both the key and the tokens come from the `n2c_agent` role in NSLS2/ansible.
 
