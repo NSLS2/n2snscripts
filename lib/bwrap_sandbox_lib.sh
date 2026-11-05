@@ -17,7 +17,10 @@
 # Tool-specific wrapper scripts source this file and provide:
 #   - Argument parsing (parse_wrapper_args) — must handle --ro-path/--rw-path
 #     and accumulate values into the shared EXTRA_RO_PATHS/EXTRA_RW_PATHS arrays
-#   - Binary resolution: call bwrap_resolve_tool NAME [HINT] (sets _TOOL_BIN and _TOOL_CMD)
+#   - Binary resolution: call bwrap_resolve_tool NAME [HINT] (sets _TOOL_BIN and _TOOL_CMD),
+#     or, for a launcher that runs an arbitrary command (bwrun), set _TOOL_BIN
+#     (the absolute path, mounted and put on PATH by build_dynamic_tool_mounts)
+#     and _TOOL_CMD (the command to run) directly
 #   - Help text (show_help)
 #   - Tool-specific path resolution, host directory creation, mounts, and env vars
 #   - main() orchestrating the build sequence — must call build_extra_path_mounts

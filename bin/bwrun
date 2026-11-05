@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# bwrun — Run an arbitrary command inside a bubblewrap (bwrap) sandbox.
+#
+# The command gets the same sandbox as the AI agent wrappers (bwclaude,
+# bwcodex, bwcopilot, bwopencode, bwopencode2) but none of their agent state:
+# no agent config directories, credentials, authoring directories, gateway
+# keys or agent environment variables are mounted or forwarded.
+#
+# Requires: bwrap >= 0.4.0 (RHEL 8)
+#   - 0.4.0: base functionality
+#   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+#
+# The sandbox provides filesystem isolation:
+#   - Current directory (or its git root): read-write
+#   - $HOME: empty tmpfs
+#   - Git config + includes: read-only
+#   - Pixi cache: read-write
+#   - Pixi config: read-only
+#   - ccache config: read-only
+#   - ccache cache: read-write
+#   - npm config: read-only
+#   - npm cache: read-write
+#   - System and user binaries: read-only
+#   - The directory of the command (and of its symlink target): read-only
+#   - SSH binaries: masked (ssh, scp, sftp, ssh-agent, etc.)
+#   - Network tools: masked (telnet, nc/ncat, socat, rsync, rsh)
+#   - Kerberos tools: masked (kinit, klist, kdestroy, kswitch)
+#   - Privilege escalation: masked (sudo, su, pkexec)
+#   - Namespace tools: masked (nsenter, unshare, chroot)
+#   - Keyring tools: masked (keyctl)
+#   - SSH/GPG agent env vars: stripped
+#   - ~/.bashrc and other shell rc files: not mounted
+#
+# Usage:
+#   bwrun [bwrun-options] [--] [COMMAND [ARGS...]]
+#   bwrun --help
+#
+# COMMAND and ARGS are passed to the sandbox unchanged (no word splitting).
+# Option parsing stops at the first argument that is not a bwrun option, or at
+# `--`.  Without a COMMAND an interactive shell is started.
+#
+# Options:
+#   --help, -h      Show this help.
+#   --dry-run       Print the bwrap command that would be executed without running it.
+#   --new-session   Force bwrap --new-session even on kernels with the TIOCSTI cap
+#                   guard.  Detaches the controlling tty for stricter isolation at the
+#                   cost of SIGWINCH (terminal resize) propagation.
+#   --github-tokens Forward GH_TOKEN_* variables so gh(1) can authenticate inside
+#                   the sandbox.  Off by default.
+#   --n2c-token NAME  Mount the N2C access token NAME read-only (for NSLS-II API
+#                   access).  May be repeated; `all` mounts every token present.
+#                   Off by default.  The refresh token is never mounted.
+#   --ro-path PATH  Mount PATH read-only into the sandbox.  May be repeated to
+#                   accumulate multiple paths.  Dangerous paths are blocked:
+#                   $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws, ~/.kube,
+#                   ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler, ~/.yarnrc,
+#                   ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
+#                   $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
+#                   /etc/sudoers{,.d}.
+#   --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated to
+#                   accumulate multiple paths.  Same blocked-path rules as --ro-path.
+#                   A nested --ro-path/--rw-path overrides the one it sits under,
+#                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
+#   --no-sandbox-context
+#                   Do not generate the sandbox context file (see below).
+#
+# Sandbox context: a short markdown file describing this sandbox (what is
+# mounted read-only or read-write, what is lost at exit, which tools are
+# disabled) is built from the final mounts and mounted read-only at
+# ~/.sandbox/AGENTS.md, and BWRAP_SANDBOX / BWRAP_SANDBOX_CONTEXT are set.
+# Nothing loads the file automatically; it is there for a program (for
+# example an agent that has no launcher of its own) that wants to read it.
+
+set -euo pipefail
+
+# Source the shared sandbox library.
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=../lib/bwrap_sandbox_lib.sh
+source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
+
+# ═══════════════════════════════════════════════════════════════════
+# Tool-specific state
+# ═══════════════════════════════════════════════════════════════════
+
+FORWARD_GH_TOKENS=0
+# The command as given on the command line (empty: start a shell).
+RUN_CMD=""
+
+# ═══════════════════════════════════════════════════════════════════
+# Tool-specific functions
+# ═══════════════════════════════════════════════════════════════════
+
+parse_wrapper_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help | -h)
+                SHOW_HELP=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --github-tokens)
+                FORWARD_GH_TOKENS=1
+                shift
+                ;;
+            --new-session)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh (build_base_sandbox)
+                FORCE_NEW_SESSION=1
+                shift
+                ;;
+            --n2c-token)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --n2c-token requires a token name or 'all'." >&2
+                    exit 1
+                fi
+                add_n2c_token "$2"
+                shift 2
+                ;;
+            --no-sandbox-context)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+                SANDBOX_CONTEXT_ENABLED=0
+                shift
+                ;;
+            --ro-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --ro-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RO_PATHS+=("$2")
+                shift 2
+                ;;
+            --rw-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --rw-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RW_PATHS+=("$2")
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                # Unlike the agent wrappers, nothing here can be an argument
+                # of "the tool", so an unknown option is a mistake, not a
+                # command to run.  Use `--` to run a command that starts
+                # with a dash.
+                echo "Error: unknown option '$1' (use -- before a command that starts with '-')." >&2
+                echo "Try: bwrun --help" >&2
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ $# -gt 0 ]]; then
+        RUN_CMD="$1"
+        shift
+    fi
+    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
+    TOOL_ARGS=("$@")
+}
+
+show_help() {
+    cat << 'HELP_EOF'
+bwrun — run a command inside a bubblewrap sandbox
+
+Usage:
+  bwrun [options] [--] [COMMAND [ARGS...]]
+
+Runs COMMAND with the same sandbox the AI agent wrappers (bwclaude, bwcodex,
+bwcopilot, bwopencode, bwopencode2) use, without any agent state: no agent
+configuration, credentials or API keys are mounted or forwarded.
+
+COMMAND and ARGS are passed through unchanged (they are not split on
+whitespace), for example:
+  bwrun make test
+  bwrun bash -c 'env | sort'
+  bwrun -- -odd-name arg
+Without a COMMAND an interactive shell is started.  Options are only
+recognised before COMMAND; use -- to run a command whose name starts with '-'.
+
+Options:
+  -h, --help      Show this message.
+  --dry-run       Print the bwrap command that would be run, then exit.
+  --new-session   Force bwrap to call setsid(2), detaching the sandbox from the
+                  controlling terminal.  This is the default on older kernels
+                  (< 5.14); on newer kernels we omit it so that SIGWINCH (terminal
+                  resize) propagates from tmux/screen.  Use this flag to opt back
+                  into stricter terminal isolation when SIGWINCH is not important.
+  --n2c-token NAME
+                  Mount the N2C access token NAME (read-only) so the command can
+                  call NSLS-II APIs.  May be repeated; `--n2c-token all` mounts
+                  every token present.  Off by default: no token is mounted unless
+                  asked for.  Tokens are written on the host by `n2c-token`
+                  (run `n2c-token login` first); the refresh token is never
+                  mounted.  A missing token only warns.
+  --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
+                  May be repeated to accumulate multiple extra paths.
+                  Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
+                  ~/.kube, ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler,
+                  ~/.yarnrc, ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
+                  $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
+                  /etc/sudoers{,.d}.
+                  Symlinks are resolved before the safety check is applied.
+  --rw-path PATH  Mount PATH (file or directory) read-write into the sandbox.
+                  Same blocked-path rules as --ro-path.  May be repeated.
+                  --ro-path/--rw-path may nest: a nested path overrides the one
+                  it sits under, so `--rw-path DIR --ro-path DIR/sub` keeps DIR
+                  writable but DIR/sub read-only.
+  --github-tokens Forward any GH_TOKEN_* environment variables into the
+                  sandbox so the command can authenticate the gh(1) CLI.
+                  Off by default.  When set, use per-command token selection:
+                    GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo
+  --no-sandbox-context
+                  Do not mount the sandbox description.  By default a short
+                  description of what is mounted (read-only or read-write), what
+                  is lost at exit and which tools are disabled is mounted at
+                  ~/.sandbox/AGENTS.md (nothing loads it automatically).
+                  Use --dry-run to see it.
+
+Environment:
+  Only a small allowlist of host variables (terminal, locale, XDG, proxy,
+  editor, git identity, pixi/npm/ccache locations) is passed in.  To set a
+  variable for one command use env:  bwrun env FOO=bar mycommand
+
+The working directory (or its git root) is mounted read-write; the directory
+holding COMMAND is mounted read-only when it is not already visible.
+Exit status is that of COMMAND.
+HELP_EOF
+    exit 0
+}
+
+# Resolve RUN_CMD to an absolute path on the host and set the globals the
+# library reads: _TOOL_BIN (mounted and added to PATH by
+# build_dynamic_tool_mounts) and _TOOL_CMD (the command that is run).
+# Without a command, run the sandbox shell.  Must run after
+# resolve_common_paths (needs _PWD) and detect_shell (needs SANDBOX_SHELL).
+resolve_run_command() {
+    if [[ -z "${RUN_CMD}" ]]; then
+        _TOOL_BIN="${SANDBOX_SHELL}"
+        _TOOL_CMD=("${SANDBOX_SHELL}")
+        return 0
+    fi
+
+    local _bin
+    if [[ "${RUN_CMD}" == */* ]]; then
+        # A path: make it absolute without resolving symlinks (the library
+        # resolves them when mounting).
+        case "${RUN_CMD}" in
+            /*) _bin="${RUN_CMD}" ;;
+            *) _bin="${_PWD}/${RUN_CMD}" ;;
+        esac
+    else
+        # `type -P` skips builtins, functions and aliases (`command -v true`
+        # would answer "true"): only an executable file can run in the
+        # sandbox.  Honour N2SNSCRIPTS_TOOL_EXCLUDE_PATH like bwrap_find_tool.
+        _bin="$(
+            if [[ -n "${N2SNSCRIPTS_TOOL_EXCLUDE_PATH:-}" ]]; then
+                _bwrap_filter_path || exit 0
+                PATH="${_BWRAP_FILTERED_PATH}"
+            fi
+            type -P -- "${RUN_CMD}" 2> /dev/null || true
+        )"
+        if [[ "${_bin}" != /* ]]; then
+            echo "Error: '${RUN_CMD}' not found in PATH." >&2
+            exit 1
+        fi
+    fi
+
+    if [[ -d "${_bin}" ]]; then
+        echo "Error: '${RUN_CMD}' is a directory." >&2
+        exit 1
+    fi
+    if [[ ! -e "${_bin}" ]]; then
+        echo "Error: '${RUN_CMD}' does not exist." >&2
+        exit 1
+    fi
+    if [[ ! -x "${_bin}" ]]; then
+        echo "Error: '${RUN_CMD}' is not executable." >&2
+        exit 1
+    fi
+
+    _TOOL_BIN="${_bin}"
+    _TOOL_CMD=("${_bin}")
+}
+
+# ── Environment ──────────────────────────────────────────────────
+build_run_env() {
+    # GitHub CLI token passthrough (opt-in via --github-tokens).  In
+    # --dry-run, print_dry_run redacts the values (the names match *TOKEN*).
+    if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
+        forward_env_by_prefix GH_TOKEN_
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════
+
+main() {
+    bwrap_check_account
+    parse_wrapper_args "$@"
+
+    if [[ "${SHOW_HELP}" -eq 1 ]]; then
+        show_help
+        # show_help never returns
+    fi
+
+    detect_bwrap_capabilities
+    detect_kernel_capabilities
+    resolve_common_paths
+    detect_shell
+    resolve_run_command
+    parse_all_git_includes
+    init_sandbox_path
+
+    # Build bwrap argument list.  Nothing is created on the host, so there is
+    # no ensure_host_dirs step and --dry-run needs no special handling.
+    build_base_sandbox
+    build_proc_dev_tmp
+    build_sys_mounts
+    build_etc_mounts
+    build_home_tmpfs
+    build_workdir_mount
+    build_git_mounts
+    build_pixi_mounts
+    build_ccache_mounts
+    build_npm_mounts
+    build_user_bin_mount
+    build_nsls2_mount
+    build_dynamic_tool_mounts
+    build_n2c_token_mounts
+    build_extra_path_mounts
+
+    # Environment variables
+    build_env_vars
+    build_run_env
+
+    # Sandbox context: mounted only; no loader (bwrun does not run an agent).
+    # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+    SANDBOX_CONTEXT_NOTES=(
+        "Started by \`bwrun\`: the command runs with the standard sandbox and none of an agent's configuration, credentials or API keys."
+    )
+    build_sandbox_context bwrun
+
+    # Mask dangerous binaries as the very last step: a mask is hidden by any
+    # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
+    build_binary_masks
+
+    # Launch
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        print_dry_run
+    else
+        launch_sandbox
+    fi
+}
+
+main "$@"

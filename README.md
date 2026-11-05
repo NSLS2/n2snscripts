@@ -24,10 +24,11 @@ docs/   Per-script and per-library documentation
 | `bwcopilot` | GitHub Copilot CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwopencode` | OpenCode in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwopencode2` | OpenCode 2 (`opencode2`) in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
+| `bwrun` | Any command in the same bubblewrap sandbox, without agent state | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `gh-protect-branch` | Apply NSLS-II standard branch protection to a GitHub repo (all branches); enables secret scanning and push protection; optionally restricts branch creation to named patterns | [docs/gh-protect-branch.md](docs/gh-protect-branch.md) |
 | `pemdecompose` | List and verify certificates in a PEM file | [docs/pemdecompose.md](docs/pemdecompose.md) |
 
-All `bw*` wrappers share `lib/bwrap_sandbox_lib.sh` for sandbox construction.
+All `bw*` wrappers (including `bwrun`) share `lib/bwrap_sandbox_lib.sh` for sandbox construction.
 
 ### `lib/`
 
@@ -85,6 +86,7 @@ bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 bwclaude   [bwclaude-options]   [claude arguments...]
 bwcopilot  [bwcopilot-options]  [copilot arguments...]
 bwcodex    [bwcodex-options]    [codex arguments...]
+bwrun      [bwrun-options] [--] [command [arguments...]]
 ```
 
 Common wrapper options:
@@ -99,6 +101,13 @@ Common wrapper options:
 | `--ro-path PATH`, `--rw-path PATH` | Mount an existing path read-only / read-write (may be repeated and nested) |
 | `--github-tokens` | Forward `GH_TOKEN_*` variables so `gh` can authenticate inside the sandbox (off by default) |
 | `--no-sandbox-context` | Do not tell the agent about the sandbox (by default a short description of the mounts is added to its instructions) |
+
+`bwrun` runs any command in the same sandbox with no agent state (config,
+credentials, API keys). It passes the command's arguments unchanged, starts a
+shell when none is given, has no `--exec` and no `--init-auth`, and accepts only
+`--help`, `--dry-run`, `--new-session`, `--ro-path`, `--rw-path`, `--n2c-token`,
+`--github-tokens` and `--no-sandbox-context`; e.g.
+`bwrun --ro-path /data make test`.
 
 `bwclaude` also supports `--debug`. `bwopencode2` has no `--init-auth` (sign-in
 persists in its data directory), always runs OpenCode 2 with `--standalone`

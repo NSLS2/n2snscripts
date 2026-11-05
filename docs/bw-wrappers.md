@@ -5,8 +5,9 @@ The `bw*` wrappers in `bin/` run AI CLI tools inside a [bubblewrap][bwrap]
 masked privileged binaries, ephemeral auth on shared accounts, and
 filesystem isolation from the rest of the host. See the NSLS-II
 coding-agents documentation for the policy these wrappers implement.
+`bwrun` puts any other command in the same sandbox, without agent state.
 
-All five wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
+All six wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
 for sandbox construction. Each wrapper's `--help` is the authoritative
 option list; the tables below summarise the common surface.
 
@@ -81,7 +82,8 @@ top-level entry created in the sandbox is discarded on exit.
 
 ## Common options
 
-Every `bw*` wrapper accepts these options:
+Every `bw*` wrapper accepts these options, except where the note below the
+table says otherwise (`bwrun` accepts only the ones listed in its section):
 
 | Option | Effect |
 | --- | --- |
@@ -104,7 +106,8 @@ rejected. The masks on privileged binaries are the very last step, applied after
 other mounts and the environment setup, so a path that covers their directory
 (for example `--ro-path /usr`) does not undo them.
 
-Tool-specific options are listed in each wrapper's section below.
+Tool-specific options are listed in each wrapper's section below. `bwrun` has
+no `--exec` (the command is its argument) and no `--init-auth`.
 
 ## N2C access tokens
 
@@ -255,7 +258,7 @@ files:
 | `bwcopilot` | `COPILOT_CUSTOM_INSTRUCTIONS_DIRS=~/.sandbox`; Copilot reads that directory's `AGENTS.md` in addition to its usual files | A host value is not forwarded (it never was), so nothing is replaced |
 
 `--exec` mounts the file and sets the two variables but adds no loader, since
-the command is not the agent.
+the command is not the agent. `bwrun` does the same for its command.
 
 `--dry-run` prints the generated file after the command (the
 `--ro-bind-data` descriptor number is only meaningful in a real run).
@@ -706,6 +709,54 @@ Additional options:
 Note: Codex CLI also enforces its own inner Landlock-based sandbox for
 agent tool calls. The outer `bwrap` here is complementary — it scopes
 the entire Codex process tree, not just agent-issued commands.
+
+## `bwrun`
+
+Runs any command inside the same sandbox as the agent wrappers, with none of
+their agent state.
+
+```text
+bwrun [bwrun-options] [--] [COMMAND [ARGS...]]
+```
+
+```bash
+bwrun make test
+bwrun bash -c 'env | sort'
+bwrun --rw-path /scratch/data --ro-path /scratch/data/raw python3 analyse.py
+bwrun                       # interactive shell in the sandbox
+```
+
+- **Arguments are passed unchanged.** Unlike `--exec` of the agent wrappers,
+  `COMMAND` is not split on whitespace. Options are recognised only before
+  `COMMAND`; use `--` to run a command whose name starts with `-`. An unknown
+  option before the command is an error rather than a command.
+- **No command** starts an interactive shell (`bash` from `PATH`, else
+  `/bin/sh`).
+- **Finding the command.** A name is looked up in the host `PATH` (honouring
+  `N2SNSCRIPTS_TOOL_EXCLUDE_PATH`); a name with a `/` is used as given, relative
+  to the working directory. Its directory, and the directory of its symlink
+  target, are mounted read-only when they are not already visible, and the
+  directory is added to the sandbox `PATH`, like the agent binary in the other
+  wrappers. Builtins and shell functions cannot be run (use `bwrun bash -c ...`).
+- **Exit status** is the command's: the wrapper replaces itself with `bwrap`.
+- **Same sandbox.** Working directory (or git root) read-write, `$HOME` a
+  tmpfs, read-only git, npm, pixi and ccache configuration, read-write caches,
+  privileged binaries masked, SSH/GPG agent variables stripped, and the same
+  [account check](#account-check).
+- **Nothing agent-specific.** No agent config, credentials, authoring
+  directories, gateway keys (`AIFAPIM_*`) or `OPENCODE_*` / `CLAUDE_*`
+  variables are mounted or forwarded, and nothing is created on the host.
+- **Environment.** Only the allowlist the other wrappers use is passed in
+  (terminal, locale, XDG, proxy, editor, git identity, pixi/npm/ccache
+  locations). To set a variable for one command use `env`:
+  `bwrun env FOO=bar mycommand`.
+- **Sandbox context.** The [context file](#sandbox-context) is mounted at
+  `~/.sandbox/AGENTS.md` (`BWRAP_SANDBOX=bwrun`) unless `--no-sandbox-context`
+  is given. Nothing loads it automatically.
+
+Options: `--help`, `--dry-run`, `--new-session`, `--ro-path`, `--rw-path`,
+`--n2c-token`, `--github-tokens` and `--no-sandbox-context`, as described in
+[Common options](#common-options). `--help` shows only the wrapper's own help.
 
 ## `lib/bwrap_sandbox_lib.sh`
 
