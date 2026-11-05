@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+#
+# bl-agent — start a beamline coding agent as the agent service account.
+#
+# Beamline staff do not run the bw* launchers as the agent account directly.
+# They run
+#
+#     sudo -u xfagent /opt/nsls2/scripts/bin/bl-agent opencode2
+#
+# and this script decides everything the agent sees: the AI gateway key, the
+# NSLS-II API tokens, the writable directory and the instructions. Nothing is
+# passed through from the caller, so a caller cannot widen the sandbox with
+# --exec, --rw-path, --ro-path or --n2c-token. Only the agent name is taken
+# from the command line, and only from a fixed list.
+#
+# The calling user, the host and the agent are logged to syslog before the
+# agent starts, so an action can be traced back to a person even though the
+# agent runs as a shared account.
+#
+# Requires: the n2c_agent ansible role (the gateway key and the token minter),
+# and the base role (the bw* launchers and the account check).
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly PROGRAM_NAME="${0##*/}"
+
+# Agents this launcher knows, and the wrapper each one runs. Adding a name
+# here is the only way to make it available.
+declare -A AGENT_WRAPPERS=(
+    [opencode]=bwopencode
+    [opencode2]=bwopencode2
+    [claude]=bwclaude
+)
+
+# Where the n2c_agent role puts the gateway key and the minted tokens. The
+# defaults match roles/n2c_agent/defaults/main.yml in NSLS2/ansible.
+readonly AIFAPIM_KEY_PATH="${BL_AGENT_AIFAPIM_KEY_PATH:-/etc/nsls2/agent/aifapim/key}"
+readonly AGENT_CREDS_DIR="${BL_AGENT_CREDS_DIR:-/run/nsls2/agent/creds}"
+readonly AIFAPIM_GATEWAY_HOST="${BL_AGENT_AIFAPIM_HOST:-aifapim.nsls2.bnl.gov}" # gitleaks:allow
+
+readonly ACCOUNT_CHECK=/opt/nsls2/libexec/agent-account-check
+
+die() {
+    echo "${PROGRAM_NAME}: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: sudo -u <agent-account> ${PROGRAM_NAME} <agent>
+
+Start a beamline coding agent in its sandbox. The agent runs as the account
+this is invoked as, reads the beamline's AI gateway key and the NSLS-II API
+tokens kept by the host, and may write only in the calling user's agent
+directory.
+
+Agents:
+$(printf '  %s\n' "${!AGENT_WRAPPERS[@]}" | sort)
+
+No other options are accepted: this launcher, not the caller, decides what
+the agent can reach.
+EOF
+}
+
+# calling_user
+#   The person who invoked sudo. SUDO_USER is set by sudo and is the name of
+#   the user who ran it, which is what the audit line and the writable
+#   directory are based on.
+calling_user() {
+    local user="${SUDO_USER:-}"
+    [[ -n "${user}" ]] || die "SUDO_USER is not set; run this with sudo -u <agent-account> ${PROGRAM_NAME} <agent>"
+    [[ "${user}" != "root" ]] || die "refusing to run for root"
+    printf '%s\n' "${user}"
+}
+
+# agent_home_dir USER
+#   The writable directory for USER, created by the host setup role. The agent
+#   works in a clone here and a person moves changes into the live profile.
+agent_home_dir() {
+    local user="$1" home
+    home="$(getent passwd "${user}" | cut -d: -f6)"
+    [[ -n "${home}" ]] || die "cannot find the home directory of '${user}'"
+    printf '%s/agent\n' "${home}"
+}
+
+main() {
+    [[ $# -ge 1 ]] || {
+        usage >&2
+        exit 1
+    }
+
+    case "$1" in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+    esac
+
+    local agent="$1"
+    shift
+    [[ $# -eq 0 ]] || die "no options are accepted after the agent name (got: $*)"
+
+    local wrapper="${AGENT_WRAPPERS[${agent}]:-}"
+    [[ -n "${wrapper}" ]] || die "unknown agent '${agent}'. Known agents: $(printf '%s ' "${!AGENT_WRAPPERS[@]}" | sort | tr -d '\n')"
+
+    # The same check the bw* launchers run. It is advisory there; running it
+    # here as well means a refusal is reported before anything is set up.
+    if [[ -x "${ACCOUNT_CHECK}" ]]; then
+        "${ACCOUNT_CHECK}" || exit $?
+    fi
+
+    local user agent_dir
+    user="$(calling_user)"
+    agent_dir="$(agent_home_dir "${user}")"
+    [[ -d "${agent_dir}" ]] || die "'${agent_dir}' does not exist; the host setup role creates it"
+    [[ -w "${agent_dir}" ]] || die "'${agent_dir}' is not writable by this account; check its ACL"
+
+    [[ -r "${AIFAPIM_KEY_PATH}" ]] || die "cannot read the AI gateway key '${AIFAPIM_KEY_PATH}'; is this a beamline host with the n2c_agent role?"
+
+    # The key is read here and passed in the environment, because the wrappers
+    # take it as AIFAPIM_API_KEY. The file itself is never mounted.
+    local aifapim_key
+    aifapim_key="$(< "${AIFAPIM_KEY_PATH}")"
+    [[ -n "${aifapim_key}" ]] || die "the AI gateway key '${AIFAPIM_KEY_PATH}' is empty"
+
+    logger -t "${PROGRAM_NAME}" -p auth.notice \
+        "agent start: user=${user} host=$(hostname -s) agent=${agent} wrapper=${wrapper} dir=${agent_dir}" ||
+        true
+
+    # N2SN_CREDS_DIR points the wrapper at the tokens the root minter keeps,
+    # instead of a per-user n2c-token session this account does not have.
+    export N2SN_CREDS_DIR="${AGENT_CREDS_DIR}"
+    export AIFAPIM_HOST="${AIFAPIM_GATEWAY_HOST}"
+    export AIFAPIM_API_KEY="${aifapim_key}"
+
+    cd "${agent_dir}" || die "cannot enter '${agent_dir}'"
+
+    # --n2c-token all mounts every token the minter keeps, read-only, one file
+    # each; a token the account cannot read is skipped by the wrapper.
+    exec "${wrapper}" --n2c-token all
+}
+
+main "$@"
