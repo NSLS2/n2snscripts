@@ -3483,16 +3483,25 @@ resolve_env_bin() {
 #     2. otherwise the distribution's /usr/bin/bwrap.
 #   The resolved file must be owned by root and not writable by group or
 #   others; anything else is refused.  Exits with an error otherwise.
+#
+#   The checks use /usr/bin/readlink and /usr/bin/stat by absolute path: a
+#   readlink or stat found through PATH could be planted in a user-writable
+#   directory and report a fabricated owner and mode.
 resolve_bwrap_bin() {
     local _cand _real _stat _owner _mode
+    local _readlink=/usr/bin/readlink _stat_bin=/usr/bin/stat
+    if [[ ! -x "${_readlink}" || ! -x "${_stat_bin}" ]]; then
+        echo "Error: ${_readlink} and ${_stat_bin} are required to validate bwrap." >&2
+        exit 1
+    fi
     for _cand in /opt/nsls2/bin/bwrap /usr/bin/bwrap; do
         [[ -e "${_cand}" ]] || continue
-        _real="$(readlink -f "${_cand}")"
+        _real="$("${_readlink}" -f "${_cand}")"
         [[ -n "${_real}" && -f "${_real}" && -x "${_real}" ]] || {
             echo "Error: ${_cand} does not resolve to an executable file." >&2
             exit 1
         }
-        _stat="$(stat -c '%u %a' "${_real}")"
+        _stat="$("${_stat_bin}" -c '%u %a' "${_real}")"
         _owner="${_stat% *}"
         _mode="${_stat#* }"
         if [[ "${_owner}" != "0" ]] || (((8#${_mode} & 8#022) != 0)); then
