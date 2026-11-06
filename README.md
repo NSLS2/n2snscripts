@@ -68,7 +68,7 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 
 - `bash` >= 4.x (the `bw*` wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0 for the `bw*` wrappers
-  - 0.6.3+ enables bind-over-ro-bind binary masking
+  - binary masking is verified on RHEL 8.10 (`bubblewrap-0.4.0-3.el8_10`) and EL9 (0.6.3)
 - `gpg(1)` for `gpg-passwd.sh`
 - `openssl(1)` for `pemdecompose`
 - `python3 >= 3.9` (stdlib only, no pip dependencies) for `azoidcapp`

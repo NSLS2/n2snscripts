@@ -2,8 +2,7 @@
 # bwopencode — Launch opencode inside a bubblewrap (bwrap) sandbox.
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
-#   - 0.4.0: base functionality
-#   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+#   Binary masking is verified on RHEL 8.10 (bubblewrap-0.4.0-3.el8_10) and EL9 (0.6.3).
 #
 # Requires at least a minimal OpenCode config: /etc/opencode/opencode.json{,c}
 # or a user opencode.json, opencode.jsonc or config.json in ~/.config/opencode.
@@ -608,7 +607,6 @@ main() {
 
     bwrap_resolve_tool opencode
 
-    detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths
     resolve_opencode_paths

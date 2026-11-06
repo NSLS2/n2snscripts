@@ -28,8 +28,7 @@
 #   source "${SCRIPT_DIR}/bwrap_sandbox_lib.sh"
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
-#   - 0.4.0: base functionality
-#   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+#   Binary masking is verified on RHEL 8.10 (bubblewrap-0.4.0-3.el8_10) and EL9 (0.6.3).
 
 # Guard against double-sourcing.
 [[ -n "${_BWRAP_SANDBOX_LIB_SOURCED:-}" ]] && return 0
@@ -98,9 +97,6 @@ SANDBOX_SHELL=""
 # to bwrap through `env -i` (see launch_sandbox) rather than as --setenv
 # arguments, so they never appear on bwrap's command line.
 SANDBOX_ENV=()
-
-# bwrap capability flags (set by detect_bwrap_capabilities)
-HAS_BIND_OVER_RO=0
 
 # Kernel capability flags (set by detect_kernel_capabilities)
 KERNEL_HAS_TIOCSTI_CAP_GUARD=0
@@ -191,24 +187,6 @@ _version_ge() {
     [[ "${a}" == "${b}" ]] && return 0
     # If the lexicographically-smallest version (per sort -V) is B, then A > B.
     [[ "$(printf '%s\n%s\n' "${a}" "${b}" | sort -V | head -n1)" == "${b}" ]]
-}
-
-# Feature detection by parsing the version string — much cheaper than
-# grepping --help.
-#
-# Version history:
-#   0.6.3 - bind over ro-bind works (can mask binaries inside /usr)
-detect_bwrap_capabilities() {
-    local _bwrap_ver
-    _bwrap_ver="$(bwrap --version)"
-    _bwrap_ver="${_bwrap_ver##* }"            # "bubblewrap 0.11.0" -> "0.11.0"
-
-    # Bind over ro-bind: ability to bind-mount on top of a read-only bind
-    # mount (e.g., masking /usr/bin/ssh after --ro-bind /usr /usr).
-    # This works in 0.6.3+; earlier versions fail with "Permission denied".
-    # Fallback: skip binary masking (security reduction — tools remain accessible)
-    HAS_BIND_OVER_RO=0
-    if _version_ge "${_bwrap_ver}" "0.6.3"; then HAS_BIND_OVER_RO=1; fi
 }
 
 # Detect kernel-level security features that affect bwrap argument choice.
@@ -2057,9 +2035,10 @@ build_base_sandbox() {
 # Bind /dev/null over security-sensitive binaries so attempts to
 # execute them fail rather than silently working.
 #
-# This requires bwrap >= 0.6.3 which supports binding over paths inside
-# an existing read-only bind mount.  On older versions, we skip masking
-# entirely (the binaries remain accessible inside the sandbox).
+# Binding over a path inside an existing read-only bind mount works on every
+# bwrap this library supports (verified on RHEL 8.10 with 0.4.0-3.el8_10 and on
+# EL9 with 0.6.3).  Masking is therefore unconditional: if bwrap cannot apply a
+# mask it fails before the tool starts, so a sandbox never runs unmasked.
 #
 # Must be the very last step of every launcher, after every other mount
 # (user --ro-path / --rw-path included) and after the environment builders,
@@ -2092,8 +2071,6 @@ _MASKED_BINS=(
     nsenter unshare chroot
 )
 build_binary_masks() {
-    [[ "${HAS_BIND_OVER_RO}" -eq 1 ]] || return 0
-
     # Canonicalize + dedupe the search prefixes once.  On merged-/usr systems
     # /bin, /sbin, /usr/bin, /usr/sbin resolve to the same directory; collapsing
     # them here avoids re-checking (and re-resolving) the same candidate under
@@ -3370,13 +3347,9 @@ _bwrap_context_render() {
     _t+="- Not mounted: everything under \`\$HOME\` that is not listed above"
     [[ -z "${_line}" ]] || _t+=", for example ${_line}"
     _t+=".${_nl}"
-    if [[ "${HAS_BIND_OVER_RO}" -eq 1 ]]; then
-        _line=""
-        for _n in "${_MASKED_BINS[@]}"; do _line+="${_line:+, }\`${_n}\`"; done
-        _t+="- Disabled (replaced by an empty file, so they fail when run): ${_line}.${_nl}"
-    else
-        _t+="- The ssh, sudo and network tools are NOT disabled here (the bwrap on this host is too old to mask them).${_nl}"
-    fi
+    _line=""
+    for _n in "${_MASKED_BINS[@]}"; do _line+="${_line:+, }\`${_n}\`"; done
+    _t+="- Disabled (replaced by an empty file, so they fail when run): ${_line}.${_nl}"
     _t+="${_nl}"
 
     _t+="## Environment${_nl}${_nl}"
@@ -3499,6 +3472,49 @@ resolve_env_bin() {
     exit 1
 }
 
+# resolve_bwrap_bin
+#   Echo the absolute path of the bwrap binary to run.
+#
+#   bwrap is NOT looked up on PATH: the sandbox mounts directories a user can
+#   write to (for example ~/.pixi), so a "bwrap" earlier on PATH could replace
+#   the sandbox itself on the next launch.  Instead:
+#     1. /opt/nsls2/bin/bwrap, an optional administrator-managed build, if it
+#        exists;
+#     2. otherwise the distribution's /usr/bin/bwrap.
+#   The resolved file must be owned by root and not writable by group or
+#   others; anything else is refused.  Exits with an error otherwise.
+#
+#   The checks use /usr/bin/readlink and /usr/bin/stat by absolute path: a
+#   readlink or stat found through PATH could be planted in a user-writable
+#   directory and report a fabricated owner and mode.
+resolve_bwrap_bin() {
+    local _cand _real _stat _owner _mode
+    local _readlink=/usr/bin/readlink _stat_bin=/usr/bin/stat
+    if [[ ! -x "${_readlink}" || ! -x "${_stat_bin}" ]]; then
+        echo "Error: ${_readlink} and ${_stat_bin} are required to validate bwrap." >&2
+        exit 1
+    fi
+    for _cand in /opt/nsls2/bin/bwrap /usr/bin/bwrap; do
+        [[ -e "${_cand}" ]] || continue
+        _real="$("${_readlink}" -f "${_cand}")"
+        [[ -n "${_real}" && -f "${_real}" && -x "${_real}" ]] || {
+            echo "Error: ${_cand} does not resolve to an executable file." >&2
+            exit 1
+        }
+        _stat="$("${_stat_bin}" -c '%u %a' "${_real}")"
+        _owner="${_stat% *}"
+        _mode="${_stat#* }"
+        if [[ "${_owner}" != "0" ]] || (((8#${_mode} & 8#022) != 0)); then
+            echo "Error: ${_real} must be owned by root and not writable by group or others (owner uid ${_owner}, mode ${_mode})." >&2
+            exit 1
+        fi
+        echo "${_real}"
+        return 0
+    done
+    echo "Error: cannot locate bwrap (/opt/nsls2/bin/bwrap and /usr/bin/bwrap are missing)." >&2
+    exit 1
+}
+
 # _bwrap_flag_arity FLAG
 #   Set _BWRAP_FLAG_ARITY to the number of value arguments that bwrap flag
 #   FLAG consumes (0, 1, or 2).  Used to walk BWRAP_ARGS (print_dry_run,
@@ -3544,7 +3560,7 @@ _is_secret_env_name() {
 print_dry_run() {
     verify_n2c_state_not_exposed
     local _BWRAP_BIN _ENV_BIN
-    _BWRAP_BIN="$(command -v bwrap)"
+    _BWRAP_BIN="$(resolve_bwrap_bin)"
     _ENV_BIN="$(resolve_env_bin)"
 
     # Mirror the exact invocation used by launch_sandbox:
@@ -3621,7 +3637,7 @@ print_dry_run() {
 launch_sandbox() {
     verify_n2c_state_not_exposed
     local _BWRAP_BIN _ENV_BIN
-    _BWRAP_BIN="$(command -v bwrap)"
+    _BWRAP_BIN="$(resolve_bwrap_bin)"
     _ENV_BIN="$(resolve_env_bin)"
 
     exec "${_ENV_BIN}" -i \
