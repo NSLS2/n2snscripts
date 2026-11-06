@@ -2,8 +2,7 @@
 # bwopencode2 — Launch OpenCode 2 (opencode2) inside a bubblewrap (bwrap) sandbox.
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
-#   - 0.4.0: base functionality
-#   - 0.6.3+: bind over ro-bind (fallback: skip binary masking)
+#   Binary masking is verified on RHEL 8.10 (bubblewrap-0.4.0-3.el8_10) and EL9 (0.6.3).
 #
 # Requires the `opencode2` command (npm @opencode/cli), which the ansible base
 # role installs.  OpenCode 2 is a separate product from
@@ -797,7 +796,6 @@ main() {
         guard_tool_args
     fi
 
-    detect_bwrap_capabilities
     detect_kernel_capabilities
     resolve_common_paths
     resolve_opencode2_paths
