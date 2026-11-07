@@ -123,6 +123,14 @@
 # There is no --init-auth: OpenCode 2 stores credentials in its database
 # (the `credential` table in opencode.db), which lives in the persistent
 # data directory, so sign-in (`opencode2 auth login`) persists on its own.
+#
+# Database guard: opencode.db is on NFS and OpenCode 2 runs it in WAL mode,
+# which SQLite does not support across hosts; two builds sharing it damaged
+# it.  Before the sandbox starts, lib/opencode2-db-lock.sh refuses to start
+# when another host, or another OpenCode 2 build on this host, uses the same
+# data directory, holds a lock for the life of the sandbox, and starts a daily
+# background backup (bin/opencode2-db).  OPENCODE2_DB_GUARD=off skips it.
+# See docs/bw-wrappers.md (Database guard).
 
 set -euo pipefail
 
@@ -281,6 +289,13 @@ that take a value are only recognised for --session/-s, --prompt, --log-level
 and --completions.  Arguments after `--` are never inspected.
 
 --exec runs an arbitrary command and therefore bypasses this argument guard.
+
+Database guard: the OpenCode 2 database is on NFS, where SQLite's WAL mode is
+only safe from one host.  bwopencode2 refuses to start while another host, or
+another OpenCode 2 build on this host, is using the same data directory, and
+makes a daily compressed backup (opencode2-db status shows them; opencode2-db
+restore and rebuild recover).  Set OPENCODE2_DB_GUARD=off to skip the checks
+once.  Not applied to --exec, --dry-run or --help.
 
 Also kept out of the sandbox: service.json (service settings), all OPENCODE_*
 environment variables except a short allowlist of harmless switches (see
@@ -458,6 +473,32 @@ resolve_opencode2_paths() {
 # repos, shell, ...), so no file list could be kept in sync.
 ensure_host_dirs() {
     mkdir -p "${OC2_DATA_SRC}" "${OC2_CACHE_SRC}" "${OC2_TUI_STATE_SRC}"
+}
+
+# ── Database guard ───────────────────────────────────────────────
+# Refuse to start when another host, or another OpenCode 2 build, is using the
+# database; hold a lock for the life of the sandbox.  The lock is a file
+# descriptor opened here: launch_sandbox ends in `exec`, which passes it on to
+# bwrap and the sandboxed process, so it stays locked until they all exit.
+# Not applied to commands that never open the database, to --exec (an
+# arbitrary command) or to --dry-run.
+guard_opencode2_db() {
+    [[ "${DRY_RUN}" -eq 0 && -z "${TEST_CMD}" ]] || return 0
+
+    local _lib="${SCRIPT_DIR}/../lib/opencode2-db-lock.sh"
+    [[ -r "${_lib}" ]] || return 0
+    # shellcheck source=../lib/opencode2-db-lock.sh
+    source "${_lib}"
+    oc2db_needs_guard ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"} || return 0
+
+    # Only the installed binary has a known identity to compare running
+    # processes with; the ansible wrapper script (fallback) does not.
+    local _bin=""
+    [[ "${_TOOL_BIN}" == "${OC2_INSTALL_BIN}" ]] && _bin="${_TOOL_BIN}"
+
+    # shellcheck disable=SC2034  # read by oc2db_* in opencode2-db-lock.sh
+    OC2DB_PROG=bwopencode2
+    oc2db_guard "${OC2_DATA_SRC}" "${_bin}" || exit 1
 }
 
 # Resolve opencode2 config symlinks.
@@ -808,6 +849,7 @@ main() {
     if [[ "${DRY_RUN}" -eq 0 ]]; then
         ensure_host_dirs
     fi
+    guard_opencode2_db
     parse_all_git_includes
     resolve_config_symlinks
     init_sandbox_path
