@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+# opencode2-db — back up, check and recover the OpenCode 2 SQLite database.
+#
+# The database (<data dir>/opencode.db) holds sessions, messages, projects,
+# saved sign-in and plugin storage.  It lives on NFS, where SQLite's WAL mode
+# is only safe from one host, and it has been damaged before (database disk
+# image is malformed).  This tool keeps compressed daily backups and recovers
+# from them.  The launchers (bwopencode2, the ansible opencode2 wrapper) start
+# `backup --if-due` in the background through lib/opencode2-db-lock.sh, which
+# also takes the session locks this tool checks.
+#
+# Run it on the host, never inside the sandbox.  Needs python3 >= 3.7, standard
+# library only.
+#
+# Usage:
+#   opencode2-db [--data-dir DIR] status
+#   opencode2-db [--data-dir DIR] backup [--if-due] [--delay SECONDS] [--keep N]
+#   opencode2-db [--data-dir DIR] restore [BACKUP] [--yes]
+#   opencode2-db [--data-dir DIR] rebuild [--apply] [--accept-loss] [--yes]
+#   opencode2-db [--data-dir DIR] clear
+#
+#   status    show the locks, the backups and the result of the last check
+#   backup    consistent copy (SQLite backup API), quick_check on the copy,
+#             gzip into <guard dir>/backups, keep the newest N (default 3).
+#             A failed check writes the CHECK-FAILED flag, which makes the
+#             launchers refuse to start until restore, rebuild or clear.
+#   restore   replace the database with a backup (default: the newest); the
+#             damaged files are kept as opencode.db.corrupt-<date>*
+#   rebuild   copy every readable table into a new database and rebuild the
+#             project table from sessions and worktrees; without --apply the
+#             new file is only built and checked; a table that could not be
+#             copied completely stops --apply unless --accept-loss is given
+#   clear     remove the CHECK-FAILED flag without changing anything
+#
+# restore, rebuild and clear refuse to run while any session lock is held.
+# Data directory default: ~/.local/share/opencode2/opencode.
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import gzip
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator, List, Optional, Tuple
+
+DAY = 24 * 3600
+DB_NAME = "opencode.db"
+FLAG_NAME = "CHECK-FAILED"
+BACKUP_GLOB = "opencode-*.db.gz"
+
+
+class ToolError(Exception):
+    pass
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def say(message: str) -> None:
+    print("%s %s" % (now_utc().strftime("%Y-%m-%dT%H:%M:%SZ"), message), flush=True)
+
+
+def log_syslog(message: str) -> None:
+    try:
+        import syslog
+
+        syslog.openlog("opencode2-db-guard")
+        syslog.syslog(syslog.LOG_NOTICE, message)
+    except Exception:
+        pass
+
+
+def guard_dir(data_dir: Path) -> Path:
+    return data_dir.parent / "opencode-db-guard"
+
+
+def default_data_dir() -> Path:
+    return Path.home() / ".local" / "share" / "opencode2" / "opencode"
+
+
+def human(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return "%.0f %s" % (size, unit) if unit == "B" else "%.1f %s" % (size, unit)
+        size /= 1024
+    return "%.1f GB" % size
+
+
+def ago(timestamp: float) -> str:
+    seconds = max(0, int(time.time() - timestamp))
+    if seconds < 3600:
+        return "%d min ago" % (seconds // 60)
+    if seconds < 2 * DAY:
+        return "%d h ago" % (seconds // 3600)
+    return "%d days ago" % (seconds // DAY)
+
+
+# ── locks ────────────────────────────────────────────────────────────────
+
+
+def held_sessions(gdir: Path) -> List[str]:
+    """Names of session lock files that somebody holds (flock probe)."""
+    held: List[str] = []
+    for lock in sorted((gdir / "locks").glob("session@*.lock")):
+        try:
+            fd = os.open(str(lock), os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            held.append(lock.name)
+        finally:
+            os.close(fd)
+    return held
+
+
+def describe_lock(name: str) -> str:
+    parts = name[len("session@") : -len(".lock")].split("@")
+    if len(parts) == 2:
+        return "%s (OpenCode %s)" % (parts[0], parts[1])
+    return name
+
+
+@contextlib.contextmanager
+def exclusive(gdir: Path) -> Iterator[None]:
+    """Hold guard.lock (no launcher can pass its checks) and require that no
+    session lock is held."""
+    gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (gdir / "locks").mkdir(exist_ok=True, mode=0o700)
+    with open(str(gdir / "guard.lock"), "a+") as handle:
+        deadline = time.time() + 30
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() > deadline:
+                    raise ToolError("another launch holds %s/guard.lock" % gdir)
+                time.sleep(0.5)
+        held = held_sessions(gdir)
+        if held:
+            raise ToolError(
+                "OpenCode 2 sessions are running, close them first: " + ", ".join(describe_lock(name) for name in held)
+            )
+        yield
+
+
+# ── SQLite helpers ───────────────────────────────────────────────────────
+
+
+def quick_check(conn: sqlite3.Connection) -> List[str]:
+    rows = [str(row[0]) for row in conn.execute("pragma quick_check")]
+    return [] if rows == ["ok"] else rows
+
+
+def free_space_ok(directory: str, need: int) -> bool:
+    return shutil.disk_usage(directory).free > need * 1.2
+
+
+def scratch_dir(prefix: str) -> str:
+    base = os.environ.get("OC2DB_TMPDIR") or "/var/tmp"
+    if not os.path.isdir(base):
+        base = tempfile.gettempdir()
+    return tempfile.mkdtemp(prefix=prefix, dir=base)
+
+
+# ── backup ───────────────────────────────────────────────────────────────
+
+
+def list_backups(gdir: Path) -> List[Path]:
+    return sorted((gdir / "backups").glob(BACKUP_GLOB))
+
+
+def write_flag(gdir: Path, lines: List[str]) -> None:
+    text = "\n".join(["Database check failed at %s on this host:" % now_utc().strftime("%Y-%m-%d %H:%M UTC")] + lines)
+    (gdir / FLAG_NAME).write_text(text + "\n")
+
+
+def cmd_backup(data_dir: Path, args: argparse.Namespace) -> int:
+    gdir = guard_dir(data_dir)
+    bdir = gdir / "backups"
+    bdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    source = data_dir / DB_NAME
+    if not source.exists():
+        say("no database at %s, nothing to back up" % source)
+        return 0
+    stamp = bdir / "last-success"
+    with open(str(bdir / "backup.lock"), "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            say("another backup is running")
+            return 0
+        if args.if_due and stamp.exists() and time.time() - stamp.stat().st_mtime < DAY:
+            return 0
+        if args.delay:
+            time.sleep(args.delay)
+        return run_backup(source, gdir, bdir, stamp, args.keep)
+
+
+def run_backup(source: Path, gdir: Path, bdir: Path, stamp: Path, keep: int) -> int:
+    size = source.stat().st_size
+    work = scratch_dir("oc2db-")
+    try:
+        if not free_space_ok(work, size):
+            say("not enough free space in %s for a copy of %s, skipping" % (work, human(size)))
+            return 0
+        copy = os.path.join(work, DB_NAME)
+        say("backing up %s (%s)" % (source, human(size)))
+        src = sqlite3.connect("file:%s?mode=rw" % source, uri=True, timeout=60)
+        try:
+            dst = sqlite3.connect(copy)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        check = sqlite3.connect(copy)
+        try:
+            problems = quick_check(check)
+        finally:
+            check.close()
+        if problems:
+            lines = [line for problem in problems for line in problem.splitlines()][:8]
+            write_flag(gdir, lines)
+            log_syslog("backup check failed for %s: %s" % (source, lines[0]))
+            say("quick_check FAILED on the copy; wrote %s/%s" % (gdir, FLAG_NAME))
+            for line in lines:
+                say("  " + line)
+            return 3
+        name = "opencode-%s.db.gz" % now_utc().strftime("%Y%m%dT%H%M%SZ")
+        part = bdir / (".%s.part" % name)
+        with open(copy, "rb") as raw, gzip.open(str(part), "wb", compresslevel=3) as packed:
+            shutil.copyfileobj(raw, packed, 1 << 20)
+        os.replace(str(part), str(bdir / name))
+        stamp.touch()
+        old = list_backups(gdir)[:-keep] if keep > 0 else []
+        for path in old:
+            path.unlink()
+        say("wrote %s (%s), kept %d" % (name, human((bdir / name).stat().st_size), len(list_backups(gdir))))
+        return 0
+    except sqlite3.OperationalError as err:
+        say("backup failed: %s" % err)
+        log_syslog("backup failed for %s: %s" % (source, err))
+        return 1
+    except sqlite3.DatabaseError as err:
+        # Not "locked" or "I/O error": SQLite could not read the file at all.
+        write_flag(gdir, [str(err)])
+        log_syslog("database damaged: %s: %s" % (source, err))
+        say("database is damaged (%s); wrote %s/%s" % (err, gdir, FLAG_NAME))
+        return 3
+    except (sqlite3.Error, OSError) as err:
+        say("backup failed: %s" % err)
+        log_syslog("backup failed for %s: %s" % (source, err))
+        return 1
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+# ── status ───────────────────────────────────────────────────────────────
+
+
+def cmd_status(data_dir: Path, args: argparse.Namespace) -> int:
+    gdir = guard_dir(data_dir)
+    db = data_dir / DB_NAME
+    print("Data directory : %s" % data_dir)
+    print("Guard directory: %s" % gdir)
+    if db.exists():
+        st = db.stat()
+        print("Database       : %s, changed %s" % (human(st.st_size), ago(st.st_mtime)))
+    else:
+        print("Database       : not found")
+    flag = gdir / FLAG_NAME
+    if flag.exists():
+        print("Damage flag    : SET (launchers refuse to start)")
+        for line in flag.read_text().splitlines():
+            print("    " + line)
+    else:
+        print("Damage flag    : none")
+    held = held_sessions(gdir) if (gdir / "locks").is_dir() else []
+    print("Session locks  : " + (", ".join(describe_lock(n) for n in held) if held else "none held"))
+    backups = list_backups(gdir)
+    print("Backups        : %d" % len(backups))
+    for path in backups:
+        st = path.stat()
+        print("    %s  %s  %s" % (path.name, human(st.st_size), ago(st.st_mtime)))
+    log = gdir / "backup.log"
+    if log.exists():
+        lines = log.read_text().splitlines()
+        if lines:
+            print("Last backup job: " + lines[-1])
+    return 0
+
+
+# ── replacing the database ───────────────────────────────────────────────
+
+
+def swap_in(data_dir: Path, new_db: Path, gdir: Path) -> List[str]:
+    """Move the current database (and its -wal/-shm) aside, put new_db in its
+    place, clear the flag.  Returns the names of the files kept."""
+    stamp = now_utc().strftime("%Y%m%d")
+    suffix = "corrupt-" + stamp
+    if (data_dir / (DB_NAME + "." + suffix)).exists():
+        suffix += now_utc().strftime("-%H%M%S")
+    kept: List[str] = []
+    for ext in ("", "-wal", "-shm"):
+        current = data_dir / (DB_NAME + ext)
+        if current.exists():
+            target = data_dir / (DB_NAME + "." + suffix + ext)
+            os.rename(str(current), str(target))
+            kept.append(target.name)
+    os.rename(str(new_db), str(data_dir / DB_NAME))
+    with contextlib.suppress(FileNotFoundError):
+        (gdir / FLAG_NAME).unlink()
+    return kept
+
+
+def confirm(question: str, assume_yes: bool) -> None:
+    if assume_yes:
+        return
+    if not sys.stdin.isatty():
+        raise ToolError("not a terminal; add --yes to confirm: " + question)
+    if input(question + " [y/N] ").strip().lower() not in ("y", "yes"):
+        raise ToolError("cancelled")
+
+
+def cmd_restore(data_dir: Path, args: argparse.Namespace) -> int:
+    gdir = guard_dir(data_dir)
+    if args.backup:
+        chosen = Path(args.backup)
+        if not chosen.is_absolute() and not chosen.exists():
+            chosen = gdir / "backups" / args.backup
+    else:
+        found = list_backups(gdir)
+        if not found:
+            raise ToolError("no backups in %s/backups" % gdir)
+        chosen = found[-1]
+    if not chosen.is_file():
+        raise ToolError("backup not found: %s" % chosen)
+    with exclusive(gdir):
+        confirm("Replace %s with %s?" % (data_dir / DB_NAME, chosen.name), args.yes)
+        restored = data_dir / (DB_NAME + ".restore-" + now_utc().strftime("%Y%m%dT%H%M%SZ"))
+        try:
+            say("unpacking %s" % chosen.name)
+            with gzip.open(str(chosen), "rb") as packed, open(str(restored), "wb") as out:
+                shutil.copyfileobj(packed, out, 1 << 20)
+            conn = sqlite3.connect(str(restored))
+            try:
+                problems = quick_check(conn)
+            finally:
+                conn.close()
+            if problems:
+                raise ToolError("the backup fails quick_check: " + problems[0])
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                restored.unlink()
+            raise
+        kept = swap_in(data_dir, restored, gdir)
+        log_syslog("restored %s from %s" % (data_dir / DB_NAME, chosen.name))
+    say("restored %s from %s" % (DB_NAME, chosen.name))
+    if kept:
+        say("the previous files were kept: " + ", ".join(kept))
+    say("sessions after %s are not in the restored database" % chosen.name[len("opencode-") : -len(".db.gz")])
+    return 0
+
+
+def cmd_clear(data_dir: Path, args: argparse.Namespace) -> int:
+    gdir = guard_dir(data_dir)
+    with exclusive(gdir):
+        flag = gdir / FLAG_NAME
+        if flag.exists():
+            flag.unlink()
+            say("removed %s" % flag)
+        else:
+            say("no damage flag set")
+    return 0
+
+
+# ── rebuild ──────────────────────────────────────────────────────────────
+
+SQL_OBJECTS = "select type, name, tbl_name, sql from sqlite_master where sql is not null and name not like 'sqlite_%' order by rowid"
+
+
+def open_source_copy(data_dir: Path, work: str) -> sqlite3.Connection:
+    """Open a private copy of the database and its WAL, so the originals are
+    never touched.  Falls back to the main file alone, read-only, when SQLite
+    cannot recover the WAL."""
+    main = data_dir / DB_NAME
+    copy = os.path.join(work, DB_NAME)
+    shutil.copyfile(str(main), copy)
+    wal = data_dir / (DB_NAME + "-wal")
+    if wal.exists():
+        shutil.copyfile(str(wal), copy + "-wal")
+    try:
+        conn = sqlite3.connect(copy)
+        conn.execute("select count(*) from sqlite_master").fetchone()
+        return conn
+    except sqlite3.Error:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(copy + "-wal")
+        return sqlite3.connect("file:%s?mode=ro&immutable=1" % copy, uri=True)
+
+
+def table_count(conn: sqlite3.Connection, name: str) -> Optional[int]:
+    try:
+        return int(conn.execute('select count(*) from "%s"' % name).fetchone()[0])
+    except sqlite3.Error:
+        return None
+
+
+def copy_table(src: sqlite3.Connection, dst: sqlite3.Connection, name: str) -> Tuple[int, Optional[str]]:
+    cols = [row[1] for row in src.execute('pragma table_info("%s")' % name)]
+    quoted = ",".join('"%s"' % c for c in cols)
+    insert = 'insert into "%s" (%s) values (%s)' % (name, quoted, ",".join("?" * len(cols)))
+    copied = 0
+    try:
+        cur = src.execute('select %s from "%s"' % (quoted, name))
+        while True:
+            rows = cur.fetchmany(2000)
+            if not rows:
+                break
+            dst.executemany(insert, rows)
+            copied += len(rows)
+    except sqlite3.Error as err:
+        return copied, str(err)
+    return copied, None
+
+
+def rebuild_project(src: sqlite3.Connection, dst: sqlite3.Connection) -> Optional[int]:
+    """Rebuild project rows from session_v2 and worktree.  Name, icon and
+    commands are lost; id, main directory and the other directories are kept."""
+    try:
+        worktrees: dict = {}
+        for pid, directory, created in src.execute("select project_id, directory, time_created from worktree"):
+            worktrees.setdefault(pid, []).append((directory, created))
+        rebuilt = 0
+        for (pid,) in src.execute("select distinct project_id from session_v2").fetchall():
+            sessions = src.execute(
+                "select directory, time_created, time_updated from session_v2 where project_id = ?", (pid,)
+            ).fetchall()
+            dirs = [d for d, _ in worktrees.get(pid, [])] or [s[0] for s in sessions]
+            main = min(dirs, key=len)
+            created = min([s[1] for s in sessions] + [t for _, t in worktrees.get(pid, [])])
+            updated = max(s[2] for s in sessions)
+            dst.execute(
+                "insert into project (id, worktree, vcs, time_created, time_updated, time_active, sandboxes)"
+                " values (?, ?, ?, ?, ?, 0, ?)",
+                (pid, main, "git", created, updated, json.dumps([d for d in dirs if d != main])),
+            )
+            rebuilt += 1
+        return rebuilt
+    except sqlite3.Error as err:
+        say("project: cannot rebuild from sessions (%s)" % err)
+        return None
+
+
+def cmd_rebuild(data_dir: Path, args: argparse.Namespace) -> int:
+    gdir = guard_dir(data_dir)
+    if not (data_dir / DB_NAME).exists():
+        raise ToolError("no database at %s" % (data_dir / DB_NAME))
+    with exclusive(gdir):
+        size = (data_dir / DB_NAME).stat().st_size
+        work = scratch_dir("oc2db-rebuild-")
+        try:
+            if not free_space_ok(work, size):
+                raise ToolError("not enough free space in %s" % work)
+            for leftover in data_dir.glob(DB_NAME + ".rebuilt-*"):
+                leftover.unlink()
+            result = data_dir / (DB_NAME + ".rebuilt-" + now_utc().strftime("%Y%m%dT%H%M%SZ"))
+            valid, complete = build_rebuilt(data_dir, work, result)
+            if not valid:
+                say("not swapping: the new database did not pass its checks; it is left at %s" % result)
+                return 1
+            if not complete and not (args.apply and args.accept_loss):
+                say("some tables could not be copied completely (see above); the new database is left at %s" % result)
+                say("to use it anyway, accept the loss: rebuild --apply --accept-loss")
+                return 1
+            if not args.apply:
+                say("built and checked %s; run again with --apply to put it in place" % result)
+                return 0
+            confirm("Replace %s with the rebuilt database?" % (data_dir / DB_NAME), args.yes)
+            kept = swap_in(data_dir, result, gdir)
+            log_syslog("rebuilt %s" % (data_dir / DB_NAME))
+            say("rebuilt database in place; the previous files were kept: " + ", ".join(kept))
+            return 0
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def build_rebuilt(data_dir: Path, work: str, result: Path) -> Tuple[bool, bool]:
+    """Returns (valid, complete): valid when the new file passes integrity and
+    foreign key checks, complete when every table was copied in full."""
+    src = open_source_copy(data_dir, work)
+    dst = sqlite3.connect(str(result))
+    valid = True
+    complete = True
+    try:
+        objects = src.execute(SQL_OBJECTS).fetchall()
+        tables = [o for o in objects if o[0] == "table"]
+        for _, _, _, sql in tables:
+            dst.execute(sql)
+        names = [t[1] for t in tables]
+        project_rebuilt = False
+        for name in names:
+            expected = table_count(src, name)
+            copied, error = copy_table(src, dst, name)
+            dst.commit()
+            if name == "project":
+                bad = dst.execute("select count(*) from project where id is null or worktree is null").fetchone()[0]
+                if error or bad or (expected is not None and copied != expected):
+                    dst.execute("delete from project")
+                    rebuilt = rebuild_project(src, dst)
+                    dst.commit()
+                    project_rebuilt = True
+                    say(
+                        "project: copy was damaged (%s); rebuilt %s row(s) from sessions"
+                        % (error or "bad rows", rebuilt)
+                    )
+                    complete = complete and rebuilt is not None
+                else:
+                    say("project: %d rows copied" % copied)
+            elif name == "kv" and (error or (expected is not None and copied != expected)):
+                dst.execute("delete from kv")
+                dst.commit()
+                say("kv: damaged, left empty (OpenCode recreates it; plugin storage is lost)")
+            elif error or expected is None or copied != expected:
+                say("%s: %d row(s) copied, expected %s, error: %s" % (name, copied, expected, error))
+                complete = False
+            else:
+                say("%s: %d rows copied" % (name, copied))
+        for kind, _, _, sql in objects:
+            if kind != "table":
+                dst.execute(sql)
+        dst.commit()
+        integrity = [str(r[0]) for r in dst.execute("pragma integrity_check")]
+        foreign = dst.execute("pragma foreign_key_check").fetchall()
+        say("integrity_check: %s; foreign_key_check: %d problem(s)" % (", ".join(integrity), len(foreign)))
+        valid = integrity == ["ok"] and not foreign
+        if project_rebuilt:
+            say("note: project name, icon and commands were lost")
+        dst.execute("pragma journal_mode=delete")
+    finally:
+        dst.close()
+        src.close()
+    return valid, complete
+
+
+# ── main ─────────────────────────────────────────────────────────────────
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="opencode2-db",
+        description="Back up, check and recover the OpenCode 2 database (see the header of this file).",
+    )
+    parser.add_argument("--data-dir", type=Path, default=None, help="OpenCode 2 data directory")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="show locks, backups and the last check")
+    backup = sub.add_parser("backup", help="back up and check the database")
+    backup.add_argument("--if-due", action="store_true", help="only when the last backup is over 24 hours old")
+    backup.add_argument("--delay", type=float, default=0, help="wait this many seconds first")
+    backup.add_argument("--keep", type=int, default=3, help="backups to keep (default 3)")
+    restore = sub.add_parser("restore", help="restore a backup")
+    restore.add_argument("backup", nargs="?", help="backup name or path (default: newest)")
+    restore.add_argument("--yes", action="store_true", help="do not ask")
+    rebuild = sub.add_parser("rebuild", help="rebuild the database from its readable tables")
+    rebuild.add_argument("--apply", action="store_true", help="put the rebuilt database in place")
+    rebuild.add_argument(
+        "--accept-loss", action="store_true", help="with --apply: use it even if a table is incomplete"
+    )
+    rebuild.add_argument("--yes", action="store_true", help="do not ask")
+    sub.add_parser("clear", help="remove the damage flag")
+    args = parser.parse_args(argv)
+
+    if os.environ.get("BWRAP_SANDBOX"):
+        print("opencode2-db: run this on the host, not inside the sandbox", file=sys.stderr)
+        return 2
+    data_dir = (args.data_dir or default_data_dir()).expanduser()
+    commands = {
+        "status": cmd_status,
+        "backup": cmd_backup,
+        "restore": cmd_restore,
+        "rebuild": cmd_rebuild,
+        "clear": cmd_clear,
+    }
+    try:
+        return commands[args.command](data_dir, args)
+    except ToolError as err:
+        print("opencode2-db: %s" % err, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
