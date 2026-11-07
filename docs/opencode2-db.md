@@ -114,6 +114,10 @@ it.
 | `opencode2-db rebuild [--apply] [--accept-loss] [--yes]` | Copy readable tables into a new database |
 | `opencode2-db clear` | Remove the damage flag without changing anything |
 
+The database holds saved sign-in, so every file the tool makes (backups,
+restored and rebuilt databases, temporary copies) is private (mode 0600, the
+guard directory 0700); the launchers create the guard directory the same way.
+
 `restore`, `rebuild` and `clear` take `guard.lock` and refuse while any session
 lock is held. The damaged files are never deleted: they are renamed to
 `opencode.db.corrupt-<date>` (with `-wal` and `-shm` alongside, and a time
@@ -135,8 +139,9 @@ database disk image is malformed`.
    rows are damaged (name, icon and commands are lost), leaves `kv` empty when it
    is damaged (plugin storage is lost), then checks `integrity_check` and
    `foreign_key_check` and compares row counts. Without `--apply` it only
-   builds the file and reports; `--apply` puts it in place, and a table that
-   could not be copied completely also needs `--accept-loss`.
+   builds the file and reports; `--apply` puts it in place, and when data was
+   lost (a table that could not be copied completely, `project` rebuilt, `kv`
+   left empty) it also needs `--accept-loss`.
 5. Start OpenCode 2 and check the session list. The first start after a restore
    may re-run the OpenCode 1 import: look for duplicate sessions.
 
@@ -159,8 +164,11 @@ different-build check is skipped. It exports `OC2DB_GUARDED=1`, which is how
 other launches recognise an unsandboxed process that took part in the locking.
 
 Do not call it for commands that never open the database (`--help`,
-`--version`, `upgrade`, `update`, `uninstall`); `bwopencode2` skips those, and
-`--exec` and `--dry-run`.
+`--version`, `upgrade`, `update`, `uninstall`): `oc2db_needs_guard "$@"` returns
+1 for those and 0 otherwise. It skips the value of `--session`/`-s`, `--prompt`
+and `--log-level` (so `--prompt upgrade` is guarded), accepts a subcommand only
+as the first positional word and looks for help and version flags anywhere
+before `--`. `bwopencode2` also skips `--exec` and `--dry-run`.
 
 ## Environment variables
 

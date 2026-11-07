@@ -29,7 +29,9 @@
 #   rebuild   copy every readable table into a new database and rebuild the
 #             project table from sessions and worktrees; without --apply the
 #             new file is only built and checked; a table that could not be
-#             copied completely stops --apply unless --accept-loss is given
+#             copied completely, or whose damaged project rows or kv storage
+#             had to be rebuilt or left empty, stops --apply unless
+#             --accept-loss is given
 #   clear     remove the CHECK-FAILED flag without changing anything
 #
 # restore, rebuild and clear refuse to run while any session lock is held.
@@ -367,6 +369,7 @@ def cmd_restore(data_dir: Path, args: argparse.Namespace) -> int:
             with contextlib.suppress(FileNotFoundError):
                 restored.unlink()
             raise
+        os.chmod(str(restored), 0o600)
         kept = swap_in(data_dir, restored, gdir)
         log_syslog("restored %s from %s" % (data_dir / DB_NAME, chosen.name))
     say("restored %s from %s" % (DB_NAME, chosen.name))
@@ -484,13 +487,14 @@ def cmd_rebuild(data_dir: Path, args: argparse.Namespace) -> int:
                 say("not swapping: the new database did not pass its checks; it is left at %s" % result)
                 return 1
             if not complete and not (args.apply and args.accept_loss):
-                say("some tables could not be copied completely (see above); the new database is left at %s" % result)
+                say("data was lost or rebuilt (see above); the new database is left at %s" % result)
                 say("to use it anyway, accept the loss: rebuild --apply --accept-loss")
                 return 1
             if not args.apply:
                 say("built and checked %s; run again with --apply to put it in place" % result)
                 return 0
             confirm("Replace %s with the rebuilt database?" % (data_dir / DB_NAME), args.yes)
+            os.chmod(str(result), 0o600)
             kept = swap_in(data_dir, result, gdir)
             log_syslog("rebuilt %s" % (data_dir / DB_NAME))
             say("rebuilt database in place; the previous files were kept: " + ", ".join(kept))
@@ -528,13 +532,14 @@ def build_rebuilt(data_dir: Path, work: str, result: Path) -> Tuple[bool, bool]:
                         "project: copy was damaged (%s); rebuilt %s row(s) from sessions"
                         % (error or "bad rows", rebuilt)
                     )
-                    complete = complete and rebuilt is not None
+                    complete = False
                 else:
                     say("project: %d rows copied" % copied)
             elif name == "kv" and (error or (expected is not None and copied != expected)):
                 dst.execute("delete from kv")
                 dst.commit()
                 say("kv: damaged, left empty (OpenCode recreates it; plugin storage is lost)")
+                complete = False
             elif error or expected is None or copied != expected:
                 say("%s: %d row(s) copied, expected %s, error: %s" % (name, copied, expected, error))
                 complete = False
@@ -587,6 +592,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if os.environ.get("BWRAP_SANDBOX"):
         print("opencode2-db: run this on the host, not inside the sandbox", file=sys.stderr)
         return 2
+    # The database holds saved sign-in: every file this tool makes (backups,
+    # restored and rebuilt databases, temporary copies) must be private.
+    os.umask(0o077)
     data_dir = (args.data_dir or default_data_dir()).expanduser()
     commands = {
         "status": cmd_status,

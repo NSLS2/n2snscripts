@@ -485,26 +485,11 @@ ensure_host_dirs() {
 guard_opencode2_db() {
     [[ "${DRY_RUN}" -eq 0 && -z "${TEST_CMD}" ]] || return 0
 
-    local _arg
-    for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do
-        case "${_arg}" in
-            --)
-                break
-                ;;
-            --help | -h | --version | -v | --completions | --completions=* | upgrade | update | uninstall)
-                return 0
-                ;;
-            -*) ;;
-            *)
-                break
-                ;;
-        esac
-    done
-
     local _lib="${SCRIPT_DIR}/../lib/opencode2-db-lock.sh"
     [[ -r "${_lib}" ]] || return 0
     # shellcheck source=../lib/opencode2-db-lock.sh
     source "${_lib}"
+    oc2db_needs_guard ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"} || return 0
 
     # Only the installed binary has a known identity to compare running
     # processes with; the ansible wrapper script (fallback) does not.

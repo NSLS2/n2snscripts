@@ -205,6 +205,43 @@ oc2db_probe_locks() {
     done
 }
 
+# oc2db_needs_guard ARGS...: the opencode2 command line, as given to the
+# launcher.  Returns 1 when it never opens the database (help, version,
+# completions, upgrade, update, uninstall), 0 otherwise.  Options that take a
+# value (--session/-s, --prompt, --log-level) are skipped with their value, so
+# `--prompt upgrade` still needs the guard; only the first positional word can
+# be a subcommand; help and version flags count anywhere before `--`.
+oc2db_needs_guard() {
+    local _skip=0 _first=1 _arg
+    for _arg in "$@"; do
+        if ((_skip)); then
+            _skip=0
+            continue
+        fi
+        case "${_arg}" in
+            --)
+                break
+                ;;
+            --help | -h | --version | -v | --completions | --completions=*)
+                return 1
+                ;;
+            --session | -s | --prompt | --log-level)
+                _skip=1
+                ;;
+            -*) ;;
+            *)
+                if ((_first)); then
+                    _first=0
+                    case "${_arg}" in
+                        upgrade | update | uninstall) return 1 ;;
+                    esac
+                fi
+                ;;
+        esac
+    done
+    return 0
+}
+
 # oc2db_guard DATA_DIR [OPENCODE_BIN]
 # Returns 0 to go ahead (with the session lock held on OC2DB_SESSION_FD), 1
 # after printing why not.  Problems with the lock files themselves (no flock,

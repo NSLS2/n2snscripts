@@ -216,6 +216,20 @@ sleep 3
 check "the lock is released when the session ends, though the backup job still runs" lock_free "${LOCKFILE}"
 [[ -s "${T}/tool-pid" ]] && kill "$(cat "${T}/tool-pid")" 2> /dev/null
 
+# oc2db_needs_guard: which command lines open the database.
+needs() { bash -c 'source "$1"; shift; oc2db_needs_guard "$@" && echo yes || echo no' _ "${LIB}" "$@"; }
+check "no arguments need the guard" test "$(needs)" = yes
+check "auth login needs the guard" test "$(needs auth login)" = yes
+check "--version does not" test "$(needs --version)" = no
+check "--help does not" test "$(needs --help)" = no
+check "a help flag after a subcommand does not" test "$(needs debug --help)" = no
+check "upgrade does not" test "$(needs upgrade)" = no
+check "an option with a value before the subcommand does not hide it" test "$(needs --log-level debug upgrade)" = no
+check "--prompt upgrade (a value, not a subcommand) needs the guard" test "$(needs --prompt upgrade)" = yes
+check "-s upgrade needs the guard" test "$(needs -s upgrade)" = yes
+check "upgrade as a later word needs the guard" test "$(needs run upgrade)" = yes
+check "words after -- are never inspected" test "$(needs run -- --help)" = yes
+
 # ── bin/opencode2-db ────────────────────────────────────────────────────
 
 mkdir -p "${T}/py/share/opencode"
@@ -257,6 +271,7 @@ sleep 1.1
 "${TOOL}" --data-dir "${PD}" backup --keep 2 > /dev/null
 sleep 1.1
 "${TOOL}" --data-dir "${PD}" backup --keep 2 > /dev/null
+check "backups are private (mode 600, directory 700)" bash -c '[[ "$(stat -c %a "$1"/backups/opencode-*.db.gz | sort -u)" == 600 && "$(stat -c %a "$1"/backups)" == 700 ]]' _ "${GD}"
 check "backup keeps only the newest N" bash -c '[[ "$(ls "$1"/backups/opencode-*.db.gz | wc -l)" -eq 2 ]]' _ "${GD}"
 
 python3 - "${DB}" << 'EOF'
@@ -279,6 +294,7 @@ check "the guard then refuses to start" contains "${OUT}" 'rc=1'
 "${TOOL}" --data-dir "${PD}" restore --yes > /dev/null
 check "restore clears the flag" test ! -e "${GD}/CHECK-FAILED"
 check "restore keeps the damaged file" bash -c 'ls "$1"/opencode.db.corrupt-* >/dev/null 2>&1' _ "${PD}"
+check "the restored database is private (mode 600)" bash -c '[[ "$(stat -c %a "$1")" == 600 ]]' _ "${DB}"
 check "the restored database passes quick_check" python3 -c "
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
@@ -296,6 +312,38 @@ import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 assert c.execute('pragma integrity_check').fetchone()[0] == 'ok'
 assert c.execute('select count(*) from session_message').fetchone()[0] == 300" "${DB}"
+
+check "the rebuilt database is private (mode 600)" bash -c '[[ "$(stat -c %a "$1")" == 600 ]]' _ "${DB}"
+
+# A damaged project table is rebuilt from sessions, which loses data: --apply
+# then needs --accept-loss.
+mkdir -p "${T}/lossy/share/opencode"
+python3 - "${T}/lossy/share/opencode/opencode.db" << 'EOF'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.executescript("""
+create table project(id text, worktree text, vcs text, time_created int, time_updated int, time_active int, sandboxes text);
+create table worktree(id integer primary key, project_id text, directory text, time_created int);
+create table session_v2(id text primary key, project_id text, directory text, time_created int, time_updated int);
+""")
+c.execute("insert into project values(NULL, NULL, NULL, NULL, NULL, NULL, NULL)")
+c.execute("insert into worktree(project_id, directory, time_created) values('p1', '/a', 1)")
+c.execute("insert into session_v2 values('s1', 'p1', '/a', 1, 5)")
+c.commit()
+EOF
+LD="${T}/lossy/share/opencode"
+if "${TOOL}" --data-dir "${LD}" rebuild --apply --yes > /dev/null 2>&1; then
+    check "rebuild --apply refuses a lossy rebuild without --accept-loss" false
+else
+    check "rebuild --apply refuses a lossy rebuild without --accept-loss" true
+fi
+check "the refused rebuild left the original database in place" python3 -c "
+import sqlite3, sys
+assert sqlite3.connect(sys.argv[1]).execute('select count(*) from project where id is null').fetchone()[0] == 1" "${LD}/opencode.db"
+"${TOOL}" --data-dir "${LD}" rebuild --apply --accept-loss --yes > /dev/null
+check "rebuild --apply --accept-loss applies it" python3 -c "
+import sqlite3, sys
+assert sqlite3.connect(sys.argv[1]).execute('select id from project').fetchall() == [('p1',)]" "${LD}/opencode.db"
 
 printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
 [[ "${FAIL}" -eq 0 ]]
