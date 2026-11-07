@@ -117,6 +117,29 @@ OUT="$(run_guard "${D}")"
 check "a live session of another version on this host is refused" contains "${OUT}" 'rc=1'
 check "the refusal names the version" contains "${OUT}" '2.2.4'
 
+# Same host and version, but the live holder recorded another build.
+build_holder() { # build_holder LOCKFILE ID SECONDS
+    mkdir -p "$(dirname -- "$1")"
+    {
+        exec 9<> "$1"
+        printf '%s\n' "$2" >&9
+        flock -s 9
+        exec sleep "$3"
+    } &
+    PIDS+=($!)
+    sleep 0.3
+}
+D="$(new_data samebuild)"
+build_holder "$(locks_of "${D}")/session@${HOST}@2.2.5.lock" "1:999999999" 4
+OUT="$(run_guard "${D}")"
+check "a live session of the same version but another build is refused" contains "${OUT}" 'rc=1'
+check "the refusal says the build differs" contains "${OUT}" 'different build'
+D="$(new_data samebuild-ok)"
+build_holder "$(locks_of "${D}")/session@${HOST}@2.2.5.lock" "$(oc2db_file_id "${NEW}")" 4
+OUT="$(run_guard "${D}")"
+check "a live session of the same build is allowed" contains "${OUT}" 'rc=0'
+check "the session records its build id in the lock file" bash -c '[[ "$(head -n1 "$1")" == "$2" ]]' _ "$(locks_of "${D}")/session@${HOST}@2.2.5.lock" "$(oc2db_file_id "${NEW}")"
+
 D="$(new_data stale)"
 mkdir -p "$(locks_of "${D}")"
 : > "$(locks_of "${D}")/session@gone.example@2.2.5.lock"
@@ -181,17 +204,17 @@ check "an old build in another PID namespace is refused" contains "${OUT}" 'rc=1
 
 # The lock must survive exec, and the backup job must not hold it.
 D="$(new_data persist)"
-printf '#!/bin/sh\necho "$@" >"%s/tool-args"\nexec sleep 8\n' "${T}" > "${T}/fake-tool"
+printf '#!/bin/sh\necho "$@" >"%s/tool-args"\necho $$ >"%s/tool-pid"\nexec sleep 8\n' "${T}" "${T}" > "${T}/fake-tool"
 chmod +x "${T}/fake-tool"
 OC2DB_TOOL="${T}/fake-tool" bash -c 'set -euo pipefail; source "$1"; oc2db_guard "$2" "$3"; exec sleep 3' _ "${LIB}" "${D}" "${NEW}" &
 PIDS+=($!)
 sleep 1
 LOCKFILE="$(locks_of "${D}")/session@${HOST}@2.2.5.lock"
 check "the lock is held across exec" bash -c '! flock -x -n "$1" true' _ "${LOCKFILE}"
-check "the backup job was started with --if-due" grep -q -- '--if-due' "${T}/tool-args"
+check "the backup job gets --data-dir before the subcommand" grep -q -- "^--data-dir ${D} backup --if-due" "${T}/tool-args"
 sleep 3
 check "the lock is released when the session ends, though the backup job still runs" lock_free "${LOCKFILE}"
-pkill -f "sleep 8" 2> /dev/null || true
+[[ -s "${T}/tool-pid" ]] && kill "$(cat "${T}/tool-pid")" 2> /dev/null
 
 # ── bin/opencode2-db ────────────────────────────────────────────────────
 
@@ -216,6 +239,14 @@ for i in range(300):
 c.commit()
 c.close()
 EOF
+mkdir -p "${T}/job/opencode"
+cp "${DB}" "${T}/job/opencode/opencode.db"
+env -u OC2DB_TOOL OC2DB_BACKUP_DELAY=0 bash -c 'set -euo pipefail; source "$1"; oc2db_guard "$2" "$3"' _ "${LIB}" "${T}/job/opencode" "${NEW}"
+for _ in $(seq 1 40); do
+    compgen -G "${T}/job/opencode-db-guard/backups/opencode-*.db.gz" > /dev/null && break
+    sleep 0.5
+done
+check "the guard starts the real backup tool, which writes a backup" compgen -G "${T}/job/opencode-db-guard/backups/opencode-*.db.gz" > /dev/null
 PD="${T}/py/share/opencode"
 GD="${T}/py/share/opencode-db-guard"
 

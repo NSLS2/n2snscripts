@@ -29,6 +29,7 @@ Three parts:
 | The last daily check found damage (`CHECK-FAILED` flag) | Refuse; the message says how to recover |
 | A session lock is held by another host | Refuse |
 | A session lock is held on this host by a different OpenCode version | Refuse |
+| A live session on this host with the same version recorded a different build of the binary (a reinstall of the same version while it runs) | Refuse |
 | An OpenCode 2 process of this user on this host runs a different binary (an old build still running after an upgrade), in any PID namespace | Refuse |
 | An unsandboxed OpenCode 2 process of this user on this host took no part in the locking (an older wrapper, started by hand, or the background service) | Refuse |
 | Same host, same version, sessions that hold their lock | Allow; any number may run together |
@@ -47,6 +48,9 @@ sessions on two hosts.
   the launcher; the launcher's `exec` passes the descriptor on (through `env`
   and `bwrap` for `bwopencode2`), so the lock lasts as long as any process
   still has it open.
+- Each session also writes the build id of its binary (device and inode) as the
+  first line of its lock file, under `guard.lock`, so a launch compares builds
+  even while the other launcher has not yet started its process.
 - A launch first holds `guard.lock` exclusively, so two launches cannot both
   pass the checks, then tries an exclusive, non-blocking lock on every other
   session lock file. A file it can lock has no holder: it is removed.
@@ -166,7 +170,7 @@ Do not call it for commands that never open the database (`--help`,
 | `OPENCODE2_DB_BACKUPS=N` | Backups to keep; `0` turns backups off (default 3) |
 | `OC2DB_PROG` | Program name in messages (set by the launcher) |
 | `OC2DB_TMPDIR` | Where `opencode2-db` makes its temporary copies (default `/var/tmp`) |
-| `OC2DB_PROC`, `OC2DB_TOOL` | Test hooks: an alternate `/proc`, and the backup command |
+| `OC2DB_PROC`, `OC2DB_TOOL`, `OC2DB_BACKUP_DELAY` | Test hooks: an alternate `/proc`, the backup command, and the seconds the background backup waits (default 30) |
 
 ## Limits
 

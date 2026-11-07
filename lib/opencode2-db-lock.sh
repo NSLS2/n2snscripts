@@ -11,7 +11,8 @@
 #
 # What oc2db_guard does, before OpenCode 2 starts:
 #   - refuses when another host holds a session lock (live session there);
-#   - refuses when this host has a session of a different version, or an
+#   - refuses when this host has a session of a different version, a session of
+#     the same version that recorded another build of the binary, or an
 #     OpenCode 2 process that is not the binary about to run (an old build still
 #     running after an upgrade);
 #   - refuses when an unsandboxed OpenCode 2 process of this user on this host
@@ -34,7 +35,8 @@
 #   OPENCODE2_DB_GUARD=off     skip every check (logged)
 #   OPENCODE2_DB_BACKUPS=N     backups to keep (default 3, 0 turns backups off)
 #   OC2DB_PROG                 name used in messages (set by the caller)
-#   OC2DB_PROC, OC2DB_TOOL     test hooks (alternate /proc, backup tool)
+#   OC2DB_PROC, OC2DB_TOOL,    test hooks (alternate /proc, backup tool, and the
+#   OC2DB_BACKUP_DELAY         seconds the background backup waits, default 30)
 #
 # Usage (callers use `|| exit 1`):
 #   source lib/opencode2-db-lock.sh
@@ -158,16 +160,36 @@ oc2db_scan_processes() {
     done
 }
 
-# Probe every session lock file except our own.  A file we can lock
-# exclusively has no holder: it is stale and is removed.  Fills
-# _OC2DB_HELD with "HOST VERSION" entries.
+# Probe every session lock file.  A file we can lock exclusively has no
+# holder: another host's or version's is stale and is removed.  Fills
+#   _OC2DB_HELD         "HOST VERSION" of live locks of another host or version
+#   _OC2DB_BUILD_CLASH  "HOST VERSION" when the live holders of OUR lock file
+#                       (this host, this version) recorded another build id
+# A session writes its build id (device:inode of the binary) as the first line
+# of its lock file, under guard.lock, so a build that has not started its
+# process yet is still compared.
 oc2db_probe_locks() {
-    local _locks="$1" _own="$2" _f _name _rest _host _ver _fd
+    local _locks="$1" _own="$2" _bin_id="$3" _f _name _rest _host _ver _fd _recorded
     _OC2DB_HELD=()
+    _OC2DB_BUILD_CLASH=()
     for _f in "${_locks}"/session@*.lock; do
         [[ -e "${_f}" ]] || continue
         _name="${_f##*/}"
-        [[ "${_name}" == "${_own}" ]] && continue
+        if [[ "${_name}" == "${_own}" ]]; then
+            if [[ -n "${_bin_id}" ]] && { exec {_fd}<> "${_f}"; } 2> /dev/null; then
+                if ! flock -x -n "${_fd}" 2> /dev/null; then
+                    _recorded=""
+                    IFS= read -r _recorded < "${_f}" || true
+                    if [[ -n "${_recorded}" && "${_recorded}" != "${_bin_id}" ]]; then
+                        _rest="${_name#session@}"
+                        _rest="${_rest%.lock}"
+                        _OC2DB_BUILD_CLASH+=("${_rest%%@*} ${_rest#*@}")
+                    fi
+                fi
+                exec {_fd}>&-
+            fi
+            continue
+        fi
         if { exec {_fd}<> "${_f}"; } 2> /dev/null; then
             if flock -x -n "${_fd}" 2> /dev/null; then
                 rm -f -- "${_f}"
@@ -240,7 +262,7 @@ oc2db_guard() {
         return 1
     fi
 
-    oc2db_probe_locks "${_locks}" "${_own}"
+    oc2db_probe_locks "${_locks}" "${_own}" "${_bin_id}"
     if ((${#_OC2DB_HELD[@]} > 0)); then
         _details=()
         for _h in "${_OC2DB_HELD[@]}"; do
@@ -250,6 +272,14 @@ oc2db_guard() {
         exec {_gfd}>&-
         # A session lock on this host with the same version is not in the list.
         oc2db_refuse "a session is running with the same database" "${_details[@]}"
+        return 1
+    fi
+
+    if ((${#_OC2DB_BUILD_CLASH[@]} > 0)); then
+        _details=("a live session on this host with the same version (${_ver}) recorded a different build of the binary")
+        _details+=("(for example a reinstall of the same version while it runs)")
+        exec {_gfd}>&-
+        oc2db_refuse "an OpenCode 2 of a different build is running on this host" "${_details[@]}"
         return 1
     fi
 
@@ -279,6 +309,8 @@ oc2db_guard() {
         ! flock -s -n "${OC2DB_SESSION_FD}" 2> /dev/null; then
         oc2db_warn "cannot take the session lock ${_locks}/${_own}; continuing without it"
         OC2DB_SESSION_FD=""
+    elif [[ -n "${_bin_id}" ]]; then
+        printf '%s\n' "${_bin_id}" 1>&"${OC2DB_SESSION_FD}" 2> /dev/null || true
     fi
     export OC2DB_GUARDED=1
     exec {_gfd}>&-
@@ -303,8 +335,8 @@ oc2db_backup_if_due() {
     command -v setsid > /dev/null 2>&1 && _run=(setsid "${_run[@]}")
     {
         [[ -n "${OC2DB_SESSION_FD}" ]] && exec {OC2DB_SESSION_FD}>&-
-        exec "${_run[@]}" "${_tool}" backup --if-due --delay 30 \
-            --data-dir "${_data}" --keep "${_keep}" \
+        exec "${_run[@]}" "${_tool}" --data-dir "${_data}" \
+            backup --if-due --delay "${OC2DB_BACKUP_DELAY:-30}" --keep "${_keep}" \
             < /dev/null > "${_gdir}/backup.log" 2>&1
     } &
     disown 2> /dev/null || true
