@@ -602,7 +602,9 @@ execution to that unsandboxed server. `bwopencode2` therefore:
   `opencode2` is started with no subcommand or a directory argument, or with
   `run`, `mini`, `models`, or `stats`;
 - refuses (exit status 1) `--server`, `--standalone=...`, `--no-standalone`,
-  and the `service`, `serve`, `api`, `pair`, and `reload` subcommands;
+  and the `service`, `serve`, `api`, `pair`, and `reload` subcommands (to run
+  a server, use [`--serve`](#--serve-the-web-ui-from-a-browser), which runs it
+  inside the sandbox);
 - passes the other subcommands (`auth`, `debug`, `mcp`, `plugin`, `session`,
   `upgrade`, `uninstall`, `acp`) through unchanged, since they do not accept
   `--standalone`.
@@ -615,6 +617,74 @@ so `bwopencode2 --exec 'opencode2 --server ...'` is not stopped (the host
 server password is no longer in the sandbox environment, see above). The config directory is
 read-only, so commands that write global config (for example `plugin add`)
 fail; edit config on the host.
+
+### `--serve`: the web UI from a browser
+
+`bwopencode2 --serve` is the one supported way to run `serve`. It runs
+`opencode2 serve` **inside** the sandbox, so tools stay sandboxed (the refusal
+above is about servers that run outside it), and the OpenCode web UI is then
+reachable from a browser.
+
+```text
+bwopencode2 --serve [--serve-port N]
+bwopencode2 --serve-ssh-config
+```
+
+- **One server per invocation.** Each `--serve` is its own sandbox with its own
+  server; stop it with Ctrl-C in its terminal.
+- **Bound to `127.0.0.1` only**, never another address. Reach it from another
+  machine through an ssh tunnel.
+- **Free port from a fixed range**, `24700-24709` by default (ten sessions at
+  once). The range sits below the kernel's ephemeral range (32768-60999 on
+  Linux), so no outgoing connection takes a server port, and clear of 49374
+  (the shared OpenCode service). `BWOPENCODE2_SERVE_PORTS=LO-HI` changes it
+  (at most 100 ports, 1024-65535, never including 49374; a warning is printed
+  if it overlaps the ephemeral range). `--serve-port N` asks for one port in
+  the range and fails if it is taken, so a saved tunnel always matches.
+- **The ssh tunnel.** At start the launcher prints
+  `ssh -L P:127.0.0.1:P <host>` with the host from `hostname -f`. For all
+  ports at once, `bwopencode2 --serve-ssh-config` prints a block for
+  `~/.ssh/config` on the machine with the browser (alias `<host>-oc`, one
+  `LocalForward` per port of the range, `ExitOnForwardFailure no` so a busy local
+  port does not stop the others). Keep the same port number at both ends: the
+  browser cookie is named by it (see below). Add `User` and `ProxyJump` to the
+  alias as needed.
+- **Password.** The server needs one (Basic auth, user `opencode`; the web UI
+  asks for the password). The launcher uses a **random password for each
+  session** and prints it at start. To use a fixed one, export
+  `BWOPENCODE2_SERVE_PASSWORD` (at least 12 characters, for example from
+  `load-env`); the launcher prints nothing about it. Either way it reaches the
+  server only as `OPENCODE_PASSWORD` in the sandbox environment (the host's
+  own `OPENCODE_PASSWORD` is still dropped) and is never written to a file.
+  Trade-off: a sandboxed agent can read its own environment, so it can read its
+  password. With a random password that only reaches its own session. With a
+  fixed one it reaches every session that shares it, and any sandboxed agent on
+  the host could drive them all. Prefer the random default.
+- **Port claims.** A file `~/.local/state/bwopencode2/serve/<port>.session` (host
+  side, not mounted in the sandbox; the port, launcher pid, host, directory and
+  start time, no secret) stops two launchers picking the same port. A claim
+  whose process is gone is stale and is removed on the next `--serve`. The
+  launcher ends in `exec`, so it cannot retry or clean up afterwards; the
+  remaining race is another program taking the port in the moment before the
+  server binds it, and then the server fails to start with an error: run it
+  again.
+- **Limits.** `--serve` takes no opencode2 arguments and cannot be combined with
+  `--exec`; `serve`, `--server`, `pair` and the other refused arguments stay
+  refused. `--dry-run` shows the command (password redacted) and claims
+  nothing.
+- **Cookie.** The server names its login cookie `opencode_session_<port>` from
+  the port in the address the browser used (checked with 2.2.6 using curl), so
+  sessions on different ports do not log each other out. The cookie holds an
+  expiry (30 days) and a hash made with the server password: with a fixed
+  password a cookie is accepted by any session that shares it, with a random
+  one it stops working when the session ends.
+
+Checked against OpenCode 2.2.6 with curl and an isolated data directory: the
+server answers 401 without the password and 200 with it, serves the web UI page
+without a password, and `POST /api/pair` with the password gives a one-time link
+that sets the cookie. Not checked, because it needs a browser: the password
+prompt in the web UI, and two sessions open in one browser. Whether the agent
+can read `OPENCODE_PASSWORD` in tool output (`printenv`) is also unchecked.
 
 ## `bwclaude`
 
