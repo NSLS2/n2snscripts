@@ -80,6 +80,12 @@
 # commands that accept it and refuses --server and the server-related
 # commands (service, serve, api, pair, reload).  See --help.
 #
+# --serve is the one deliberate exception: it runs `opencode2 serve` INSIDE this
+# sandbox (tools stay sandboxed), bound to 127.0.0.1 on a free port from a fixed
+# range and protected by a password, so the OpenCode web UI can be opened from a
+# browser (over an ssh -L tunnel).  The launcher builds those arguments itself;
+# nothing from the command line reaches `serve`.  See docs/bw-wrappers.md.
+#
 # Usage:
 #   bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 #   bwopencode2 --help
@@ -94,6 +100,13 @@
 #   --new-session   Force bwrap --new-session even on kernels with the TIOCSTI cap
 #                   guard.  Detaches the controlling tty for stricter isolation at the
 #                   cost of SIGWINCH (terminal resize) propagation.
+#   --serve         Run the OpenCode web UI server inside the sandbox instead of the
+#                   TUI (see above).  One server per invocation.
+#   --serve-port N  With --serve: use port N (must be in the range) instead of the
+#                   first free one.
+#   --serve-ssh-config
+#                   Print the ssh_config block that forwards the whole port range, then
+#                   exit.
 #   --n2c-token NAME  Mount the N2C access token NAME read-only (for NSLS-II API
 #                   skills).  May be repeated; `all` mounts every token present.
 #                   Off by default.  The refresh token is never mounted.
@@ -138,6 +151,24 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 FORWARD_GH_TOKENS=0
 OC2_CONFIG_BINDS=()
 
+# --serve state.  The password is passed to the server only as OPENCODE_PASSWORD
+# (see build_opencode2_env) and is never written to a file.
+SERVE=0
+SERVE_SSH_CONFIG=0
+SERVE_PORT_REQUEST=""
+SERVE_PORT=""
+SERVE_PASSWORD=""
+SERVE_PASSWORD_RANDOM=0
+SERVE_PORT_LO=""
+SERVE_PORT_HI=""
+SERVE_STATE_DIR=""
+# Default range: below the kernel's ephemeral range (32768-60999 on Linux, so no
+# outgoing connection takes a server port), clear of the shared OpenCode service
+# (49374) and of the ports in use on the workstations.  Keep ssh_config in step
+# with it: --serve-ssh-config prints the matching block.
+SERVE_DEFAULT_PORTS="24700-24709"
+SERVE_SHARED_SERVICE_PORT=49374
+
 # ═══════════════════════════════════════════════════════════════════
 # Tool-specific functions
 # ═══════════════════════════════════════════════════════════════════
@@ -181,6 +212,22 @@ parse_wrapper_args() {
             --no-sandbox-context)
                 # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
                 SANDBOX_CONTEXT_ENABLED=0
+                shift
+                ;;
+            --serve)
+                SERVE=1
+                shift
+                ;;
+            --serve-port)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --serve-port requires a port number." >&2
+                    exit 1
+                fi
+                SERVE_PORT_REQUEST="$2"
+                shift 2
+                ;;
+            --serve-ssh-config)
+                SERVE_SSH_CONFIG=1
                 shift
                 ;;
             --ro-path)
@@ -230,6 +277,21 @@ Wrapper options (consumed before opencode2 sees the command line):
                   (< 5.14); on newer kernels we omit it so that SIGWINCH (terminal
                   resize) propagates from tmux/screen.  Use this flag to opt back
                   into stricter terminal isolation when SIGWINCH is not important.
+  --serve         Run the OpenCode web UI server inside the sandbox instead of the
+                  TUI: `opencode2 serve` on 127.0.0.1 (never another address), on
+                  the first free port of the range 24700-24709 (override the range
+                  with BWOPENCODE2_SERVE_PORTS=LO-HI), tools still sandboxed.  Open
+                  it from a browser through an ssh tunnel; the command and the
+                  password are printed at start.  The password is random for each
+                  session unless BWOPENCODE2_SERVE_PASSWORD is set (at least 12
+                  characters; a fixed password is shared by every session that
+                  uses it).  Takes no opencode2 arguments and cannot be combined
+                  with --exec.  One server per invocation.
+  --serve-port N  With --serve, use port N (inside the range) instead of the first
+                  free one; fails if it is taken.
+  --serve-ssh-config
+                  Print the ssh_config block (one alias, one LocalForward per port
+                  of the range) for the machine your browser runs on, then exit.
   --n2c-token NAME
                   Mount the N2C access token NAME (read-only) so skills inside
                   the sandbox can call NSLS-II APIs, for example observability,
@@ -281,6 +343,7 @@ that take a value are only recognised for --session/-s, --prompt, --log-level
 and --completions.  Arguments after `--` are never inspected.
 
 --exec runs an arbitrary command and therefore bypasses this argument guard.
+--serve is the one way to run `serve`: the wrapper builds its arguments itself.
 
 Also kept out of the sandbox: service.json (service settings), all OPENCODE_*
 environment variables except a short allowlist of harmless switches (see
@@ -295,6 +358,257 @@ HELP_EOF
     # --exec so the sandbox is fully constructed; opencode2 --help is passed
     # as the sandbox command.
     bwrap_show_tool_help opencode2
+}
+
+# ── --serve: OpenCode web UI server inside the sandbox ───────────
+# `opencode2 serve` is refused as a command-line argument (see the guard below)
+# because the shared service it could reach runs tools outside any sandbox.
+# --serve runs the server inside THIS sandbox instead, so tools stay sandboxed:
+#   - bound to 127.0.0.1 only; reach it from a browser with an ssh -L tunnel;
+#   - one server per invocation, on the first free port of a fixed range, so one
+#     ssh_config block covers every session (--serve-ssh-config);
+#   - protected by a password that reaches the server only as OPENCODE_PASSWORD.
+#     It is random for each session unless BWOPENCODE2_SERVE_PASSWORD is set.
+#     A fixed password is shared by all sessions that use it: any process that
+#     holds it (including a sandboxed agent that can read its own environment)
+#     can drive every one of them.
+# The launcher execs bwrap, so it cannot clean up or retry after the server
+# starts.  A port is claimed with a file in the host-side state directory (not
+# mounted in the sandbox), which stops two launchers picking one port; a claim
+# whose process is gone is stale and is removed.  The remaining race is another
+# program taking the port in the moment before the server binds it.
+
+serve_host_name() {
+    hostname -f 2> /dev/null || hostname
+}
+
+serve_ssh_alias() {
+    local _h
+    _h="$(hostname -s 2> /dev/null || hostname)"
+    printf '%s-oc' "${_h%%.*}"
+}
+
+# Validate BWOPENCODE2_SERVE_PORTS (LO-HI) into SERVE_PORT_LO / SERVE_PORT_HI.
+serve_parse_range() {
+    local _spec="${BWOPENCODE2_SERVE_PORTS:-${SERVE_DEFAULT_PORTS}}"
+    if [[ ! "${_spec}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        echo "Error: BWOPENCODE2_SERVE_PORTS must look like 24700-24709 (got '${_spec}')." >&2
+        exit 1
+    fi
+    SERVE_PORT_LO=$((10#${BASH_REMATCH[1]}))
+    SERVE_PORT_HI=$((10#${BASH_REMATCH[2]}))
+    if ((SERVE_PORT_LO < 1024 || SERVE_PORT_HI > 65535 || SERVE_PORT_LO > SERVE_PORT_HI)); then
+        echo "Error: BWOPENCODE2_SERVE_PORTS must be an ascending range within 1024-65535 (got '${_spec}')." >&2
+        exit 1
+    fi
+    if ((SERVE_PORT_HI - SERVE_PORT_LO > 99)); then
+        echo "Error: BWOPENCODE2_SERVE_PORTS may hold at most 100 ports (got '${_spec}')." >&2
+        exit 1
+    fi
+    if ((SERVE_SHARED_SERVICE_PORT >= SERVE_PORT_LO && SERVE_SHARED_SERVICE_PORT <= SERVE_PORT_HI)); then
+        echo "Error: BWOPENCODE2_SERVE_PORTS must not include ${SERVE_SHARED_SERVICE_PORT}, the port of the shared OpenCode service." >&2
+        exit 1
+    fi
+    local _eph_lo _eph_hi
+    if read -r _eph_lo _eph_hi < /proc/sys/net/ipv4/ip_local_port_range 2> /dev/null &&
+        [[ "${_eph_lo}" =~ ^[0-9]+$ && "${_eph_hi}" =~ ^[0-9]+$ ]] &&
+        ((SERVE_PORT_HI >= _eph_lo && SERVE_PORT_LO <= _eph_hi)); then
+        printf 'bwopencode2: warning: ports %s-%s overlap the kernel ephemeral range %s-%s; an outgoing connection can take a server port.\n' \
+            "${SERVE_PORT_LO}" "${SERVE_PORT_HI}" "${_eph_lo}" "${_eph_hi}" >&2
+    fi
+}
+
+# Print the ssh_config block for the port range (--serve-ssh-config).
+serve_print_ssh_config() {
+    local _p
+    printf '# Add to ~/.ssh/config on the machine your browser runs on, then: ssh %s\n' "$(serve_ssh_alias)"
+    printf '# One forward per port of the bwopencode2 --serve range %s-%s.  A port with no\n' "${SERVE_PORT_LO}" "${SERVE_PORT_HI}"
+    printf '# session behind it just refuses connections.  Add User / ProxyJump as needed.\n'
+    printf 'Host %s\n' "$(serve_ssh_alias)"
+    printf '    HostName %s\n' "$(serve_host_name)"
+    printf '    ExitOnForwardFailure no\n'
+    for ((_p = SERVE_PORT_LO; _p <= SERVE_PORT_HI; _p++)); do
+        printf '    LocalForward %s 127.0.0.1:%s\n' "${_p}" "${_p}"
+    done
+}
+
+# Refuse combinations that make no sense; validate --serve-port.
+serve_check_args() {
+    if [[ "${SERVE}" -eq 0 ]]; then
+        if [[ -n "${SERVE_PORT_REQUEST}" ]]; then
+            echo "Error: --serve-port needs --serve." >&2
+            exit 1
+        fi
+        return 0
+    fi
+    if [[ -n "${TEST_CMD}" ]]; then
+        echo "Error: --serve cannot be combined with --exec." >&2
+        exit 1
+    fi
+    if [[ ${#TOOL_ARGS[@]} -gt 0 ]]; then
+        echo "Error: --serve takes no opencode2 arguments (got '${TOOL_ARGS[*]}')." >&2
+        exit 1
+    fi
+    if [[ -n "${SERVE_PORT_REQUEST}" ]]; then
+        if [[ ! "${SERVE_PORT_REQUEST}" =~ ^[0-9]+$ ]] ||
+            ((10#${SERVE_PORT_REQUEST} < SERVE_PORT_LO || 10#${SERVE_PORT_REQUEST} > SERVE_PORT_HI)); then
+            echo "Error: --serve-port must be a port in ${SERVE_PORT_LO}-${SERVE_PORT_HI} (the ssh_config range), got '${SERVE_PORT_REQUEST}'." >&2
+            exit 1
+        fi
+        SERVE_PORT_REQUEST=$((10#${SERVE_PORT_REQUEST}))
+    fi
+}
+
+# True when nothing listens on 127.0.0.1:PORT (the bind succeeds, as the server's
+# would; SO_REUSEADDR as a server sets it, so a lingering TIME_WAIT does not count).
+serve_port_is_free() {
+    local _port="$1"
+    if command -v python3 > /dev/null 2>&1; then
+        python3 -c '
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+' "${_port}" 2> /dev/null
+    else
+        # No python3: a successful connection means something listens.
+        if (exec 3<> "/dev/tcp/127.0.0.1/${_port}") 2> /dev/null; then
+            return 1
+        fi
+    fi
+}
+
+# True when claim file F belongs to a launcher that is still running.  A file
+# without a pid is being written by another launcher: live unless it is old.
+serve_claim_is_live() {
+    local _f="$1" _pid _mtime _now
+    [[ -e "${_f}" ]] || return 1
+    _pid="$(sed -n 's/^pid=//p' "${_f}" 2> /dev/null | head -n 1)"
+    if [[ "${_pid}" =~ ^[0-9]+$ ]]; then
+        kill -0 "${_pid}" 2> /dev/null
+        return
+    fi
+    _mtime="$(stat -c %Y "${_f}" 2> /dev/null || echo 0)"
+    _now="$(date +%s)"
+    ((_now - _mtime < 10))
+}
+
+# Claim PORT atomically.  The file holds no secret: the pid is this launcher's,
+# which stays the pid of the bwrap process because the launch ends in exec.
+serve_claim_port() {
+    local _port="$1" _f="${SERVE_STATE_DIR}/$1.session"
+    if serve_claim_is_live "${_f}"; then
+        return 1
+    fi
+    rm -f "${_f}"
+    (set -o noclobber && : > "${_f}") 2> /dev/null || return 1
+    {
+        printf 'pid=%s\n' "$$"
+        printf 'port=%s\n' "${_port}"
+        printf 'host=%s\n' "$(serve_host_name)"
+        printf 'dir=%s\n' "${_PWD}"
+        printf 'started=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "${_f}"
+}
+
+# Pick the port (the requested one, or the first free one of the range).  On
+# --dry-run nothing is claimed and no directory is created.
+serve_choose_port() {
+    local _p _f
+    SERVE_STATE_DIR="${_HOME}/.local/state/bwopencode2/serve"
+    local -a _candidates=()
+    if [[ -n "${SERVE_PORT_REQUEST}" ]]; then
+        _candidates=("${SERVE_PORT_REQUEST}")
+    else
+        for ((_p = SERVE_PORT_LO; _p <= SERVE_PORT_HI; _p++)); do
+            _candidates+=("${_p}")
+        done
+    fi
+
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p "${SERVE_STATE_DIR}"
+        chmod 700 "${SERVE_STATE_DIR}"
+        for _f in "${SERVE_STATE_DIR}"/*.session; do
+            [[ -e "${_f}" ]] || continue
+            serve_claim_is_live "${_f}" || rm -f "${_f}"
+        done
+    fi
+
+    for _p in "${_candidates[@]}"; do
+        _f="${SERVE_STATE_DIR}/${_p}.session"
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            serve_claim_is_live "${_f}" && continue
+            serve_port_is_free "${_p}" || continue
+        else
+            serve_claim_port "${_p}" || continue
+            if ! serve_port_is_free "${_p}"; then
+                rm -f "${_f}"
+                continue
+            fi
+        fi
+        SERVE_PORT="${_p}"
+        return 0
+    done
+
+    if [[ -n "${SERVE_PORT_REQUEST}" ]]; then
+        echo "Error: port ${SERVE_PORT_REQUEST} is in use." >&2
+    else
+        echo "Error: no free port in ${SERVE_PORT_LO}-${SERVE_PORT_HI}; stop a session or see ${SERVE_STATE_DIR}/." >&2
+    fi
+    exit 1
+}
+
+# Set SERVE_PASSWORD: BWOPENCODE2_SERVE_PASSWORD, else a random one.
+serve_make_password() {
+    if [[ -n "${BWOPENCODE2_SERVE_PASSWORD:-}" ]]; then
+        if ((${#BWOPENCODE2_SERVE_PASSWORD} < 12)); then
+            echo "Error: BWOPENCODE2_SERVE_PASSWORD must have at least 12 characters." >&2
+            exit 1
+        fi
+        SERVE_PASSWORD="${BWOPENCODE2_SERVE_PASSWORD}"
+        SERVE_PASSWORD_RANDOM=0
+        return 0
+    fi
+    if command -v openssl > /dev/null 2>&1; then
+        SERVE_PASSWORD="$(openssl rand -hex 16)"
+    else
+        SERVE_PASSWORD="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    fi
+    if [[ ${#SERVE_PASSWORD} -lt 32 ]]; then
+        echo "Error: could not generate a random password." >&2
+        exit 1
+    fi
+    SERVE_PASSWORD_RANDOM=1
+}
+
+# Choose port and password, and give the server its arguments.
+serve_prepare() {
+    serve_choose_port
+    serve_make_password
+    TOOL_ARGS=(serve --hostname 127.0.0.1 --port "${SERVE_PORT}")
+}
+
+# Tell the user how to reach the server (stderr, before the exec).
+serve_print_info() {
+    local _p="${SERVE_PORT}" _host _alias
+    _host="$(serve_host_name)"
+    _alias="$(serve_ssh_alias)"
+    {
+        printf '\nbwopencode2: sandboxed OpenCode 2 web UI on 127.0.0.1:%s (this host only)\n' "${_p}"
+        printf '  1. On the machine with your browser, forward the port:\n'
+        printf '       ssh -L %s:127.0.0.1:%s %s\n' "${_p}" "${_p}" "${_host}"
+        printf '     or use the ssh_config alias (bwopencode2 --serve-ssh-config):  ssh %s\n' "${_alias}"
+        printf '     (on this host itself, skip this step)\n'
+        printf '  2. Open http://127.0.0.1:%s/ and enter the server password when asked.\n' "${_p}"
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            printf '     Password: (not shown on --dry-run)\n'
+        elif [[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]]; then
+            printf '     Password (new for this session): %s\n' "${SERVE_PASSWORD}"
+        else
+            printf '     Password: the value of BWOPENCODE2_SERVE_PASSWORD (shared by every session that uses it)\n'
+        fi
+        printf '  Keep the same port number at both ends of the tunnel: the browser cookie is named by it.\n\n'
+    } >&2
 }
 
 # ── Sandbox-escape guard (arguments) ─────────────────────────────
@@ -746,6 +1060,13 @@ build_opencode2_env() {
         printf 'bwopencode2: dry-run: dropped host OPENCODE_* variables (not in allowlist): %s\n' "${_dropped[*]}" >&2
     fi
 
+    # --serve: the password of the server this sandbox itself runs.  It is set
+    # here, after the host variables were dropped above, so it is the only
+    # OPENCODE_PASSWORD the sandbox sees and never one of the host's.
+    if [[ "${SERVE}" -eq 1 ]]; then
+        SANDBOX_ENV+=("OPENCODE_PASSWORD=${SERVE_PASSWORD}")
+    fi
+
     # GitHub CLI token passthrough (opt-in via --github-tokens).  In
     # --dry-run, print_dry_run redacts the values (the names match *TOKEN*).
     if [[ "${FORWARD_GH_TOKENS}" -eq 1 ]]; then
@@ -765,6 +1086,11 @@ build_opencode2_context() {
         "Only run \`opencode2\` with \`--standalone\`. Without it the CLI talks to a shared background service (port 49374) that runs tools OUTSIDE this sandbox."
         "Plan mode writes plan files to \`~/.opencode/plan/\`, which is not mounted: they are lost at exit unless the plan-mirror plugin keeps them."
     )
+    if [[ "${SERVE}" -eq 1 ]]; then
+        SANDBOX_CONTEXT_NOTES+=(
+            "This session is a sandboxed \`opencode2 serve\` (the OpenCode web UI), started by \`bwopencode2 --serve\`. Do not start or connect to any other OpenCode server."
+        )
+    fi
     build_sandbox_context bwopencode2
     [[ -n "${SANDBOX_CONTEXT_PATH}" && -z "${TEST_CMD}" ]] || return 0
 
@@ -789,11 +1115,20 @@ main() {
         # show_help never returns
     fi
 
+    serve_parse_range
+    if [[ "${SERVE_SSH_CONFIG}" -eq 1 ]]; then
+        serve_print_ssh_config
+        exit 0
+    fi
+    serve_check_args
+
     bwrap_resolve_tool opencode2 "OpenCode 2 is installed by the ansible base role."
     use_opencode2_binary
 
     # --exec runs an arbitrary command, so its arguments are not opencode2's.
-    if [[ -z "${TEST_CMD}" ]]; then
+    # --serve builds its own arguments (serve_prepare), so the guard, which
+    # refuses `serve`, does not apply to them.
+    if [[ -z "${TEST_CMD}" && "${SERVE}" -eq 0 ]]; then
         guard_tool_args
     fi
 
@@ -801,6 +1136,9 @@ main() {
     detect_kernel_capabilities
     resolve_common_paths
     resolve_opencode2_paths
+    if [[ "${SERVE}" -eq 1 ]]; then
+        serve_prepare
+    fi
     # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
     require_opencode_config bwopencode2 "${OC2_CONFIG_SRC}"
     detect_shell
@@ -849,6 +1187,9 @@ main() {
     build_binary_masks
 
     # Launch
+    if [[ "${SERVE}" -eq 1 ]]; then
+        serve_print_info
+    fi
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         print_dry_run
     else
