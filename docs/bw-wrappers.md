@@ -627,8 +627,21 @@ bwopencode2 --serve-ssh-config
   port does not stop the others). Keep the same port number at both ends: the
   browser cookie is named by it (see below). Add `User` and `ProxyJump` to the
   alias as needed.
-- **Password.** The server needs one (Basic auth, user `opencode`; the web UI
-  asks for the password). The launcher uses a **random password for each
+- **Signing in.** The web UI opens on a "Connect to a server" page that asks
+  for a pairing link and offers **Use password**. Do not run `opencode pair`
+  (the wrapper refuses it, and outside the sandbox it points at the shared
+  service). Instead the sandbox runs a small wrapper, not `opencode2 serve`
+  directly: it starts the server, waits until it answers, asks it for a
+  one-time pairing code and prints
+  `http://127.0.0.1:<port>/auth/connect/<code>`. Open that link (through the
+  tunnel) to be signed in, with the 30-day cookie, without typing the password.
+  The link works once and expires after 5 minutes; after that, or if the
+  printed link failed, click **Use password** and enter the password. The
+  password reaches `curl` on its standard input (`-K -`), never on a command
+  line, because a process in the sandbox is visible to `ps` on the host. The
+  wrapper stays in the foreground and stops the server on Ctrl-C or when the
+  sandbox ends.
+- **Password.** The server needs one (Basic auth, user `opencode`). The launcher uses a **random password for each
   session** and prints it at start. To use a fixed one, export
   `BWOPENCODE2_SERVE_PASSWORD` (at least 12 characters, for example from
   `load-env`); the launcher prints nothing about it. Either way it reaches the
@@ -660,9 +673,15 @@ bwopencode2 --serve-ssh-config
 Checked against OpenCode 2.2.6 with curl and an isolated data directory: the
 server answers 401 without the password and 200 with it, serves the web UI page
 without a password, and `POST /api/pair` with the password gives a one-time link
-that sets the cookie. Not checked, because it needs a browser: the password
-prompt in the web UI, and two sessions open in one browser. Whether the agent
-can read `OPENCODE_PASSWORD` in tool output (`printenv`) is also unchecked.
+that sets the cookie. The pairing wrapper was run in a sandbox against a
+throwaway server (isolated data directories): it printed a link that signed in
+with `Set-Cookie: opencode_session_<port>` and worked only once, the password
+appeared in no process command line that was sampled, and TERM stopped the
+server. The web UI's "Use password" page was seen in a screenshot. Not checked,
+because it needs a browser or the real launcher: signing in with the link in a
+browser, entering the password, a Ctrl-C from the terminal, and two sessions
+open in one browser. Whether the agent can read `OPENCODE_PASSWORD` in tool
+output (`printenv`) is also unchecked.
 
 ## `bwclaude`
 

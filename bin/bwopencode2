@@ -281,8 +281,10 @@ Wrapper options (consumed before opencode2 sees the command line):
                   TUI: `opencode2 serve` on 127.0.0.1 (never another address), on
                   the first free port of the range 24700-24709 (override the range
                   with BWOPENCODE2_SERVE_PORTS=LO-HI), tools still sandboxed.  Open
-                  it from a browser through an ssh tunnel; the command and the
-                  password are printed at start.  The password is random for each
+                  it from a browser through an ssh tunnel; the command, a one-time
+                  pairing link (valid 5 minutes) and the password are printed at
+                  start; the web UI's "Use password" button also works.  The
+                  password is random for each
                   session unless BWOPENCODE2_SERVE_PASSWORD is set (at least 12
                   characters; a fixed password is shared by every session that
                   uses it).  Takes no opencode2 arguments and cannot be combined
@@ -581,11 +583,60 @@ serve_make_password() {
     SERVE_PASSWORD_RANDOM=1
 }
 
-# Choose port and password, and give the server its arguments.
+# The command run INSIDE the sandbox for --serve: start the server, then print a
+# one-time pairing link so the browser can sign in without typing the password
+# (the web UI's "Use password" button still works).  It runs as
+# `bash -c SERVE_WRAPPER bwopencode2-serve BINARY PORT`.  OPENCODE_PASSWORD is in
+# its environment.  The password reaches curl on stdin (-K -), never on a command
+# line: a process in the sandbox is visible to `ps` on the host.  printf is a
+# builtin, so it does not show either.  Needs only bash and curl.
+read -r -d '' SERVE_WRAPPER << 'SERVE_WRAPPER_EOF' || true
+set -u
+bin=$1 port=$2
+base="http://127.0.0.1:${port}"
+
+"$bin" serve --hostname 127.0.0.1 --port "$port" &
+srv=$!
+trap 'kill "$srv" 2>/dev/null' INT TERM HUP
+
+# Wait up to about 30 s for the server to answer; without credentials /api/info
+# gives 401, which is enough to know it is listening.
+ready=0
+for _ in $(seq 60); do
+    kill -0 "$srv" 2> /dev/null || break
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${base}/api/info") || code=000
+    if [[ $code == 401 || $code == 200 ]]; then
+        ready=1
+        break
+    fi
+    sleep 0.5
+done
+
+{
+    if [[ $ready -eq 1 ]]; then
+        resp=$(printf 'user = "opencode:%s"\n' "$OPENCODE_PASSWORD" |
+            curl -s -K - -X POST "${base}/api/pair") || resp=""
+        if [[ $resp =~ \"code\":\"([A-Za-z0-9_-]+)\" ]]; then
+            printf '\nbwopencode2: pairing link (works once, expires in 5 minutes):\n'
+            printf '  %s/auth/connect/%s\n' "$base" "${BASH_REMATCH[1]}"
+            printf '  After it expires, click "Use password" in the web UI instead.\n\n'
+        else
+            printf 'bwopencode2: could not get a pairing link; click "Use password" in the web UI.\n'
+        fi
+    else
+        printf 'bwopencode2: the server did not start listening on %s.\n' "$base"
+    fi
+} >&2
+
+wait "$srv"
+SERVE_WRAPPER_EOF
+
+# Choose port and password, and give the sandbox its command.
 serve_prepare() {
     serve_choose_port
     serve_make_password
-    TOOL_ARGS=(serve --hostname 127.0.0.1 --port "${SERVE_PORT}")
+    _TOOL_CMD=(/usr/bin/bash -c "${SERVE_WRAPPER}" bwopencode2-serve "${_TOOL_BIN}" "${SERVE_PORT}")
+    TOOL_ARGS=()
 }
 
 # Tell the user how to reach the server (stderr, before the exec).
@@ -599,7 +650,9 @@ serve_print_info() {
         printf '       ssh -L %s:127.0.0.1:%s %s\n' "${_p}" "${_p}" "${_host}"
         printf '     or use the ssh_config alias (bwopencode2 --serve-ssh-config):  ssh %s\n' "${_alias}"
         printf '     (on this host itself, skip this step)\n'
-        printf '  2. Open http://127.0.0.1:%s/ and enter the server password when asked.\n' "${_p}"
+        printf '  2. Open the pairing link printed below once the server is up (it works once and\n'
+        printf '     expires in 5 minutes), or open http://127.0.0.1:%s/, click "Use password"\n' "${_p}"
+        printf '     and enter the server password.\n'
         if [[ "${DRY_RUN}" -eq 1 ]]; then
             printf '     Password: (not shown on --dry-run)\n'
         elif [[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]]; then
