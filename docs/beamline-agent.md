@@ -46,26 +46,28 @@ adds them is only read by a login shell.
   accounts so each can read what the other writes. This runs as the caller,
   who owns their home, so it needs no root and no prior ansible run.
 - **The profile collection.** `~<caller>/.ipython/profile_collection`, mounted
-  read-write so the agent can edit and commit in the real repository, and
-  resolved first because on some hosts it is a symlink to shared storage and
-  the sandbox mounts the target. The same ACLs are applied to it: without
-  default entries, the git objects the agent writes are unwritable by the
-  caller, who is then locked out of committing after the agent has — which is
-  the whole hand-off. Not fatal if the filesystem refuses them, since the
-  agent is still useful read-only.
+  read-write so the agent can edit the real repository, and resolved first
+  because on some hosts it is a symlink to shared storage and the sandbox
+  mounts the target. The same ACLs are applied to it: without default
+  entries, the files the agent writes are unwritable by the caller, who is
+  then locked out of committing them — which is the whole hand-off. Not fatal
+  if the filesystem refuses them, since the agent is still useful read-only.
 
   A caller cannot aim that symlink at another beamline: the launcher resolves
   it as them and refuses a target they cannot write. That catches a mistake
   rather than a determined caller, who owns the link and can repoint it after
   the check; scoping the agent account per beamline is what would make it
   pointless.
-- **A git identity.** The agent account has no git config, and git refuses to
-  work in a repository someone else owns, so the launcher writes a
-  `.gitconfig` in `$HOME` with `user.name` naming the caller
-  (`<caller> (beamline agent)`) and `safe.directory` for the agent directory
-  and the profile collection. There are no GitHub credentials in the sandbox,
-  so the agent commits and a person pushes; the launcher says so at startup
-  and gives the command.
+- **A git config.** git refuses every command in a repository someone else
+  owns, so the launcher writes a `.gitconfig` in `$HOME` with
+  `safe.directory` for the agent directory and the profile collection.
+  Without it the agent cannot even run `git status`.
+
+  No `user.name` is set. The agent edits but does not commit, and leaving the
+  identity out makes a commit fail with "please tell me who you are" rather
+  than succeed quietly. That guards a mistake rather than a determined agent,
+  which can pass `git -c user.name`. There are no GitHub credentials either,
+  so a person reviews and commits; the launcher says so at startup.
 - **`HOME`.** A directory per session, `mktemp -d` under
   `/run/nsls2/agent/home/<caller>/`, which the `n2c_agent` role makes on the
   tmpfs next to the tokens. The wrappers create their authoring directories

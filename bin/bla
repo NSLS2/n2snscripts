@@ -67,11 +67,6 @@ readonly PROFILE_COLLECTION=.ipython/profile_collection
 # The one directory the agent may write in, inside the caller's home.
 readonly AGENT_SUBDIR=agent
 
-# What the agent's commits are signed with. The account is shared, so the
-# name carries the caller; the address does not receive mail.
-readonly GIT_IDENTITY="beamline agent"
-readonly GIT_EMAIL=noreply@bnl.gov
-
 die() {
     echo "${PROGRAM_NAME}: $*" >&2
     exit 1
@@ -127,22 +122,22 @@ write_npm_config() {
         > "${agent_home}/.npmrc" || die "cannot write '${agent_home}/.npmrc'"
 }
 
-# write_git_config AGENT_HOME CALLER DIR...
-#   Give the agent an identity to commit with, and mark DIRs safe. Both are
-#   needed: the agent account has no git config of its own, and git refuses to
-#   work in a repository owned by someone else, which every one of these is —
-#   they belong to the caller, or to the beamline on shared storage.
+# write_git_config AGENT_HOME DIR...
+#   Mark DIRs safe. git refuses every command in a repository owned by someone
+#   else — which each of these is, belonging to the caller or to the beamline
+#   on shared storage — so without this the agent cannot even run git status.
 #
-#   Written in $HOME, which the wrappers mount into the sandbox. The identity
-#   names the caller because the account is shared: the commit says who asked
-#   for it, matching the audit line. The address does not receive mail.
+#   No identity is set. The agent edits but does not commit, and leaving the
+#   identity out makes a commit fail with "please tell me who you are" rather
+#   than succeed quietly. A guard against a mistake, not a boundary: anyone
+#   can pass git -c user.name.
+#
+#   Written in $HOME, which the wrappers mount into the sandbox.
 write_git_config() {
-    local agent_home="$1" caller="$2" dir
-    shift 2
+    local agent_home="$1" dir
+    shift
     {
-        printf '# %s\n[user]\n\tname = %s (%s)\n\temail = %s\n' \
-            "written by ${PROGRAM_NAME}" "${caller}" "${GIT_IDENTITY}" "${GIT_EMAIL}"
-        printf '[safe]\n'
+        printf '# %s\n[safe]\n' "written by ${PROGRAM_NAME}"
         for dir in "$@"; do
             # continue, not &&: a false test on the last argument would be the
             # group's exit status and look like a write failure.
@@ -152,20 +147,20 @@ write_git_config() {
     } > "${agent_home}/.gitconfig" || die "cannot write '${agent_home}/.gitconfig'"
 }
 
-# say_how_to_publish CALLER [PROFILE]
-#   The agent can commit but never push: the sandbox has no GitHub credentials
-#   and no SSH. Say so at the start, with the command to publish afterwards,
-#   or the work looks lost.
+# say_how_to_publish [PROFILE]
+#   The agent edits but neither commits nor pushes: the sandbox has no git
+#   identity, no GitHub credentials and no SSH. Say so at the start, with the
+#   command to review afterwards, or the work looks lost.
 say_how_to_publish() {
-    local caller="$1" profile="$2"
+    local profile="$1"
 
     [[ -n "${profile}" ]] || return 0
     cat >&2 << EOF
 ${PROGRAM_NAME}: the profile collection is mounted read-write at
   ${profile}
-The agent commits there as '${caller} (${GIT_IDENTITY})'. It cannot push: the
-sandbox has no GitHub credentials. Review and publish it yourself afterwards:
-  cd ${profile} && git log --oneline && git push
+The agent edits it but does not commit, and cannot push: the sandbox has no
+git identity and no GitHub credentials. Review and commit yourself afterwards:
+  cd ${profile} && git diff
 EOF
 }
 
@@ -328,9 +323,9 @@ main() {
         echo "${PROGRAM_NAME}: no profile collection at '${home}/${PROFILE_COLLECTION}'; starting without it" >&2
     fi
 
-    write_git_config "${agent_home}" "${user}" "${agent_dir}" "${profile}"
+    write_git_config "${agent_home}" "${agent_dir}" "${profile}"
     write_npm_config "${agent_home}" "${caller_dir}/cache"
-    say_how_to_publish "${user}" "${profile}"
+    say_how_to_publish "${profile}"
 
     exec "${SCRIPT_DIR}/${wrapper}" "${mounts[@]}"
 }
