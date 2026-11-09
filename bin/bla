@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# bla — start a beamline coding agent as the agent service account.
+# bla — the beamline-agent launcher. Starts a beamline coding agent as the
+# agent service account.
 #
 #     bla            # the default agent
 #     bla opencode2  # a named one

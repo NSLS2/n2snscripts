@@ -1,7 +1,7 @@
-# `bla`
+# beamline-agent
 
-Starts a beamline coding agent as the agent service account. Beamline staff do
-not run the `bw*` wrappers as that account themselves:
+Starts a beamline coding agent as the agent service account, so beamline staff
+do not run the `bw*` wrappers as that account themselves. The command is `bla`:
 
 ```bash
 bla            # the default agent, opencode
@@ -11,10 +11,10 @@ bla opencode2  # a named one
 Staff run it as themselves; it re-runs itself through `sudo` as the agent
 account.
 
-The launcher, not the caller, decides what the agent can reach. Only the agent
-name is taken from the command line, from a fixed list, and no option is passed
-through — so a caller cannot widen the sandbox with `--exec`, `--rw-path`,
-`--ro-path` or `--n2c-token`.
+beamline-agent, not the caller, decides what the agent can reach. Only the
+agent name is taken from the command line, from a fixed list, and no option is
+passed through — so a caller cannot widen the sandbox with `--exec`,
+`--rw-path`, `--ro-path` or `--n2c-token`.
 
 ## Agents
 
