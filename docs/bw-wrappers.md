@@ -16,7 +16,7 @@ option list; the tables below summarise the common surface.
 
 - `bash` >= 4.x (the wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0
-  - 0.6.3+ enables bind-over-ro-bind binary masking
+  - binary masking is verified on RHEL 8.10 (`bubblewrap-0.4.0-3.el8_10`) and EL9 (0.6.3)
 
 ## Managed system paths
 
