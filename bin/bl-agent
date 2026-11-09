@@ -43,22 +43,29 @@ readonly AGENT_CREDS_DIR=/run/nsls2/agent/creds
 readonly AIFAPIM_GATEWAY_HOST=aifapim.nsls2.bnl.gov # gitleaks:allow
 readonly ACCOUNT_CHECK=/opt/nsls2/libexec/agent-account-check
 
-# $HOME for the agent account, per caller. The bw* launchers create their
-# authoring directories under it on the host before bind-mounting them in, so
-# it has to exist and be writable. It cannot be the caller's agent directory:
-# a wrapper refuses to run where the working directory is $HOME or above it.
-# In /tmp because the agent account has no home and no XDG runtime directory,
-# and nothing here needs to outlive a reboot.
-readonly AGENT_HOME_BASE=/tmp/bl-agent
+# $HOME for the agent account. The bw* launchers create their authoring
+# directories under it on the host before bind-mounting them in, so it has to
+# exist and be writable. It cannot be the caller's agent directory: a wrapper
+# refuses to run where the working directory is $HOME or above it.
+#
+# Made by the n2c_agent role, on the tmpfs next to the tokens: owned by the
+# agent account with mode 0700, so no one else can take a caller's name, and
+# nothing kept here outlives a reboot.
+readonly AGENT_HOME_BASE=/run/nsls2/agent/home
 
 # The live profile collection, relative to the caller's home. $HOME is a tmpfs
 # in the sandbox, so the rest of the home stays hidden and this one directory
-# is mounted read-only; the agent works on a clone of it in the agent
-# directory. Not every host has one.
+# is mounted read-write: the agent edits and commits in the real repository,
+# and a person reviews and pushes afterwards. Not every host has one.
 readonly PROFILE_COLLECTION=.ipython/profile_collection
 
 # The one directory the agent may write in, inside the caller's home.
 readonly AGENT_SUBDIR=agent
+
+# What the agent's commits are signed with. The account is shared, so the
+# name carries the caller; the address does not receive mail.
+readonly GIT_IDENTITY="beamline agent"
+readonly GIT_EMAIL=noreply@bnl.gov
 
 die() {
     echo "${PROGRAM_NAME}: $*" >&2
@@ -101,6 +108,104 @@ _acl_failed() {
 reject_symlink() {
     [[ ! -L "$1" ]] ||
         die "'$1' is a symlink: the agent directory has to be a real directory in your home"
+}
+
+# write_npm_config AGENT_HOME CACHE_DIR
+#   Point npm at the per-caller cache. npm reads ~/.npm, which is in the
+#   per-session home and so would be thrown away and re-downloaded every
+#   time. npm_config_cache in the environment does not survive the sandbox's
+#   fixed variable list, but a dotfile in $HOME is mounted.
+write_npm_config() {
+    local agent_home="$1" cache_dir="$2"
+
+    printf '# %s\ncache=%s/npm\n' "written by ${PROGRAM_NAME}" "${cache_dir}" \
+        > "${agent_home}/.npmrc" || die "cannot write '${agent_home}/.npmrc'"
+}
+
+# write_git_config AGENT_HOME CALLER DIR...
+#   Give the agent an identity to commit with, and mark DIRs safe. Both are
+#   needed: the agent account has no git config of its own, and git refuses to
+#   work in a repository owned by someone else, which every one of these is —
+#   they belong to the caller, or to the beamline on shared storage.
+#
+#   Written in $HOME, which the wrappers mount into the sandbox. The identity
+#   names the caller because the account is shared: the commit says who asked
+#   for it, matching the audit line. The address does not receive mail.
+write_git_config() {
+    local agent_home="$1" caller="$2" dir
+    shift 2
+    {
+        printf '# %s\n[user]\n\tname = %s (%s)\n\temail = %s\n' \
+            "written by ${PROGRAM_NAME}" "${caller}" "${GIT_IDENTITY}" "${GIT_EMAIL}"
+        printf '[safe]\n'
+        for dir in "$@"; do
+            [[ -n "${dir}" ]] && printf '\tdirectory = %s\n' "${dir}"
+        done
+    } > "${agent_home}/.gitconfig" || die "cannot write '${agent_home}/.gitconfig'"
+}
+
+# say_how_to_publish CALLER [PROFILE]
+#   The agent can commit but never push: the sandbox has no GitHub credentials
+#   and no SSH. Say so at the start, with the command to publish afterwards,
+#   or the work looks lost.
+say_how_to_publish() {
+    local caller="$1" profile="$2"
+
+    [[ -n "${profile}" ]] || return 0
+    cat >&2 << EOF
+${PROGRAM_NAME}: the profile collection is mounted read-write at
+  ${profile}
+The agent commits there as '${caller} (${GIT_IDENTITY})'. It cannot push: the
+sandbox has no GitHub credentials. Review and publish it yourself afterwards:
+  cd ${profile} && git log --oneline && git push
+EOF
+}
+
+# check_profile_collection HOME
+#   The agent may only reach what the caller can reach.
+#
+#   The link is in the caller's home, so they choose where it points, and the
+#   sandbox mounts whatever it resolves to. The agent account is granted on
+#   every beamline's storage, so without this check a caller could aim the
+#   link at another beamline's profile collection and have the agent open it
+#   read-write on their behalf — access they do not have themselves.
+#
+#   Run as the caller, so -w is their access, not the agent account's. This
+#   catches a mistake, not a determined caller: they own the link and can
+#   repoint it after the check. Scoping the agent account per beamline is
+#   what would make that pointless.
+check_profile_collection() {
+    local dir="$1/${PROFILE_COLLECTION}" real
+
+    # -L before -e: a link to a directory the caller cannot traverse is not
+    # -e, and returning here would skip the check in the one case it is for.
+    [[ -L "${dir}" || -e "${dir}" ]] || return 0
+
+    # || true: readlink -f fails on a path the caller cannot resolve, and
+    # errexit would end the script here with no message at all.
+    real="$(readlink -f "${dir}" 2> /dev/null || true)"
+    [[ -n "${real}" && -d "${real}" ]] ||
+        die "'${dir}' points somewhere you cannot reach"
+    [[ -w "${real}" ]] ||
+        die "'${dir}' points at '${real}', which you cannot write: the agent will not open it for you"
+}
+
+# share_profile_collection HOME CALLER
+#   The agent commits in the live profile collection, so both accounts write
+#   in one repository. Without default entries, files and git objects created
+#   by one are unwritable by the other, and the person is locked out of
+#   committing after the agent has — which is the whole hand-off.
+#
+#   Resolved first: on some hosts this is a symlink to shared storage, and
+#   setfacl on a symlink fails. Not fatal, because shared storage may not take
+#   POSIX ACLs at all, and the agent is still worth starting without them.
+share_profile_collection() {
+    local dir="$1/${PROFILE_COLLECTION}" caller="$2"
+
+    [[ -d "${dir}" ]] || return 0
+    dir="$(readlink -f "${dir}")"
+    setfacl -R -m "u:${AGENT_ACCOUNT}:rwx" -m "d:u:${AGENT_ACCOUNT}:rwx" -m "d:u:${caller}:rwx" "${dir}" 2> /dev/null ||
+        echo "${PROGRAM_NAME}: could not share '${dir}' with ${AGENT_ACCOUNT}; it may not be able to commit there" >&2
 }
 
 usage() {
@@ -147,6 +252,8 @@ main() {
     if [[ "$(id -un)" != "${AGENT_ACCOUNT}" ]]; then
         [[ "$(id -un)" != root ]] || die "refusing to run for root"
         ensure_agent_dir "${HOME}" "$(id -un)"
+        check_profile_collection "${HOME}"
+        share_profile_collection "${HOME}" "$(id -un)"
         exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_DIR}/${PROGRAM_NAME}" "$@"
     fi
 
@@ -164,15 +271,23 @@ main() {
     home="$(getent passwd "${user}" | cut -d: -f6)"
     [[ -n "${home}" ]] || die "cannot find the home directory of '${user}'"
 
-    # The one writable place: the agent works in a clone here and a person
-    # moves changes into the live profile.
+    # Writable, and shared with the caller by ACL so each can read what the
+    # other writes.
     local agent_dir="${home}/${AGENT_SUBDIR}"
     reject_symlink "${agent_dir}"
     [[ -w "${agent_dir}" ]] || die "'${agent_dir}' is not writable by ${AGENT_ACCOUNT}: check its ACL"
 
-    local agent_home="${AGENT_HOME_BASE}-${user}"
-    mkdir -p "${agent_home}" || die "cannot create '${agent_home}'"
-    chmod 700 "${agent_home}" || die "cannot secure '${agent_home}'"
+    # A $HOME per session, so two agents started at once do not race to create
+    # the same database, and two people sharing an operator account do not
+    # read each other's conversations. The cache is per caller instead: it is
+    # most of the size and holds nothing personal.
+    [[ -d "${AGENT_HOME_BASE}" ]] ||
+        die "'${AGENT_HOME_BASE}' is missing: is the n2c_agent role deployed on this host?"
+    local caller_dir="${AGENT_HOME_BASE}/${user}"
+    mkdir -p "${caller_dir}/cache" || die "cannot create '${caller_dir}'"
+    local agent_home
+    agent_home="$(mktemp -d "${caller_dir}/session-XXXXXX")" ||
+        die "cannot create a session directory in '${caller_dir}'"
 
     # Passed in the environment because that is how the wrappers take it; the
     # file itself is never mounted. Readability is checked first, or bash
@@ -194,15 +309,24 @@ main() {
     export AIFAPIM_API_KEY="${key}"
     export PATH="${AGENT_PATH}"
     export HOME="${agent_home}"
+    export XDG_CACHE_HOME="${caller_dir}/cache"
 
     cd "${agent_dir}" || die "cannot enter '${agent_dir}'"
 
     local -a mounts=(--n2c-token all)
+    local profile=""
     if [[ -d "${home}/${PROFILE_COLLECTION}" ]]; then
-        mounts+=(--ro-path "${home}/${PROFILE_COLLECTION}")
+        # Resolved, because on some hosts this is a symlink to shared storage:
+        # the sandbox mounts the target, so the link path is not there inside.
+        profile="$(readlink -f "${home}/${PROFILE_COLLECTION}")"
+        mounts+=(--rw-path "${profile}")
     else
         echo "${PROGRAM_NAME}: no profile collection at '${home}/${PROFILE_COLLECTION}'; starting without it" >&2
     fi
+
+    write_git_config "${agent_home}" "${user}" "${agent_dir}" "${profile}"
+    write_npm_config "${agent_home}" "${caller_dir}/cache"
+    say_how_to_publish "${user}" "${profile}"
 
     exec "${SCRIPT_DIR}/${wrapper}" "${mounts[@]}"
 }
