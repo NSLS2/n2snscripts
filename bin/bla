@@ -67,6 +67,11 @@ readonly PROFILE_COLLECTION=.ipython/profile_collection
 # The one directory the agent may write in, inside the caller's home.
 readonly AGENT_SUBDIR=agent
 
+# Filesystems that take POSIX ACLs, so the agent directory and the profile
+# collection can be shared with the agent account. Shared storage is not one:
+# see the ansible compliance role's compliance_agent_acls_fstypes.
+readonly ACL_FSTYPES="xfs ext4 ext3 btrfs"
+
 die() {
     echo "${PROGRAM_NAME}: $*" >&2
     exit 1
@@ -194,21 +199,31 @@ check_profile_collection() {
 }
 
 # share_profile_collection HOME CALLER
-#   The agent commits in the live profile collection, so both accounts write
-#   in one repository. Without default entries, files and git objects created
-#   by one are unwritable by the other, and the person is locked out of
-#   committing after the agent has — which is the whole hand-off.
+#   Both accounts write in one directory, so without default entries the files
+#   one creates are unwritable by the other and the person is locked out of
+#   committing what the agent wrote — which is the whole hand-off.
+#
+#   Only on a filesystem that takes POSIX ACLs. A profile collection usually
+#   lives on shared storage, where setfacl fails and a recursive attempt walks
+#   thousands of files to achieve nothing. The list matches the ansible
+#   compliance role's compliance_agent_acls_fstypes.
 #
 #   Resolved first: on some hosts this is a symlink to shared storage, and
-#   setfacl on a symlink fails. Not fatal, because shared storage may not take
-#   POSIX ACLs at all, and the agent is still worth starting without them.
+#   setfacl on a symlink fails.
 share_profile_collection() {
-    local dir="$1/${PROFILE_COLLECTION}" caller="$2"
+    local dir="$1/${PROFILE_COLLECTION}" caller="$2" fstype
 
     [[ -d "${dir}" ]] || return 0
     dir="$(readlink -f "${dir}")"
+
+    fstype="$(findmnt -no FSTYPE --target "${dir}" 2> /dev/null)"
+    if [[ " ${ACL_FSTYPES} " != *" ${fstype} "* ]]; then
+        echo "${PROGRAM_NAME}: '${dir}' is on ${fstype:-an unknown filesystem}, which does not take POSIX ACLs; the agent can read it but not change it" >&2
+        return 0
+    fi
+
     setfacl -R -m "u:${AGENT_ACCOUNT}:rwx" -m "d:u:${AGENT_ACCOUNT}:rwx" -m "d:u:${caller}:rwx" "${dir}" 2> /dev/null ||
-        echo "${PROGRAM_NAME}: could not share '${dir}' with ${AGENT_ACCOUNT}; it may not be able to commit there" >&2
+        echo "${PROGRAM_NAME}: could not share '${dir}' with ${AGENT_ACCOUNT}; it can read it but not change it" >&2
 }
 
 usage() {
