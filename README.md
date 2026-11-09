@@ -19,7 +19,7 @@ docs/   Per-script and per-library documentation
 | Script | Purpose | Docs |
 | --- | --- | --- |
 | `azoidcapp` | Create or reconcile an Entra ID OIDC app + service principal | [docs/azoidcapp.md](docs/azoidcapp.md) |
-| `bl-agent` | Start a beamline coding agent as the agent service account | [docs/bl-agent.md](docs/bl-agent.md) |
+| `bla` | Start a beamline coding agent as the agent service account | [docs/bla.md](docs/bla.md) |
 | `bwclaude` | Claude CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwcodex` | OpenAI Codex CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwcopilot` | GitHub Copilot CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# bl-agent — start a beamline coding agent as the agent service account.
+# bla — start a beamline coding agent as the agent service account.
 #
-#     sudo -u xfagent /opt/nsls2/scripts/bin/bl-agent opencode2
+#     bla            # the default agent
+#     bla opencode2  # a named one
 #
 # This launcher, not the caller, decides what the agent can reach: only the
 # agent name is taken from the command line, from a fixed list, and no option
@@ -36,6 +37,9 @@ readonly AGENT_PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 # line because shfmt's keep_padding indents a multi-line array one space
 # further on every run, so it never settles and CI never goes green.
 declare -A AGENT_WRAPPERS=([opencode]=bwopencode [opencode2]=bwopencode2 [claude]=bwclaude)
+
+# Started when no agent is named, so the common case is just "bla".
+readonly DEFAULT_AGENT=opencode
 
 # Installed by the n2c_agent role; see its defaults in NSLS2/ansible.
 readonly AIFAPIM_KEY_PATH=/etc/nsls2/agent/aifapim/key
@@ -139,7 +143,10 @@ write_git_config() {
             "written by ${PROGRAM_NAME}" "${caller}" "${GIT_IDENTITY}" "${GIT_EMAIL}"
         printf '[safe]\n'
         for dir in "$@"; do
-            [[ -n "${dir}" ]] && printf '\tdirectory = %s\n' "${dir}"
+            # continue, not &&: a false test on the last argument would be the
+            # group's exit status and look like a write failure.
+            [[ -n "${dir}" ]] || continue
+            printf '\tdirectory = %s\n' "${dir}"
         done
     } > "${agent_home}/.gitconfig" || die "cannot write '${agent_home}/.gitconfig'"
 }
@@ -210,13 +217,13 @@ share_profile_collection() {
 
 usage() {
     cat << EOF
-Usage: ${PROGRAM_NAME} <agent>
+Usage: ${PROGRAM_NAME} [agent]
 
 Start a beamline coding agent in its sandbox. It may write only in your agent
 directory, and reaches the AI gateway and the read-only NSLS-II APIs with the
 credentials this host keeps.
 
-Agents:
+Agents (${DEFAULT_AGENT} when none is named):
 $(printf '  %s\n' "${!AGENT_WRAPPERS[@]}" | sort)
 
 No other options are accepted.
@@ -227,17 +234,13 @@ main() {
     # Before anything else, so asking what this is needs no sudo rule and
     # creates nothing.
     case "${1:-}" in
-        '')
-            usage >&2
-            exit 1
-            ;;
         -h | --help)
             usage
             exit 0
             ;;
     esac
 
-    local agent="$1"
+    local agent="${1:-${DEFAULT_AGENT}}"
 
     # All argument checking before anything is created, so a typo does not
     # leave a directory behind. Named first, or an option in the agent's place
@@ -245,7 +248,7 @@ main() {
     local wrapper="${AGENT_WRAPPERS[${agent}]:-}"
     [[ -n "${wrapper}" ]] ||
         die "unknown agent '${agent}'. Known agents: $(echo "${!AGENT_WRAPPERS[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')"
-    [[ $# -eq 1 ]] || die "no options are accepted after the agent name (got: ${*:2})"
+    [[ $# -le 1 ]] || die "no options are accepted after the agent name (got: ${*:2})"
 
     # Staff run this as themselves; set up the agent directory while we still
     # are them (they own their home), then re-run as the agent account.
@@ -254,7 +257,7 @@ main() {
         ensure_agent_dir "${HOME}" "$(id -un)"
         check_profile_collection "${HOME}"
         share_profile_collection "${HOME}" "$(id -un)"
-        exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_DIR}/${PROGRAM_NAME}" "$@"
+        exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_DIR}/${PROGRAM_NAME}" "${agent}"
     fi
 
     # The bw* launchers run this too; running it before the audit line keeps a

@@ -1,11 +1,15 @@
-# `bl-agent`
+# `bla`
 
 Starts a beamline coding agent as the agent service account. Beamline staff do
 not run the `bw*` wrappers as that account themselves:
 
 ```bash
-sudo -u xfagent /opt/nsls2/scripts/bin/bl-agent opencode2
+bla            # the default agent, opencode
+bla opencode2  # a named one
 ```
+
+Staff run it as themselves; it re-runs itself through `sudo` as the agent
+account.
 
 The launcher, not the caller, decides what the agent can reach. Only the agent
 name is taken from the command line, from a fixed list, and no option is passed
@@ -93,7 +97,7 @@ Both the key and the tokens come from the `n2c_agent` role in NSLS2/ansible.
 Before anything starts:
 
 ```text
-bl-agent: agent start: user=<caller> host=<host> agent=<name> dir=<dir>
+bla: agent start: user=<caller> host=<host> agent=<name> dir=<dir>
 ```
 
 to syslog at `auth.notice`, so an action is traceable to a person even though
