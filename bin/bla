@@ -39,12 +39,19 @@ readonly AGENT_PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 # further on every run, so it never settles and CI never goes green.
 declare -A AGENT_WRAPPERS=([opencode]=bwopencode [opencode2]=bwopencode2 [claude]=bwclaude)
 
-# Started when no agent is named, so the common case is just "bla".
-readonly DEFAULT_AGENT=opencode
+# Started when no agent is named, so the common case is just "bla". opencode2
+# because it is the wrapper that sends the gateway an Entra token; opencode
+# sends only the subscription key and the gateway refuses it.
+readonly DEFAULT_AGENT=opencode2
 
 # Installed by the n2c_agent role; see its defaults in NSLS2/ansible.
 readonly AIFAPIM_KEY_PATH=/etc/nsls2/agent/aifapim/key
 readonly AGENT_CREDS_DIR=/run/nsls2/agent/creds
+# The gateway. The n2c_agent role writes the host next to the key, from the
+# same variable the base role puts in /etc/profile.d/aifapim.sh, so a gateway
+# move is fixed by a baseline run rather than a release of this script. The
+# constant is only the fallback for a host the role has not reached yet.
+readonly AIFAPIM_HOST_PATH=/etc/nsls2/agent/aifapim/host
 readonly AIFAPIM_GATEWAY_HOST=aifapim.nsls2.bnl.gov # gitleaks:allow
 readonly ACCOUNT_CHECK=/opt/nsls2/libexec/agent-account-check
 
@@ -319,8 +326,17 @@ main() {
     # The tokens come from the root minter, not an n2c-token session this
     # account does not have.
     export N2SN_CREDS_DIR="${AGENT_CREDS_DIR}"
-    export AIFAPIM_HOST="${AIFAPIM_GATEWAY_HOST}"
+    local gateway="${AIFAPIM_GATEWAY_HOST}"
+    if [[ -r "${AIFAPIM_HOST_PATH}" ]]; then
+        gateway="$(< "${AIFAPIM_HOST_PATH}")"
+        [[ -n "${gateway}" ]] || die "'${AIFAPIM_HOST_PATH}' is empty"
+    fi
+    export AIFAPIM_HOST="${gateway}"
     export AIFAPIM_API_KEY="${key}"
+    # The gateway wants an Entra token as well as the key. The path, not the
+    # token: the file is mounted by --n2c-token and the wrapper's plugin reads
+    # it, so a token minted mid-session is picked up without a restart.
+    export AIFAPIM_TOKEN_FILE="${AGENT_CREDS_DIR}/aifapim/token"
     export PATH="${AGENT_PATH}"
     export HOME="${agent_home}"
     export XDG_CACHE_HOME="${caller_dir}/cache"
