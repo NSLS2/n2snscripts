@@ -433,15 +433,15 @@ change them, and they are the data needed for a later egress allowlist.
 | --- | --- |
 | start | `event=start session=ID launcher=... user=... uid=... pid=... backend=... flows=logged\|unavailable publish=ADDR:PORTS host_ports=... dir=...` |
 | pasta | `session=ID pasta version=... pid=...`, and pasta's warnings and errors (`pasta level=error msg=...`) |
-| dns | `session=ID dns name=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21`, plus `cname=...` when the answer went through aliases |
-| open | `session=ID flow=7 open proto=tcp dir=out src=ADDR:PORT dst=140.82.112.21:443 name=github.com t=21.359` |
-| close | `session=ID flow=7 close proto=tcp dir=out dst=140.82.112.21:443 name=github.com t=33.770 secs=12.411` |
+| dns | `session=ID dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21`, plus `cname=...` when the answer went through aliases |
+| open | `session=ID flow=7 open proto=tcp dir=out src=ADDR:PORT dst=140.82.112.21:443 domain=github.com t=21.359` |
+| close | `session=ID flow=7 close proto=tcp dir=out dst=140.82.112.21:443 domain=github.com t=33.770 secs=12.411` |
 | fail | `session=ID flow=9 fail ...`: a connection that never became active (refused, unreachable) |
 | end | `event=end session=ID ...`, when the sandbox has exited |
 
 Every line is `key=value` (logfmt), so Loki's `| logfmt` can filter on any
-field, for example the names an agent reached:
-`{syslog_identifier="bwrap-net"} | logfmt | dir="out"` grouped by `name`.
+field, for example the domains an agent reached:
+`{syslog_identifier="bwrap-net"} | logfmt | dir="out"` grouped by `domain`.
 
 - `dir` is `out` (the sandbox to the network), `publish` (a host client to a
   `--publish` port) or `host-port` (the sandbox to a `--host-port` service).
@@ -452,10 +452,10 @@ field, for example the names an agent reached:
 - `flow` is pasta's flow slot, which it reuses: it identifies a connection
   only between its open and its close.
 - pasta logs no byte counts.
-- `name` is the name of the last lookup, through the DNS relay, that returned
-  the destination address. It is a record, not proof: several names can share
-  one address (CDNs), and a lookup that bypasses the relay (a query sent to
-  `169.254.1.1` directly, DNS over HTTPS) leaves no name.
+- `domain` is the domain of the last lookup, through the DNS relay, that
+  returned the destination address. It is a record, not proof: several
+  domains can share one address (CDNs), and a lookup that bypasses the relay
+  (a query sent to `169.254.1.1` directly, DNS over HTTPS) leaves none.
 
 - **Tag** (`SYSLOG_IDENTIFIER`): `bwrap-net`. `journalctl -t bwrap-net` shows
   all sessions; `journalctl -t bwrap-net -g ID` one. Inside the sandbox
@@ -502,7 +502,7 @@ field, for example the names an agent reached:
   forwards each lookup to `169.254.1.1` (pasta's DNS forward) and writes one
   `dns` line per lookup to the log, before it answers, so the name is known
   when the connection that follows is logged. The condenser keeps a map from the answers'
-  addresses to names. The sandbox's `/etc/resolv.conf` lists the relay first
+  addresses to domains. The sandbox's `/etc/resolv.conf` lists the relay first
   and `169.254.1.1` second, so lookups go on working, at once, if the relay is
   down (its port is then closed); pasta's own leg of a relayed lookup (UDP to
   `169.254.1.1:53`) is not logged as a connection.

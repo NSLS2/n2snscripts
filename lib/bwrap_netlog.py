@@ -6,7 +6,7 @@ platform-python) and later.
     bwrap_netlog.py condense --session ID [--dns-forward ADDR] -- CMD...
         Read pasta's debug log (and the DNS relay's lines) on standard input
         and write one line when a connection opens and one when it closes,
-        with the DNS name of the destination when the relay saw it, to CMD's
+        with the domain of the destination when the relay saw it, to CMD's
         standard input (systemd-cat or logger).  Everything else pasta writes
         at debug level (timers, ACK and buffer bookkeeping, state changes,
         its setup dump) is dropped; its warnings and errors are kept.
@@ -20,11 +20,11 @@ platform-python) and later.
 
 Output lines are logfmt (key=value), so Loki's `| logfmt` can filter them:
 
-    session=ID flow=7 open proto=tcp dir=out src=... dst=140.82.113.22:443 name=github.com t=21.359
-    session=ID flow=7 close proto=tcp dir=out dst=140.82.113.22:443 name=github.com t=33.770 secs=12.411
+    session=ID flow=7 open proto=tcp dir=out src=... dst=140.82.113.22:443 domain=github.com t=21.359
+    session=ID flow=7 close proto=tcp dir=out dst=140.82.113.22:443 domain=github.com t=33.770 secs=12.411
     session=ID flow=9 fail proto=tcp dir=out dst=192.0.2.1:443 src=... t=40.120
-    session=ID dns name=github.com type=A rcode=NOERROR answers=140.82.113.22
-    session=ID dns name=api.x.com type=A rcode=NOERROR answers=192.0.2.1 cname=lb.x.net
+    session=ID dns domain=github.com type=A rcode=NOERROR answers=140.82.113.22
+    session=ID dns domain=api.x.com type=A rcode=NOERROR answers=192.0.2.1 cname=lb.x.net
 """
 
 # Kept to what the DNS relay needs: it starts while the sandbox starts, and
@@ -110,7 +110,7 @@ class Condenser:
 
     def _dns(self, fields):
         kv = dict(re.findall(r'(\w+)=("(?:[^"\\]|\\.)*"|\S*)', fields))
-        name = kv.get("name", "").strip('"')
+        name = kv.get("domain", "").strip('"')
         for a in kv.get("answers", "").split(","):
             if a and (re.match(r"^\d+\.\d+\.\d+\.\d+$", a) or ":" in a):
                 self.names[a] = name
@@ -159,7 +159,7 @@ class Condenser:
             parts.append("via=%s" % _hostport(*f["tdst"]))
         name = self.names.get(f["dst"][0])
         if name and direction == "out":
-            parts.append("name=%s" % _value(name))
+            parts.append("domain=%s" % _value(name))
         return parts
 
     def _is_dns_forward(self, f):
@@ -330,7 +330,7 @@ class DnsRelay:
                 rcode, answers = "UNPARSED", []
         addrs = [a for a in answers if re.match(r"^[0-9.]+$", a) or ":" in a]
         cnames = [a for a in answers if a not in addrs]
-        line = "bwrap-dns name=%s type=%s proto=%s rcode=%s answers=%s%s\n" % (
+        line = "bwrap-dns domain=%s type=%s proto=%s rcode=%s answers=%s%s\n" % (
             _value(name),
             qtype,
             proto,
@@ -441,7 +441,7 @@ def dns(argv):
     try:
         relay.bind()
     except OSError as e:
-        sys.stdout.write("bwrap-dns name=- type=- proto=- rcode=RELAY-FAILED answers=%s\n" % _value(str(e)))
+        sys.stdout.write("bwrap-dns domain=- type=- proto=- rcode=RELAY-FAILED answers=%s\n" % _value(str(e)))
         sys.stdout.flush()
         return
     _drop_capabilities()

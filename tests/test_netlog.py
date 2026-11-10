@@ -96,10 +96,10 @@ class CondenserTest(unittest.TestCase):
         self.assertEqual(self.out[0], "pasta version=2026_10_02.cba3570 pid=3962723")
 
     def test_names_from_dns(self):
-        out = condense(["bwrap-dns name=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21"] + self.raw)
-        self.assertEqual(out[0], "dns name=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21")
+        out = condense(["bwrap-dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21"] + self.raw)
+        self.assertEqual(out[0], "dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21")
         line = next(x for x in out if " open " in x and "dst=140.82.112.21:443" in x)
-        self.assertTrue(line.endswith("name=github.com t=0.917"), line)
+        self.assertTrue(line.endswith("domain=github.com t=0.917"), line)
 
     def test_publish_and_host_port(self):
         t = "1.0000:          Flow 3 "
@@ -215,7 +215,7 @@ class DnsRelayTest(unittest.TestCase):
         self.assertEqual(netlog.parse_answers(c.recv(4096))[1], ["example.org", "192.0.2.10"])
         self.assertEqual(
             self.wait_lines(1),
-            ["bwrap-dns name=www.example.org type=A proto=udp rcode=NOERROR answers=192.0.2.10 cname=example.org"],
+            ["bwrap-dns domain=www.example.org type=A proto=udp rcode=NOERROR answers=192.0.2.10 cname=example.org"],
         )
 
     def test_tcp(self):
