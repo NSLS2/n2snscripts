@@ -3016,15 +3016,25 @@ _net_busy_port() {
     done
 }
 
+# net_publish_prefix
+#   Print this user's publish prefix 127.H1.H2: H1.H2 from a hash of the uid
+#   (H1 in 1-254, so 127.0.x.x, 127.0.0.53 and 127.0.1.1 are never used).
+#   Session S of the user publishes on 127.H1.H2.S; S=1 is the usual one.
+net_publish_prefix() {
+    local _hex _v
+    _hex="$(printf '%s' "$(id -u)" | sha256sum)"
+    _v=$((16#${_hex:0:4}))
+    printf '127.%s.%s' "$((1 + (_v >> 8) % 254))" "$((_v & 255))"
+}
+
 # _net_derive_publish_addr
 #   Set _NET_PUBLISH_ADDR_EFFECTIVE for --publish.  Without --publish-addr the
-#   address is 127.H1.H2.S: H1.H2 from a hash of the uid (H1 in 1-254, so
-#   127.0.x.x, 127.0.0.53 and 127.0.1.1 are never used), S the lowest session
+#   address is 127.H1.H2.S (see net_publish_prefix), S the lowest session
 #   index in 1-254 whose address has none of the requested ports in use.
 #   With --publish-addr, that address must have them all free.  Exit 1 when
 #   no address can be used.  --dry-run checks nothing and shows S=1.
 _net_derive_publish_addr() {
-    local _hex _v _h1 _h2 _s _cand
+    local _prefix _s _cand
     if [[ "${DRY_RUN}" -eq 0 ]]; then
         _net_listeners
     fi
@@ -3039,17 +3049,14 @@ _net_derive_publish_addr() {
         return 0
     fi
 
-    _hex="$(printf '%s' "$(id -u)" | sha256sum)"
-    _v=$((16#${_hex:0:4}))
-    _h1=$((1 + (_v >> 8) % 254))
-    _h2=$((_v & 255))
+    _prefix="$(net_publish_prefix)"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        _NET_PUBLISH_ADDR_EFFECTIVE="127.${_h1}.${_h2}.1"
+        _NET_PUBLISH_ADDR_EFFECTIVE="${_prefix}.1"
         echo "${0##*/}: dry-run: session index 1 shown for the publish address; a real run takes the first free one." >&2
         return 0
     fi
     for ((_s = 1; _s <= 254; _s++)); do
-        _cand="127.${_h1}.${_h2}.${_s}"
+        _cand="${_prefix}.${_s}"
         _net_busy_port "${_cand}"
         if [[ -z "${_NET_BUSY}" ]]; then
             _NET_PUBLISH_ADDR_EFFECTIVE="${_cand}"
@@ -3060,8 +3067,8 @@ _net_derive_publish_addr() {
             exit 1
         fi
     done
-    echo "Error: --publish: all 254 publish addresses 127.${_h1}.${_h2}.1-254 have a requested port in use." >&2
-    echo "       This usually means leftover sandbox (pasta) processes; see: ss -ltnp 'src 127.${_h1}.${_h2}.0/24'" >&2
+    echo "Error: --publish: all 254 publish addresses ${_prefix}.1-254 have a requested port in use." >&2
+    echo "       This usually means leftover sandbox (pasta) processes; see: ss -ltnp 'src ${_prefix}.0/24'" >&2
     exit 1
 }
 

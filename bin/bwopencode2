@@ -80,10 +80,11 @@
 # commands (service, serve, api, pair, reload).  See --help.
 #
 # --serve is the one deliberate exception: it runs `opencode2 serve` INSIDE this
-# sandbox (tools stay sandboxed), bound to 127.0.0.1 on a free port from a fixed
-# range and protected by a password, so the OpenCode web UI can be opened from a
-# browser (over an ssh -L tunnel).  The launcher builds those arguments itself;
-# nothing from the command line reaches `serve`.  See docs/bw-wrappers.md.
+# sandbox (tools stay sandboxed) on a free port from a fixed range, protected by
+# a password, and publishes that port (--publish) on this user's loopback
+# address 127.H1.H2.S, so the OpenCode web UI can be opened from a browser (over
+# an ssh -L tunnel).  The launcher builds those arguments itself; nothing from
+# the command line reaches `serve`.  See docs/bw-wrappers.md.
 #
 # Usage:
 #   bwopencode2 [bwopencode2-options] [opencode2 arguments...]
@@ -100,7 +101,7 @@
 #                   guard.  Detaches the controlling tty for stricter isolation at the
 #                   cost of SIGWINCH (terminal resize) propagation.
 #   --serve         Run the OpenCode web UI server inside the sandbox instead of the
-#                   TUI (see above).  One server per invocation.
+#                   TUI and publish its port (see above).  One server per invocation.
 #   --serve-port N  With --serve: use port N (must be in the range) instead of the
 #                   first free one.
 #   --serve-ssh-config
@@ -190,6 +191,12 @@ SERVE_PASSWORD_RANDOM=0
 SERVE_PORT_LO=""
 SERVE_PORT_HI=""
 SERVE_STATE_DIR=""
+# Address the server is reached at on the host: this user's publish address
+# (127.H1.H2.S, see net_publish_prefix) or --publish-addr.  With a private
+# network the port is published there and the server binds 0.0.0.0 inside the
+# sandbox; with --share-net the server binds this address itself.
+SERVE_ADDR=""
+SERVE_BIND=""
 # Default range: below the kernel's ephemeral range (32768-60999 on Linux, so no
 # outgoing connection takes a server port), clear of the shared OpenCode service
 # (49374) and of the ports in use on the workstations.  Keep ssh_config in step
@@ -350,10 +357,12 @@ Wrapper options (consumed before opencode2 sees the command line):
                   resize) propagates from tmux/screen.  Use this flag to opt back
                   into stricter terminal isolation when SIGWINCH is not important.
   --serve         Run the OpenCode web UI server inside the sandbox instead of the
-                  TUI: `opencode2 serve` on 127.0.0.1 (never another address), on
-                  the first free port of the range 24700-24709 (override the range
-                  with BWOPENCODE2_SERVE_PORTS=LO-HI), tools still sandboxed.  Open
-                  it from a browser through an ssh tunnel; the command, a one-time
+                  TUI, tools still sandboxed: `opencode2 serve` on the first free
+                  port of the range 24700-24709 (override the range with
+                  BWOPENCODE2_SERVE_PORTS=LO-HI), published like --publish on your
+                  loopback address 127.H1.H2.S (printed; with --share-net the
+                  server binds that address itself, never 0.0.0.0).  Open it
+                  from a browser through an ssh tunnel; the command, a one-time
                   pairing link (valid 5 minutes) and the password are printed at
                   start; the web UI's "Use password" button also works.  The
                   password is random for each
@@ -365,7 +374,8 @@ Wrapper options (consumed before opencode2 sees the command line):
                   free one; fails if it is taken.
   --serve-ssh-config
                   Print the ssh_config block (one alias, one LocalForward per port
-                  of the range) for the machine your browser runs on, then exit.
+                  of the range, to your address 127.H1.H2.1) for the machine your
+                  browser runs on, then exit.
   --n2c-token NAME
                   Mount the N2C access token NAME (read-only) so skills inside
                   the sandbox can call NSLS-II APIs, for example observability,
@@ -446,7 +456,11 @@ HELP_EOF
 # `opencode2 serve` is refused as a command-line argument (see the guard below)
 # because the shared service it could reach runs tools outside any sandbox.
 # --serve runs the server inside THIS sandbox instead, so tools stay sandboxed:
-#   - bound to 127.0.0.1 only; reach it from a browser with an ssh -L tunnel;
+#   - reached on the host at this user's publish address 127.H1.H2.S (normally
+#     .1; see net_publish_prefix): with a private network the port is added to
+#     --publish and the server binds 0.0.0.0 inside the namespace (forwarded
+#     connections arrive at its interface); with --share-net the server binds
+#     the address itself.  From a browser elsewhere, use an ssh -L tunnel;
 #   - one server per invocation, on the first free port of a fixed range, so one
 #     ssh_config block covers every session (--serve-ssh-config);
 #   - protected by a password that reaches the server only as OPENCODE_PASSWORD.
@@ -456,7 +470,8 @@ HELP_EOF
 #     can drive every one of them.
 # The launcher execs bwrap, so it cannot clean up or retry after the server
 # starts.  A port is claimed with a file in the host-side state directory (not
-# mounted in the sandbox), which stops two launchers picking one port; a claim
+# mounted in the sandbox), which stops two launchers picking one port, and it
+# must be free on the address checked (127.H1.H2.1 or --publish-addr); a claim
 # whose process is gone is stale and is removed.  The remaining race is another
 # program taking the port in the moment before the server binds it.
 
@@ -502,18 +517,20 @@ serve_parse_range() {
 
 # Print the ssh_config block for the port range (--serve-ssh-config).
 serve_print_ssh_config() {
-    local _p
+    local _p _addr
+    _addr="$(net_publish_prefix).1"
     printf '# Add to ~/.ssh/config on the machine your browser runs on, then: ssh %s\n' "$(serve_ssh_alias)"
-    printf '# One forward per port of the bwopencode2 --serve range %s-%s.  A port with no\n' "${SERVE_PORT_LO}" "${SERVE_PORT_HI}"
-    printf '# session behind it just refuses connections.  Add User / ProxyJump as needed.\n'
+    printf '# One forward per port of the bwopencode2 --serve range %s-%s, to %s, your\n' "${SERVE_PORT_LO}" "${SERVE_PORT_HI}" "${_addr}"
+    printf '# own publish address on %s (it depends on your uid: run this as the user who\n' "$(serve_host_name)"
+    printf '# runs the sessions).  A port with no session behind it just refuses\n'
+    printf '# connections.  Add User / ProxyJump as needed.\n'
     printf 'Host %s\n' "$(serve_ssh_alias)"
     printf '    HostName %s\n' "$(serve_host_name)"
     printf '    ExitOnForwardFailure no\n'
     for ((_p = SERVE_PORT_LO; _p <= SERVE_PORT_HI; _p++)); do
-        printf '    LocalForward %s 127.0.0.1:%s\n' "${_p}" "${_p}"
+        printf '    LocalForward %s %s:%s\n' "${_p}" "${_addr}" "${_p}"
     done
 }
-
 # Refuse combinations that make no sense; validate --serve-port.
 serve_check_args() {
     if [[ "${SERVE}" -eq 0 ]]; then
@@ -541,20 +558,21 @@ serve_check_args() {
     fi
 }
 
-# True when nothing listens on 127.0.0.1:PORT (the bind succeeds, as the server's
-# would; SO_REUSEADDR as a server sets it, so a lingering TIME_WAIT does not count).
+# True when nothing listens on ADDR:PORT (the bind succeeds, as the server's or
+# the network backend's would; SO_REUSEADDR as a server sets it, so a lingering
+# TIME_WAIT does not count).
 serve_port_is_free() {
-    local _port="$1"
+    local _addr="$1" _port="$2"
     if command -v python3 > /dev/null 2>&1; then
         python3 -c '
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", int(sys.argv[1])))
-' "${_port}" 2> /dev/null
+s.bind((sys.argv[1], int(sys.argv[2])))
+' "${_addr}" "${_port}" 2> /dev/null
     else
         # No python3: a successful connection means something listens.
-        if (exec 3<> "/dev/tcp/127.0.0.1/${_port}") 2> /dev/null; then
+        if (exec 3<> "/dev/tcp/${_addr}/${_port}") 2> /dev/null; then
             return 1
         fi
     fi
@@ -620,10 +638,10 @@ serve_choose_port() {
         _f="${SERVE_STATE_DIR}/${_p}.session"
         if [[ "${DRY_RUN}" -eq 1 ]]; then
             serve_claim_is_live "${_f}" && continue
-            serve_port_is_free "${_p}" || continue
+            serve_port_is_free "${SERVE_ADDR}" "${_p}" || continue
         else
             serve_claim_port "${_p}" || continue
-            if ! serve_port_is_free "${_p}"; then
+            if ! serve_port_is_free "${SERVE_ADDR}" "${_p}"; then
                 rm -f "${_f}"
                 continue
             fi
@@ -633,7 +651,7 @@ serve_choose_port() {
     done
 
     if [[ -n "${SERVE_PORT_REQUEST}" ]]; then
-        echo "Error: port ${SERVE_PORT_REQUEST} is in use." >&2
+        echo "Error: port ${SERVE_PORT_REQUEST} is in use on ${SERVE_ADDR}." >&2
     else
         echo "Error: no free port in ${SERVE_PORT_LO}-${SERVE_PORT_HI}; stop a session or see ${SERVE_STATE_DIR}/." >&2
     fi
@@ -666,16 +684,21 @@ serve_make_password() {
 # The command run INSIDE the sandbox for --serve: start the server, then print a
 # one-time pairing link so the browser can sign in without typing the password
 # (the web UI's "Use password" button still works).  It runs as
-# `bash -c SERVE_WRAPPER bwopencode2-serve BINARY PORT`.  OPENCODE_PASSWORD is in
+# `bash -c SERVE_WRAPPER bwopencode2-serve BINARY PORT BIND`.  OPENCODE_PASSWORD is in
 # its environment.  The password reaches curl on stdin (-K -), never on a command
 # line: a process in the sandbox is visible to `ps` on the host.  printf is a
 # builtin, so it does not show either.  Needs only bash and curl.
 read -r -d '' SERVE_WRAPPER << 'SERVE_WRAPPER_EOF' || true
 set -u
-bin=$1 port=$2
-base="http://127.0.0.1:${port}"
+bin=$1 port=$2 bind=$3
+# The server's own address for the requests below, and the host-side address
+# for the printed link (the publish address, or the bound one with --share-net).
+local_addr=$bind
+[[ $bind != 0.0.0.0 ]] || local_addr=127.0.0.1
+base="http://${local_addr}:${port}"
+host_addr=${BWRAP_NET_PUBLISH_ADDR:-$bind}
 
-"$bin" serve --hostname 127.0.0.1 --port "$port" &
+"$bin" serve --hostname "$bind" --port "$port" &
 srv=$!
 trap 'kill "$srv" 2>/dev/null' INT TERM HUP
 
@@ -698,13 +721,14 @@ done
             curl -s -K - -X POST "${base}/api/pair") || resp=""
         if [[ $resp =~ \"code\":\"([A-Za-z0-9_-]+)\" ]]; then
             printf '\nbwopencode2: pairing link (works once, expires in 5 minutes):\n'
-            printf '  %s/auth/connect/%s\n' "$base" "${BASH_REMATCH[1]}"
+            printf '  through the ssh tunnel:  http://127.0.0.1:%s/auth/connect/%s\n' "$port" "${BASH_REMATCH[1]}"
+            printf '  on this host:            http://%s:%s/auth/connect/%s\n' "$host_addr" "$port" "${BASH_REMATCH[1]}"
             printf '  After it expires, click "Use password" in the web UI instead.\n\n'
         else
             printf 'bwopencode2: could not get a pairing link; click "Use password" in the web UI.\n'
         fi
     else
-        printf 'bwopencode2: the server did not start listening on %s.\n' "$base"
+        printf 'bwopencode2: the server did not start listening on %s.\n' "$bind:$port"
     fi
 } >&2
 
@@ -713,25 +737,44 @@ SERVE_WRAPPER_EOF
 
 # Choose port and password, and give the sandbox its command.
 serve_prepare() {
+    if [[ "${NET_SHARE}" -eq 1 ]]; then
+        SERVE_ADDR="$(net_publish_prefix).1"
+    else
+        SERVE_ADDR="${NET_PUBLISH_ADDR:-$(net_publish_prefix).1}"
+    fi
     serve_choose_port
     serve_make_password
-    _TOOL_CMD=(/usr/bin/bash -c "${SERVE_WRAPPER}" bwopencode2-serve "${_TOOL_BIN}" "${SERVE_PORT}")
+    if [[ "${NET_SHARE}" -eq 1 ]]; then
+        SERVE_BIND="${SERVE_ADDR}"
+    else
+        # Forwarded connections arrive at the namespace's interface, not its
+        # loopback, so the server binds every address of the private
+        # namespace; only the published port reaches it.
+        SERVE_BIND="0.0.0.0"
+        net_add_publish "${SERVE_PORT}"
+    fi
+    _TOOL_CMD=(/usr/bin/bash -c "${SERVE_WRAPPER}" bwopencode2-serve "${_TOOL_BIN}" "${SERVE_PORT}" "${SERVE_BIND}")
     TOOL_ARGS=()
 }
-
 # Tell the user how to reach the server (stderr, before the exec).
 serve_print_info() {
-    local _p="${SERVE_PORT}" _host _alias
+    local _p="${SERVE_PORT}" _host _alias _addr="${SERVE_ADDR}"
+    [[ "${NET_SHARE}" -eq 1 ]] || _addr="${_NET_PUBLISH_ADDR_EFFECTIVE}"
     _host="$(serve_host_name)"
     _alias="$(serve_ssh_alias)"
     {
-        printf '\nbwopencode2: sandboxed OpenCode 2 web UI on 127.0.0.1:%s (this host only)\n' "${_p}"
+        printf '\nbwopencode2: sandboxed OpenCode 2 web UI on %s:%s (this host only)\n' "${_addr}" "${_p}"
         printf '  1. On the machine with your browser, forward the port:\n'
-        printf '       ssh -L %s:127.0.0.1:%s %s\n' "${_p}" "${_p}" "${_host}"
-        printf '     or use the ssh_config alias (bwopencode2 --serve-ssh-config):  ssh %s\n' "${_alias}"
-        printf '     (on this host itself, skip this step)\n'
+        printf '       ssh -L %s:%s:%s %s\n' "${_p}" "${_addr}" "${_p}" "${_host}"
+        if [[ "${_addr}" == "$(net_publish_prefix).1" ]]; then
+            printf '     or use the ssh_config alias (bwopencode2 --serve-ssh-config):  ssh %s\n' "${_alias}"
+        else
+            printf '     (the ssh_config alias from --serve-ssh-config forwards to %s.1, so it does\n' "$(net_publish_prefix)"
+            printf '     not reach this session: use the command above)\n'
+        fi
+        printf '     then open http://127.0.0.1:%s/ there.  On this host itself, open http://%s:%s/.\n' "${_p}" "${_addr}" "${_p}"
         printf '  2. Open the pairing link printed below once the server is up (it works once and\n'
-        printf '     expires in 5 minutes), or open http://127.0.0.1:%s/, click "Use password"\n' "${_p}"
+        printf '     expires in 5 minutes), or open the page above, click "Use password"\n'
         printf '     and enter the server password.\n'
         if [[ "${DRY_RUN}" -eq 1 ]]; then
             printf '     Password: (not shown on --dry-run)\n'
@@ -743,7 +786,6 @@ serve_print_info() {
         printf '  Keep the same port number at both ends of the tunnel: the browser cookie is named by it.\n\n'
     } >&2
 }
-
 # ── Sandbox-escape guard (arguments) ─────────────────────────────
 # The OpenCode 2 background service listens on a fixed, shared port and runs
 # tools outside any sandbox.  A CLI started without --standalone would
@@ -1251,7 +1293,7 @@ build_opencode2_context() {
     )
     if [[ "${SERVE}" -eq 1 ]]; then
         SANDBOX_CONTEXT_NOTES+=(
-            "This session is a sandboxed \`opencode2 serve\` (the OpenCode web UI), started by \`bwopencode2 --serve\`. Do not start or connect to any other OpenCode server."
+            "This session is a sandboxed \`opencode2 serve\` (the OpenCode web UI) on port ${SERVE_PORT}, started by \`bwopencode2 --serve\`; the user reaches it through the published port. Do not start or connect to any other OpenCode server."
         )
     fi
     build_sandbox_context bwopencode2
@@ -1296,12 +1338,14 @@ main() {
     fi
 
     detect_kernel_capabilities
-    detect_net_capabilities
     resolve_common_paths
     resolve_opencode2_paths
+    # --serve adds its port to --publish, so it comes before the network
+    # backend is chosen.
     if [[ "${SERVE}" -eq 1 ]]; then
         serve_prepare
     fi
+    detect_net_capabilities
     # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
     require_opencode_config bwopencode2 "${OC2_CONFIG_SRC}"
     detect_shell
