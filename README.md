@@ -112,7 +112,7 @@ Common wrapper options:
 | `--no-sandbox-context` | Do not tell the agent about the sandbox (by default a short description of the mounts is added to its instructions) |
 | `--publish PORT[:SANDBOXPORT]` | Make a server in the sandbox reachable on the host at a per-user, per-session `127.x.y.z` address (printed at launch) |
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`, e.g. `127.0.0.1` for OAuth) for `--publish` |
-| `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal` |
+| `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `127.0.0.1:SANDBOXPORT` (pasta only) |
 | `--share-net` | Share the host network instead of a private namespace (the behaviour before private namespaces) |
 | `--net-backend pasta\|slirp4netns` | Use only this network backend |
 

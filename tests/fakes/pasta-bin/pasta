@@ -4,8 +4,9 @@
 Like the real one it closes inherited descriptors above 2 before opening
 --log-file, creates a user namespace (mapping the caller to uid 0) and a
 network namespace, starts the command in it and stays its parent, and
-forwards -t (host -> namespace interface address) and -T (namespace -> host
-loopback) ports.  The namespace gets a dummy interface with 192.168.77.2
+forwards -t (host -> namespace interface address) and -T (namespace
+loopback -> host loopback) ports.  Like the real one (fwd_rule.c), -T and -U
+take no listening address: "-T ADDR/..." stops it with pasta's error.  The namespace gets a dummy interface with 192.168.77.2
 instead of a tap with the host's address.  With --debug and --log-file it
 writes header, startup and "Flow" lines to the log file (blocking writes, as
 pasta's are).  The failure mode is read from $FAKE_NET_DIR/pasta.fail
@@ -53,6 +54,10 @@ while i < len(args):
     i += 1
 if not cmd:
     sys.exit("fake pasta: no command")
+for opt, specs in (("T", fwd_T), ("U", [opts.get("-U", "none")])):
+    for spec in specs:
+        if spec != "none" and "/" in spec:
+            sys.exit("0.0012: ERROR:   Listening address not allowed for -%s %s" % (opt, spec))
 
 os.closerange(3, 4096)
 
@@ -139,13 +144,13 @@ for spec in fwd_t:
         s.listen(16)
         _nsproxy.forward(s, lambda gp=gp: proxy.connect(NS_ADDR, gp), log, "-t %d" % hp)
 for spec in fwd_T:
-    addr, _, ports = spec.rpartition("/")
+    ports = spec
     pairs = []
     for part in ports.split(","):
         sports, _, hports = part.partition(":")
         pairs += zip(_nsproxy.port_range(sports), _nsproxy.port_range(hports or sports))
     for sp, hp in pairs:
-        s = proxy.listen(addr or "127.0.0.1", sp)
+        s = proxy.listen("127.0.0.1", sp)
         _nsproxy.forward(s, lambda hp=hp: socket.create_connection(("127.0.0.1", hp)), log, "-T %d" % sp)
 
 os.write(go_w, b"1")

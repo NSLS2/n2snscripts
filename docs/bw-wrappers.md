@@ -108,7 +108,7 @@ Every `bw*` wrapper accepts these options:
 | `--no-sandbox-context` | Do not generate the [sandbox context file](#sandbox-context) that tells the agent what is mounted |
 | `--publish PORT[:SANDBOXPORT]` | Make a server in the sandbox reachable on the host at a per-user, per-session loopback address. May be repeated. See [Network](#network) |
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`) for `--publish` instead of the derived address, for example `127.0.0.1` for OAuth redirects |
-| `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal:SANDBOXPORT`. May be repeated (pasta only) |
+| `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `127.0.0.1:SANDBOXPORT`, which it then takes. May be repeated (pasta only) |
 | `--share-net` | Share the host network instead of a private namespace (the behaviour before private namespaces); not with the forwarding options |
 | `--net-backend pasta\|slirp4netns` | Use only this backend for the private namespace (normally pasta, else slirp4netns) |
 
@@ -248,8 +248,8 @@ and makes the tool load it.
   mounts, not hard links, and are edited at their source; the working directory
   (its access taken from the effective mounts) and whether it is a git root; a
   Network section (private namespace, DNS, the published ports with their host
-  URLs and the "bind `0.0.0.0`" rule, the host services under
-  `host.internal`); a
+  URLs and the "bind `0.0.0.0`" rule, the host services and the sandbox ports
+  they take); a
   table of every mount under `$HOME` marked `rw` / `ro` / `copy` (a writable
   copy of a host file, lost at exit) / `tmpfs`; the system mounts collapsed
   into one line each, with writable exceptions such as `--rw-path /usr/local`
@@ -343,7 +343,7 @@ backend forwards to the first nameserver in the host's `/etc/resolv.conf`
 (port 53 only), so split DNS (VPN, tailnet) keeps working. Only IPv4
 nameservers are supported; the wrapper warns when the host has none. The host's
 search domains are not passed on, so use fully qualified names. `/etc/hosts` is
-the host's file, plus `host.internal` when `--host-port` is used.
+the host's file.
 
 ### Opening ports
 
@@ -354,17 +354,17 @@ is accepted, and a mapped range must have the same length.
 | Option | Direction | Host side | Sandbox side |
 | --- | --- | --- | --- |
 | `--publish PORT[:SANDBOXPORT]` | sandbox server → host | `127.H1.H2.S:PORT` (or `--publish-addr`) | the server on `SANDBOXPORT` (default `PORT`), which must listen on `0.0.0.0` |
-| `--host-port PORT[:SANDBOXPORT]` | host service → sandbox | `127.0.0.1:PORT` | `host.internal:SANDBOXPORT` (`127.0.42.1`, default `PORT`) |
+| `--host-port PORT[:SANDBOXPORT]` | host service → sandbox | `127.0.0.1:PORT` | `127.0.0.1:SANDBOXPORT` (default `PORT`), held by pasta; pasta only |
 
 Forwards are printed to stderr at launch, so they stay in the scrollback above
 the TUI, and listed in the [sandbox context file](#sandbox-context). Inside the
-sandbox `BWRAP_NET_PUBLISH`, `BWRAP_NET_PUBLISH_ADDR`, `BWRAP_NET_HOST_PORTS`
-and `BWRAP_NET_HOST_ADDR` hold the same information.
+sandbox `BWRAP_NET_PUBLISH`, `BWRAP_NET_PUBLISH_ADDR` and
+`BWRAP_NET_HOST_PORTS` hold the same information.
 
 ```text
 bwopencode2: network: private namespace (pasta); publish address 127.65.81.1
 bwopencode2: publish    http://127.65.81.1:8000/  ->  sandbox :8000  (bind 0.0.0.0 inside)
-bwopencode2: host-port  host 127.0.0.1:5432  ->  sandbox host.internal:5432  (host service sees a loopback client)
+bwopencode2: host-port  host 127.0.0.1:5432  ->  sandbox 127.0.0.1:5432  (host service sees a loopback client)
 ```
 
 **`--publish`.** The host address is `127.H1.H2.S`: `H1.H2` comes from a hash
@@ -397,9 +397,14 @@ names it (some agent logins and MCP servers open a browser on the host that
 calls back into the sandbox). The launch then fails if a requested port is
 already in use or claimed by another of your sandboxes on `ADDR`.
 
-**`--host-port`** makes one host loopback service visible in the sandbox as
-`host.internal`, so the agent's own `127.0.0.1:PORT` stays free (it can run its
-own Postgres on 5432 next to the host's). The host side is always
+**`--host-port`** makes one host loopback service visible in the sandbox at
+`127.0.0.1:SANDBOXPORT` (and `localhost`), as pasta's `-T` does: pasta listens
+on the sandbox's loopback and connects to the host's `127.0.0.1:PORT`. pasta
+takes no other listening address for `-T`, so there is no separate name for
+the host. That sandbox port is then taken: the agent cannot run its own server
+on it, and a `--publish` to the same sandbox port is refused. To keep `PORT`
+free in the sandbox (to run its own Postgres on 5432 next to the host's),
+map it elsewhere: `--host-port 5432:15432`. The host side is always
 `127.0.0.1`. Nothing checks that the host port is open or who owns it.
 **The host service sees a loopback client and may trust it** (no password for
 local connections, admin APIs): only forward services you would let the agent

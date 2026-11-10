@@ -78,7 +78,8 @@
 #                   Use ADDR (in 127.0.0.0/8) for --publish instead.
 #   --host-port PORT[:SANDBOXPORT]
 #                   Make the host's 127.0.0.1:PORT reachable in the sandbox at
-#                   host.internal:SANDBOXPORT.  May be repeated.
+#                   127.0.0.1:SANDBOXPORT (pasta only; that sandbox port is
+#                   then taken).  May be repeated.
 #   --share-net     Share the host network instead (the behaviour before
 #                   private namespaces); not with the options above.
 #   --net-backend pasta|slirp4netns

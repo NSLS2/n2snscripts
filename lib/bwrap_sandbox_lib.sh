@@ -2259,7 +2259,9 @@ build_etc_mounts() {
 # per-launch opt-in:
 #   --publish PORT[:SANDBOXPORT]    sandbox server -> host 127.H1.H2.S:PORT
 #   --host-port PORT[:SANDBOXPORT]  host 127.0.0.1:PORT -> sandbox
-#                                   host.internal:SANDBOXPORT (127.0.42.1)
+#                                   127.0.0.1:SANDBOXPORT (pasta -T, which
+#                                   always listens on the sandbox's loopback;
+#                                   it takes no listening address)
 # Without a usable backend (neither pasta nor slirp4netns installed, no
 # /dev/net/tun, or no unprivileged user namespaces) the launch stops (exit 3).
 # --net-backend NAME restricts the choice to one backend (for testing).
@@ -2291,8 +2293,6 @@ _NET_PRIVATE=0
 _NET_BACKEND=none
 _NET_SHARED_REASON=""
 _NET_PUBLISH_ADDR_EFFECTIVE=""
-_NET_HOST_INTERNAL_ADDR="127.0.42.1"
-_NET_HOST_INTERNAL_NAME="host.internal"
 _NET_DNS_FORWARD_ADDR="169.254.1.1"
 # The sandbox's nameserver address with the chosen backend.
 _NET_DNS_EFFECTIVE=""
@@ -2304,9 +2304,12 @@ _NET_HOST_PORT_DENY=(631 2375 2376 6000-6063 41112 49374)
 _NET_PUBLISH_DESC=()
 _NET_HOST_DESC=()
 # Low and high ends of the listening side of every accepted spec, per
-# direction, for the overlap check.
+# direction, for the overlap check, and of the sandbox side of --publish (a
+# --host-port sandbox port is held by pasta, so a server cannot use it).
 _NET_PUB_LO=()
 _NET_PUB_HI=()
+_NET_PUBSBX_LO=()
+_NET_PUBSBX_HI=()
 _NET_HP_LO=()
 _NET_HP_HI=()
 
@@ -2343,8 +2346,10 @@ in 1024-65535; N or LOW-HIGH ranges are accepted.
                   example 127.0.0.1 for OAuth redirect URIs that require it.
   --host-port PORT[:SANDBOXPORT]
                   Make the host's 127.0.0.1:PORT reachable in the sandbox at
-                  host.internal:SANDBOXPORT (default PORT).  The host service
-                  sees a loopback client and may trust it.  May be repeated.
+                  127.0.0.1:SANDBOXPORT (default PORT; pasta only).  That port
+                  of the sandbox is then taken: use SANDBOXPORT to keep PORT
+                  free for a server of the agent.  The host service sees a
+                  loopback client and may trust it.  May be repeated.
                   Refused: 631 (CUPS), 2375-2376 (Docker), 6000-6063 (X11),
                   41112 (Tailscale), 49374 (OpenCode 2 service).
 
@@ -3302,15 +3307,34 @@ _net_check_overlap() {
 net_add_publish() {
     _net_check_port_spec --publish "$1"
     _net_check_overlap --publish "host port" "${_NET_A_LO}" "${_NET_A_HI}" _NET_PUB_LO _NET_PUB_HI
+    _net_check_sandbox_ports "${_NET_B_LO}" "${_NET_B_HI}" _NET_HP_LO _NET_HP_HI
     _NET_PUB_LO+=("${_NET_A_LO}")
     _NET_PUB_HI+=("${_NET_A_HI}")
+    _NET_PUBSBX_LO+=("${_NET_B_LO}")
+    _NET_PUBSBX_HI+=("${_NET_B_HI}")
     NET_PUBLISH+=("${_NET_SPEC}")
+}
+
+# _net_check_sandbox_ports LO HI LOS HIS
+#   Exit 1 when sandbox ports LO-HI overlap a range in the arrays LOS/HIS:
+#   one sandbox port cannot both receive --publish and be held by pasta for
+#   --host-port.
+_net_check_sandbox_ports() {
+    local _lo="$1" _hi="$2" _i _r="$1"
+    local -n _los="$3" _his="$4"
+    [[ ${_hi} -eq ${_lo} ]] || _r+="-${_hi}"
+    for _i in "${!_los[@]}"; do
+        if [[ ${_lo} -le ${_his[${_i}]} && ${_hi} -ge ${_los[${_i}]} ]]; then
+            echo "Error: sandbox port ${_r} is used by both --publish and --host-port; give --host-port another sandbox port (PORT:SANDBOXPORT)." >&2
+            exit 1
+        fi
+    done
 }
 
 # net_add_host_port SPEC
 #   --host-port PORT[:SANDBOXPORT]: make the host's 127.0.0.1:PORT reachable in
-#   the sandbox at host.internal:SANDBOXPORT (default PORT).  Ports on the
-#   deny list (_NET_HOST_PORT_DENY) are refused.
+#   the sandbox at 127.0.0.1:SANDBOXPORT (default PORT), where pasta then holds
+#   the port.  Ports on the deny list (_NET_HOST_PORT_DENY) are refused.
 net_add_host_port() {
     local _d _dlo _dhi
     _net_check_port_spec --host-port "$1"
@@ -3323,6 +3347,7 @@ net_add_host_port() {
         fi
     done
     _net_check_overlap --host-port "sandbox port" "${_NET_B_LO}" "${_NET_B_HI}" _NET_HP_LO _NET_HP_HI
+    _net_check_sandbox_ports "${_NET_B_LO}" "${_NET_B_HI}" _NET_PUBSBX_LO _NET_PUBSBX_HI
     _NET_HP_LO+=("${_NET_B_LO}")
     _NET_HP_HI+=("${_NET_B_HI}")
     NET_HOST_PORTS+=("${_NET_SPEC}")
@@ -3655,7 +3680,6 @@ build_net_isolation() {
             "BWRAP_NET_PUBLISH="
             "BWRAP_NET_PUBLISH_ADDR="
             "BWRAP_NET_HOST_PORTS="
-            "BWRAP_NET_HOST_ADDR="
         )
         return 0
     fi
@@ -3713,7 +3737,9 @@ build_net_isolation() {
     fi
 
     if [[ ${#NET_HOST_PORTS[@]} -gt 0 ]]; then
-        # pasta's -T takes NAMESPACE_PORT:HOST_PORT, the reverse of ours.
+        # pasta's -T takes NAMESPACE_PORT:HOST_PORT, the reverse of ours, and
+        # no listening address: it always listens on the namespace's
+        # loopback (127.0.0.1 and ::1).
         local -a _tspec=()
         for _spec in "${NET_HOST_PORTS[@]}"; do
             _host="${_spec%%:*}"
@@ -3723,11 +3749,11 @@ build_net_isolation() {
             else
                 _tspec+=("${_sbx}:${_host}")
             fi
-            _NET_HOST_DESC+=("127.0.0.1:${_host}|${_NET_HOST_INTERNAL_NAME}:${_sbx}")
+            _NET_HOST_DESC+=("127.0.0.1:${_host}|127.0.0.1:${_sbx}")
         done
         for _i in "${!PASTA_ARGS[@]}"; do
             if [[ "${PASTA_ARGS[${_i}]}" == -T ]]; then
-                PASTA_ARGS[_i + 1]="${_NET_HOST_INTERNAL_ADDR}/$(_net_join "${_tspec[@]}")"
+                PASTA_ARGS[_i + 1]="$(_net_join "${_tspec[@]}")"
             fi
         done
     fi
@@ -3748,9 +3774,6 @@ build_net_isolation() {
     else
         _hosts="127.0.0.1   localhost"$'\n'"::1         localhost"
     fi
-    if [[ ${#NET_HOST_PORTS[@]} -gt 0 ]]; then
-        _hosts+=$'\n'"${_NET_HOST_INTERNAL_ADDR}   ${_NET_HOST_INTERNAL_NAME}"
-    fi
     bwrap_fd_from_data "generated /etc/hosts" "${_hosts}"
     BWRAP_ARGS+=(--ro-bind-data "${_BWRAP_FD}" /etc/hosts)
 
@@ -3759,7 +3782,6 @@ build_net_isolation() {
         "BWRAP_NET_PUBLISH=$(_net_join ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"})"
         "BWRAP_NET_PUBLISH_ADDR=${_NET_PUBLISH_ADDR_EFFECTIVE}"
         "BWRAP_NET_HOST_PORTS=$(_net_join ${NET_HOST_PORTS[@]+"${NET_HOST_PORTS[@]}"})"
-        "BWRAP_NET_HOST_ADDR=$([[ ${#NET_HOST_PORTS[@]} -eq 0 ]] || printf '%s' "${_NET_HOST_INTERNAL_ADDR}")"
     )
 }
 
@@ -4821,11 +4843,11 @@ _bwrap_context_network() {
     else
         _t+="${_nl}${_nl}"
         for _d in "${_NET_HOST_DESC[@]}"; do
-            _t+="- \`${_d#*|}\` (\`${_NET_HOST_INTERNAL_ADDR}\`) reaches the host's \`${_d%%|*}\`.${_nl}"
+            _t+="- \`${_d#*|}\` here reaches the host's \`${_d%%|*}\`.${_nl}"
         done
-        _t+="${_nl}Your own \`127.0.0.1\` is unaffected: a server you start on the same port is separate.${_nl}${_nl}"
+        _t+="${_nl}These ports of this sandbox are taken by the forward: you cannot run your own server on them.${_nl}${_nl}"
     fi
-    _t+="\`BWRAP_NET_BACKEND\` is \`${_NET_BACKEND}\`; \`BWRAP_NET_PUBLISH\`, \`BWRAP_NET_PUBLISH_ADDR\`, \`BWRAP_NET_HOST_PORTS\` and \`BWRAP_NET_HOST_ADDR\` hold the same information.${_nl}${_nl}"
+    _t+="\`BWRAP_NET_BACKEND\` is \`${_NET_BACKEND}\`; \`BWRAP_NET_PUBLISH\`, \`BWRAP_NET_PUBLISH_ADDR\` and \`BWRAP_NET_HOST_PORTS\` hold the same information.${_nl}${_nl}"
     _net_log_context_text
     _CTX_NET="${_t}${_NET_LOG_CTX}"
 }
