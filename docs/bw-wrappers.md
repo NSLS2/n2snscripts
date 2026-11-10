@@ -25,6 +25,9 @@ option list; the tables below summarise the common surface.
   [Network](#network)). `ss` (iproute) is used to find busy ports for
   `--publish`; with slirp4netns, `--publish` also needs `python3` (or RHEL 8's
   `/usr/libexec/platform-python`).
+- For the [network log](#network-log): `systemd-cat` (systemd) with a running
+  journal, or `logger` (util-linux) with `/dev/log`. Without either the
+  wrappers warn and run without the log.
 
 ## Managed system paths
 
@@ -412,6 +415,54 @@ root-managed `nftables` rules.
 
 To list the sandbox publications on a host:
 `ss -ltn 'src 127.0.0.0/8' | grep -v ' 127\.0\.'`.
+
+### Network log
+
+Every launch records its network session in the host's system log, and with
+pasta every connection as well. It is **always on**: there is no option to turn
+it off. The records are written outside the sandbox, which can neither read nor
+change them, and they are the data needed for a later egress allowlist.
+
+| Record | Content |
+| --- | --- |
+| start | `event=start session=ID launcher=... user=... uid=... pid=... backend=... flows=logged\|unavailable publish=ADDR:PORTS host_ports=... dir=...` |
+| each pasta line | `session=ID <pasta debug line>` (setup, then a line for each flow and its state changes) |
+| end | `event=end session=ID ...`, when the sandbox has exited |
+
+- **Tag** (`SYSLOG_IDENTIFIER`): `bwrap-net`. `journalctl -t bwrap-net` shows
+  all sessions; `journalctl -t bwrap-net -g ID` one. Inside the sandbox
+  `BWRAP_SESSION` is the same ID, and the context file names it.
+- **Tool:** `systemd-cat` when the journal's stream socket exists and accepts a
+  connection, else `logger` (util-linux) on `/dev/log` (journald or rsyslog).
+  Both are tried at launch without logging anything; the launcher then writes
+  the start record itself. With neither, the launch warns and continues
+  without the log.
+- **Flows only with pasta.** slirp4netns has no flow log, so with it (and with
+  `--share-net`, recorded as `backend=none`) only the start and end records
+  are written; the start record says `flows=unavailable`.
+- When the launcher runs on a terminal it prints the tool and the session ID.
+- **How (pasta).** pasta logs flows only at debug level, and at debug level it
+  never uses syslog. So pasta gets `--debug --log-file FIFO` (and not
+  `--quiet`), with the FIFO in the launch's
+  [session directory](#runtime-directory), and a supervisor started by the
+  launcher (outside the sandbox) copies each line to the log:
+  - It holds the FIFO open read-write. pasta closes inherited descriptors
+    before it opens its log file; a reader that saw end-of-file in that gap
+    would leave pasta blocked on a full pipe, which stalls the sandbox's
+    network. It stops when pasta has exited, after draining the pipe, then
+    writes the end record and removes the session directory.
+  - If the tool dies, it goes on reading and drops the lines, so pasta never
+    blocks on it.
+  - `--log-size` is set to 1 TiB: pasta rotates its log with `fallocate` or
+    `lseek`, which fail on a FIFO and would make it drop every later line.
+  - pasta also prints its setup to stderr until it starts the command. Its
+    stderr is therefore the FIFO too, so those lines go to the log instead of
+    your terminal. The descriptor relay (pasta's command) prints a marker there
+    and reopens your stderr: by path when it is a terminal or a file, else (a
+    pipe) through a second FIFO that the supervisor copies. If pasta stops
+    before the marker (a failed start), the supervisor prints pasta's lines on
+    your terminal, prefixed `<launcher>: pasta:`, just after the launcher has
+    exited.
 
 ### Implementation notes: pasta
 

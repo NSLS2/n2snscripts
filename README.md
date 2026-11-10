@@ -75,6 +75,9 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
   with `/dev/net/tun` and unprivileged user namespaces, for the private network
   namespace of the `bw*` wrappers; without either they stop unless run with
   `--share-net`
+- `systemd-cat` (with a running journal) or `logger`, for the `bw*` wrappers'
+  always-on network log (tag `bwrap-net`); without either they warn and run
+  without it
 - `gpg(1)` for `gpg-passwd.sh`
 - `openssl(1)` for `pemdecompose`
 - `python3 >= 3.9` (stdlib only, no pip dependencies) for `azoidcapp`

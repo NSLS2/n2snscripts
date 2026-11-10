@@ -104,7 +104,9 @@
 # Outbound connections work; services on the host's loopback are unreachable
 # and the sandbox's listeners are invisible to the host, except for the ports
 # opened with --publish and --host-port.  Without a usable private namespace
-# the launch stops (exit 3) unless --share-net is given.
+# the launch stops (exit 3) unless --share-net is given.  Every session (with
+# pasta every connection too) is recorded in the host's system log, tag
+# bwrap-net; there is no option to turn this off.
 #
 # Sandbox context: a short markdown file describing this sandbox (what is
 # mounted read-only or read-write, what is lost at exit, which tools are

@@ -2316,7 +2316,9 @@ or else slirp4netns).
 Outbound connections work as on the host; services on the host's loopback
 (127.0.0.1) are NOT reachable, and nothing the agent listens on is reachable
 from the host, unless opened below.  If no private network namespace can be
-set up, the launch stops (exit 3) unless --share-net is given.  Ports must be
+set up, the launch stops (exit 3) unless --share-net is given.  Every session
+(and with pasta every connection) is recorded in the host's system log, tag
+bwrap-net (journalctl -t bwrap-net); this cannot be turned off.  Ports must be
 in 1024-65535; N or LOW-HIGH ranges are accepted.
   --share-net     Share the host network instead (the behaviour before
                   private namespaces): host loopback services are reachable
@@ -2559,6 +2561,287 @@ _net_session_dir() {
     if ! _NET_SESSION_DIR="$(mktemp -d "${_NET_RUNTIME_BASE}/session.XXXXXXXX")"; then
         echo "Error: cannot create a session directory in ${_NET_RUNTIME_BASE}." >&2
         exit 3
+    fi
+}
+
+# ── Network log (system journal / syslog) ───────────────────────
+# Every launch records its network session in the host's system log, and
+# with pasta every connection too.  It is always on: there is no option to
+# turn it off.  When no logging tool works, the launch warns and continues
+# without the log.
+#
+#   tag (SYSLOG_IDENTIFIER)  bwrap-net
+#   start record             event=start session=ID launcher=... backend=...
+#   each pasta line          session=ID <pasta debug line>
+#   end record               event=end session=ID ...
+#
+# `journalctl -t bwrap-net` shows them; `journalctl -t bwrap-net -g ID` one
+# session.  BWRAP_SESSION in the sandbox is the same ID.  The tool is
+# systemd-cat when the journal's stream socket exists, else logger (util-
+# linux; /dev/log, so journald or rsyslog).  The launch writes the start
+# record itself, synchronously, which also checks that the tool works.
+#
+# pasta at debug level never uses syslog: it writes to --log-file, and until
+# it starts the command, to stderr too.  So with pasta:
+#
+#   launcher ─┬─ supervisor (_net_log_supervisor, background, outside the sandbox)
+#             │    reads the netlog FIFO line by line and writes each line,
+#             │    prefixed with the session, to the tool; at the end writes
+#             │    the end record and removes the session directory
+#             └─ exec env -i ... pasta --debug --log-file FIFO ... 2<>FIFO
+#                  -- relay (prints a marker, reopens its stderr) -- bwrap ...
+#
+#   - The supervisor holds the FIFO open read-write, so it never sees EOF
+#     early: pasta closes inherited descriptors before it opens the log file,
+#     and a reader that saw EOF in that gap would leave pasta blocked on a
+#     full pipe, which stalls the sandbox's network.  It stops reading when
+#     the launcher process (pasta) is gone, after draining what is left.
+#   - It never blocks pasta: if the tool dies it goes on reading and drops the
+#     lines.
+#   - --log-size is huge: pasta rotates its log with fallocate/lseek, which
+#     fail on a FIFO and would make it drop every later line.
+#   - pasta's stderr goes to the FIFO as well (its startup lines would
+#     otherwise print on the terminal); the relay prints a marker there and
+#     then reopens the user's stderr by path (a terminal or a file), or
+#     through a second FIFO that the supervisor copies to it (a pipe).  If
+#     pasta exits before the marker (a failed start), the supervisor prints
+#     its lines on the terminal, so its errors are not lost.
+# With slirp4netns or --share-net only the start and end records are written
+# (slirp4netns has no flow log); the supervisor just waits for the end.
+
+_NET_LOG_TAG="bwrap-net"
+_NET_LOG_TOOL=""
+_NET_LOG_TOOLS=()
+_NET_LOG_SESSION=""
+_NET_LOG_FLOWS=0
+_NET_LOG_FIFO=""
+_NET_LOG_ERR_FIFO=""
+_NET_LOG_MARKER=""
+# pasta's --log-size: 1 TiB, never reached (see above).
+_NET_LOG_PASTA_SIZE=1099511627776
+
+# _net_log_detect
+#   List the usable logging tools, best first (_NET_LOG_TOOLS: systemd-cat
+#   when the journal's stream socket exists, logger when /dev/log does), set
+#   _NET_LOG_TOOL to the first (empty when none), choose
+#   the session id, and export BWRAP_SESSION.  Called by build_net_isolation.
+_net_log_detect() {
+    _NET_LOG_SESSION="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+    _NET_LOG_TOOLS=()
+    # A real launch also tries each tool without logging anything:
+    # systemd-cat connects to the journal before running `true`, and logger
+    # opens /dev/log before reading its (empty) input.
+    if command -v systemd-cat > /dev/null 2>&1 && [[ -S /run/systemd/journal/stdout ]] &&
+        { [[ "${DRY_RUN}" -eq 1 ]] || systemd-cat -t "${_NET_LOG_TAG}" true > /dev/null 2>&1; }; then
+        _NET_LOG_TOOLS+=(systemd-cat)
+    fi
+    if command -v logger > /dev/null 2>&1 && [[ -S /dev/log ]] &&
+        { [[ "${DRY_RUN}" -eq 1 ]] || logger --socket-errors=on -t "${_NET_LOG_TAG}" < /dev/null > /dev/null 2>&1; }; then
+        _NET_LOG_TOOLS+=(logger)
+    fi
+    _NET_LOG_TOOL="${_NET_LOG_TOOLS[0]:-}"
+    _NET_LOG_FLOWS=0
+    [[ -z "${_NET_LOG_TOOL}" || "${_NET_BACKEND}" != pasta ]] || _NET_LOG_FLOWS=1
+    SANDBOX_ENV+=("BWRAP_SESSION=${_NET_LOG_SESSION}")
+}
+
+# _net_log_cmd
+#   Fill the array _NET_LOG_CMD with the command that writes its standard
+#   input to the system log, one record per line.
+_NET_LOG_CMD=()
+_net_log_cmd() {
+    case "${_NET_LOG_TOOL}" in
+        systemd-cat) _NET_LOG_CMD=(systemd-cat -t "${_NET_LOG_TAG}" -p info) ;;
+        logger) _NET_LOG_CMD=(logger --socket-errors=on -t "${_NET_LOG_TAG}" -p user.info --id="$$") ;;
+        *) _NET_LOG_CMD=() ;;
+    esac
+}
+
+# _net_log_record EVENT
+#   Print the session record for EVENT (start or end).
+_net_log_record() {
+    local _r _i _hp=""
+    _r="event=$1 session=${_NET_LOG_SESSION} launcher=${0##*/} user=${_USER:-$(id -un)} uid=$(id -u)"
+    _r+=" pid=$$ backend=${_NET_BACKEND}"
+    if [[ "$1" == start ]]; then
+        if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+            _r+=" flows=logged"
+        else
+            _r+=" flows=unavailable"
+        fi
+        [[ -z "${_NET_PUBLISH_ADDR_EFFECTIVE}" ]] || _r+=" publish=${_NET_PUBLISH_ADDR_EFFECTIVE}:$(_net_join ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"})"
+        for _i in ${NET_HOST_PORTS[@]+"${NET_HOST_PORTS[@]}"}; do _hp+="${_hp:+,}${_i}"; done
+        [[ -z "${_hp}" ]] || _r+=" host_ports=${_hp}"
+        _r+=" dir=${PWD}"
+    fi
+    printf '%s\n' "${_r}"
+}
+
+# _net_log_start
+#   Called by launch_sandbox just before it execs: write the start record
+#   (which checks the tool; without one, warn and log nothing), then with
+#   pasta add the log options and the stderr hand-over, and start the
+#   supervisor.
+_net_log_start() {
+    local _err _launcher="${0##*/}" _t
+    _NET_LOG_TOOL=""
+    for _t in ${_NET_LOG_TOOLS[@]+"${_NET_LOG_TOOLS[@]}"}; do
+        _NET_LOG_TOOL="${_t}"
+        _net_log_cmd
+        if _net_log_record start | "${_NET_LOG_CMD[@]}" > /dev/null 2>&1; then
+            break
+        fi
+        _NET_LOG_TOOL=""
+    done
+    if [[ -z "${_NET_LOG_TOOL}" ]]; then
+        printf 'Warning: %s: neither systemd-cat (journal) nor logger (/dev/log) can write to the system log;\n' "${_launcher}" >&2
+        printf '         this network session is not logged.\n' >&2
+        _NET_LOG_TOOL=""
+        _NET_LOG_FLOWS=0
+        return 0
+    fi
+    if [[ -t 2 ]]; then
+        printf '%s: network log: %s, tag %s, session %s\n' "${_launcher}" \
+            "$([[ "${_NET_LOG_TOOL}" == systemd-cat ]] && echo journal || echo syslog)" \
+            "${_NET_LOG_TAG}" "${_NET_LOG_SESSION}" >&2
+    fi
+
+    if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        _net_session_dir
+        _NET_LOG_FIFO="${_NET_SESSION_DIR}/netlog"
+        mkfifo -m 0600 "${_NET_LOG_FIFO}"
+        _NET_LOG_MARKER="bwrap-net relay started ${_NET_LOG_SESSION}"
+        local _i
+        for _i in "${!PASTA_ARGS[@]}"; do
+            [[ "${PASTA_ARGS[${_i}]}" != --quiet ]] || unset 'PASTA_ARGS[_i]'
+        done
+        PASTA_ARGS=("${PASTA_ARGS[@]}" --debug --log-file "${_NET_LOG_FIFO}" --log-size "${_NET_LOG_PASTA_SIZE}")
+        # The relay restores the user's stderr: by path when it is a terminal
+        # or a file, else through a FIFO the supervisor copies.
+        _err="$(readlink "/proc/$$/fd/2" 2> /dev/null || true)"
+        if [[ "${_err}" != /* || "${_err}" == *" (deleted)" ]] ||
+            { [[ ! -c "${_err}" && ! -f "${_err}" ]]; }; then
+            _NET_LOG_ERR_FIFO="${_NET_SESSION_DIR}/stderr"
+            mkfifo -m 0600 "${_NET_LOG_ERR_FIFO}"
+            _err="${_NET_LOG_ERR_FIFO}"
+        fi
+        _BWRAP_FD_RELAY=(2 note "${_NET_LOG_MARKER}" 2 append "${_err}" ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
+    fi
+    _net_log_supervisor &
+}
+
+# _net_log_supervisor
+#   The background half of the network log (see "Network log").  Runs in a
+#   subshell; $$ is still the launcher, which is pasta (or bwrap) by then.
+_net_log_supervisor() {
+    local _sink _fifo _line="" _part="" _rc _started=0 _dead=0 _bridge="" _i
+    local -a _early=()
+    set +e
+    # Signals meant for the session (Ctrl-C, a hangup, `kill` of its process
+    # group) must not cost the end record: the supervisor ends by itself once
+    # the launcher has gone.
+    trap '' INT QUIT TSTP HUP TERM PIPE
+    exec < /dev/null > /dev/null
+    exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
+
+    if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        exec {_fifo}<> "${_NET_LOG_FIFO}"
+        if [[ -n "${_NET_LOG_ERR_FIFO}" ]]; then
+            cat < "${_NET_LOG_ERR_FIFO}" >&2 &
+            _bridge=$!
+        fi
+        while :; do
+            # Poll faster until the sandbox has started, so a failed pasta
+            # start is reported promptly.
+            IFS= read -r -t "$([[ "${_started}" -eq 1 ]] && echo 1 || echo 0.1)" _line <&"${_fifo}"
+            _rc=$?
+            if ((_rc > 128)); then
+                # Timeout; a partial line stays in _line.
+                _part+="${_line}"
+                _net_launcher_alive || break
+                continue
+            fi
+            _line="${_part}${_line}"
+            _part=""
+            if [[ "${_started}" -eq 0 ]]; then
+                if [[ "${_line}" == "${_NET_LOG_MARKER}" ]]; then
+                    _started=1
+                    _early=()
+                    continue
+                fi
+                [[ ${#_early[@]} -ge 200 ]] || _early+=("${_line}")
+            fi
+            if [[ "${_dead}" -eq 0 ]] &&
+                ! printf 'session=%s %s\n' "${_NET_LOG_SESSION}" "${_line}" 1>&"${_sink}" 2> /dev/null; then
+                _dead=1
+            fi
+        done
+        # pasta has exited: drain what it left in the pipe.
+        while IFS= read -r -t 0.2 _line <&"${_fifo}"; do
+            [[ "${_dead}" -eq 1 ]] ||
+                printf 'session=%s %s\n' "${_NET_LOG_SESSION}" "${_part}${_line}" 1>&"${_sink}" 2> /dev/null || _dead=1
+            _part=""
+        done
+        exec {_fifo}<&-
+        if [[ "${_started}" -eq 0 ]]; then
+            # pasta stopped before starting the sandbox: show what it said.
+            for _line in ${_early[@]+"${_early[@]}"}; do
+                printf '%s: pasta: %s\n' "${0##*/}" "${_line}" >&2
+            done
+        fi
+        if [[ -n "${_bridge}" ]]; then
+            for ((_i = 0; _i < 50; _i++)); do
+                kill -0 "${_bridge}" 2> /dev/null || break
+                sleep 0.1
+            done
+            kill "${_bridge}" 2> /dev/null
+        fi
+    else
+        while _net_launcher_alive; do
+            sleep 1
+        done
+    fi
+    if [[ "${_dead}" -eq 0 ]]; then
+        _net_log_record end 1>&"${_sink}" 2> /dev/null
+    fi
+    exec {_sink}>&-
+    [[ -z "${_NET_SESSION_DIR}" ]] || rm -rf "${_NET_SESSION_DIR}"
+    exit 0
+}
+
+# _net_log_context_text
+#   Set _NET_LOG_CTX to the context file's paragraph about the network log,
+#   empty when no logging tool is available.
+_NET_LOG_CTX=""
+_net_log_context_text() {
+    _NET_LOG_CTX=""
+    [[ -n "${_NET_LOG_TOOL}" ]] || return 0
+    _NET_LOG_CTX="The host records this network session in its system log (tag \`${_NET_LOG_TAG}\`, session \`${_NET_LOG_SESSION}\`, also in \`BWRAP_SESSION\`)"
+    if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        _NET_LOG_CTX+=", with every connection pasta makes for it"
+    fi
+    _NET_LOG_CTX+=". The sandbox cannot read or change that log."$'\n\n'
+}
+
+# _net_log_print_dry_run
+#   Describe the network log as comments for --dry-run.
+_net_log_print_dry_run() {
+    _net_log_cmd
+    printf '\n# Network log: '
+    if [[ -z "${_NET_LOG_TOOL}" ]]; then
+        printf 'neither systemd-cat (journal) nor logger (/dev/log) is available;\n'
+        printf '# a real launch warns and logs nothing.\n'
+        return 0
+    fi
+    printf 'the launcher writes the start record (session %s) with\n#   %s\n' \
+        "${_NET_LOG_SESSION}" "${_NET_LOG_CMD[*]}"
+    if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        printf '# and pasta gets --debug --log-file <session dir>/netlog --log-size %s (not --quiet)\n' "${_NET_LOG_PASTA_SIZE}"
+        printf '# with its stderr on that FIFO; a supervisor copies each line to the log and the\n'
+        printf '# relay first reopens your stderr.  The end record is written when pasta exits.\n'
+    else
+        printf '# and a supervisor writes the end record when the sandbox exits (no flow log\n'
+        printf '# with %s).\n' "${_NET_BACKEND}"
     fi
 }
 
@@ -2858,7 +3141,7 @@ _net_slirp_run() {
 #   Print the parent pid of PID (from /proc/PID/stat; empty when PID is gone).
 _net_ppid() {
     local _st _f
-    IFS= read -r _st < "/proc/$1/stat" 2> /dev/null || return 0
+    IFS= read -r _st 2> /dev/null < "/proc/$1/stat" || return 0
     # Fields after the command name, which may contain spaces: state ppid ...
     read -r -a _f <<< "${_st##*) }"
     printf '%s' "${_f[1]}"
@@ -3125,7 +3408,7 @@ _NET_CLAIMS_LOCK_FD=""
 #   since boot); empty when PID is gone.
 bwrap_proc_start_time() {
     local _st _f
-    IFS= read -r _st < "/proc/$1/stat" 2> /dev/null || return 0
+    IFS= read -r _st 2> /dev/null < "/proc/$1/stat" || return 0
     read -r -a _f <<< "${_st##*) }"
     printf '%s' "${_f[19]}"
 }
@@ -3331,6 +3614,7 @@ build_net_isolation() {
     _NET_PUBLISH_DESC=()
     _NET_HOST_DESC=()
     _NET_PUBLISH_ADDR_EFFECTIVE=""
+    _net_log_detect
 
     # Host network (--share-net): the previous behaviour.
     if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
@@ -4475,7 +4759,8 @@ _bwrap_context_network() {
         _t+=" and they are not yours to use unless the user asks: they may belong to other users."
         _t+=" Anything you listen on is reachable from the host, and on \`0.0.0.0\` from the network:"
         _t+=" bind \`127.0.0.1\` unless told otherwise.${_nl}${_nl}"
-        _CTX_NET="${_t}"
+        _net_log_context_text
+        _CTX_NET="${_t}${_NET_LOG_CTX}"
         return 0
     fi
     _t+="This sandbox has its own network namespace (${_NET_BACKEND})."
@@ -4513,7 +4798,8 @@ _bwrap_context_network() {
         _t+="${_nl}Your own \`127.0.0.1\` is unaffected: a server you start on the same port is separate.${_nl}${_nl}"
     fi
     _t+="\`BWRAP_NET_BACKEND\` is \`${_NET_BACKEND}\`; \`BWRAP_NET_PUBLISH\`, \`BWRAP_NET_PUBLISH_ADDR\`, \`BWRAP_NET_HOST_PORTS\` and \`BWRAP_NET_HOST_ADDR\` hold the same information.${_nl}${_nl}"
-    _CTX_NET="${_t}"
+    _net_log_context_text
+    _CTX_NET="${_t}${_NET_LOG_CTX}"
 }
 
 # _bwrap_context_render TOOL DEST
@@ -4803,6 +5089,11 @@ _bwrap_toml_string() {
 #              (which appends one newline) and unsets the variable before
 #              exec'ing bwrap.  Not for secrets: the variable stays in
 #              pasta's environment for the whole session.
+# Two more entries are used by the network log (see "Network log"), before
+# the others:
+#   note TEXT  the relay prints TEXT on the descriptor (a marker on stderr).
+#   append PATH  the relay opens PATH for appending on the descriptor (the
+#              user's stderr again).
 
 # _bwrap_fd_check_room
 #   Exit 1 when the reserved numbers would reach 90, where the slirp4netns
@@ -4872,6 +5163,14 @@ while [[ $# -gt 0 && "$1" != -- ]]; do
             unset "${_v}"
             shift 2
             ;;
+        note)
+            printf "%s\n" "$3" >&"$1"
+            shift 3
+            ;;
+        append)
+            eval "exec $1>>\"\$3\"" || { echo "$0: cannot open $3" >&2; exit 126; }
+            shift 3
+            ;;
         *)
             echo "$0: bad relay entry: $2" >&2
             exit 126
@@ -4907,7 +5206,7 @@ _bwrap_fd_data_numbers() {
     local _r=0
     _BWRAP_FD_DATA_NUMS=()
     while [[ ${_r} -lt ${#_BWRAP_FD_RELAY[@]} ]]; do
-        if [[ "${_BWRAP_FD_RELAY[$((_r + 1))]}" == file ]]; then
+        if [[ "${_BWRAP_FD_RELAY[$((_r + 1))]}" != data ]]; then
             _r=$((_r + 3))
         else
             _BWRAP_FD_DATA_NUMS+=("${_BWRAP_FD_RELAY[${_r}]}")
@@ -5138,6 +5437,7 @@ print_dry_run() {
     for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do printf " %q" "${_arg}"; done
     printf "\n"
     [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_print_dry_run
+    _net_log_print_dry_run
     for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
         printf '\n# Descriptor %s, filled by the relay with the %s:\n#\n' "${_n}" "${_BWRAP_FD_LABEL["${_n}"]}"
         printf '%s\n' "${_BWRAP_FD_DATA["${_n}"]}" | sed 's/^/# /; s/ *$//'
@@ -5171,6 +5471,8 @@ launch_sandbox() {
     _BASH_BIN="$(resolve_bash_bin)"
 
     local -a _data_env=() _net_prefix=()
+    _net_print_report
+    _net_log_start
     if [[ "${_NET_BACKEND}" == pasta ]]; then
         _net_prefix=("${_PASTA_BIN}" "${PASTA_ARGS[@]}" --)
     elif [[ "${_NET_BACKEND}" == slirp4netns ]]; then
@@ -5181,8 +5483,11 @@ launch_sandbox() {
         _data_env+=("_BWRAP_FD_DATA_${_n}=${_BWRAP_FD_DATA["${_n}"]}")
     done
 
-    _net_print_report
     [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_start
+    if [[ -n "${_NET_LOG_FIFO}" ]]; then
+        # pasta's stderr goes to the network log (see "Network log").
+        exec 2<> "${_NET_LOG_FIFO}"
+    fi
     exec "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
         USER="${_USER}" \
