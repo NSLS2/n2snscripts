@@ -27,7 +27,7 @@ Three parts:
 | Situation | Result |
 | --- | --- |
 | The last daily check found damage (`CHECK-FAILED` flag) | Refuse; the message says how to recover |
-| A session lock is held by another host | Refuse |
+| A session lock or a backup lock is held by another host (a live session there, or its backup job is reading the database) | Refuse |
 | A session lock is held on this host by a different OpenCode version | Refuse |
 | A live session on this host with the same version recorded a different build of the binary (a reinstall of the same version while it runs) | Refuse |
 | An OpenCode 2 process of this user on this host runs a different binary (an old build still running after an upgrade), in any PID namespace | Refuse |
@@ -75,6 +75,7 @@ directory read-write) cannot reach the locks, the backups or the flag:
 ~/.local/share/opencode2/opencode-db-guard/
     guard.lock
     locks/session@<host>@<version>.lock
+    locks/backup@<host>.lock                    held while a backup reads the database
     backups/opencode-<UTC>.db.gz                newest 3
     backups/last-success, backup.lock
     backup.log                                  output of the last backup job
@@ -86,14 +87,22 @@ directory read-write) cannot reach the locks, the backups or the flag:
 When the guard lets a launch through and the last backup is over 24 hours old,
 it starts `opencode2-db backup --if-due --delay 30` in the background (`setsid`,
 `nice -n 19`, `ionice -c 3`; it closes the session lock descriptor first so it
-never holds the lock). The job:
+does not keep the session lock alive after OpenCode exits). The job:
 
-1. copies the database with SQLite's backup API into `/var/tmp` (not NFS),
-2. runs `PRAGMA quick_check` on the copy (about 20 seconds when run on a
+1. takes the right to read the database: under `guard.lock` it looks for a live
+   session or backup of another host; if there is one it skips (the next launch
+   tries again), otherwise it takes a shared lock on `locks/backup@<host>.lock`
+   and holds it while it reads. Launches on other hosts refuse while that lock
+   is held, so a backup that outlives its session cannot overlap a session on
+   another host; `restore`, `rebuild` and `clear` refuse too,
+2. copies the database with SQLite's backup API into `/var/tmp` (not NFS) and
+   releases the backup lock,
+3. runs `PRAGMA quick_check` on the copy (about 20 seconds when run on a
    340 MB file over NFS, fast on local disk),
-3. compresses the copy into `backups/` (about half the size) and keeps the
-   newest 3,
-4. on damage writes `CHECK-FAILED` and logs it; the next launch refuses.
+4. compresses the copy into `backups/` (about half the size) and keeps the
+   newest 3; a second backup in the same second waits for the next one instead
+   of overwriting the first,
+5. on damage writes `CHECK-FAILED` and logs it; the next launch refuses.
 
 A backup that cannot be made for another reason (no space, database busy) only
 logs and tries again at the next launch. Damage that stops SQLite from reading
@@ -119,7 +128,7 @@ restored and rebuilt databases, temporary copies) is private (mode 0600, the
 guard directory 0700); the launchers create the guard directory the same way.
 
 `restore`, `rebuild` and `clear` take `guard.lock` and refuse while any session
-lock is held. The damaged files are never deleted: they are renamed to
+lock or backup lock is held. The damaged files are never deleted: they are renamed to
 `opencode.db.corrupt-<date>` (with `-wal` and `-shm` alongside, and a time
 suffix if the name exists).
 
@@ -192,6 +201,13 @@ before `--`. `bwopencode2` also skips `--exec` and `--dry-run`.
 - The guard compares processes by their executable (device and inode). If the
   OpenCode binary is replaced while sessions run, the old sessions count as an
   old build until they exit, which is the point.
+- SQLite silently ignores frames of a damaged write-ahead log (a bad checksum),
+  so `rebuild` and `restore` cannot tell that transactions were lost that way.
+  Only a log SQLite refuses to open is reported. The damaged `opencode.db-wal`
+  is kept next to `opencode.db.corrupt-<date>`, so a copy exists.
+- The tool never deletes a `opencode.db.corrupt-*` or `opencode.db.rebuilt-*`
+  file; each can be as large as the database. Delete them yourself once you are
+  sure you do not need them. A new rebuild lists the earlier rebuilt files.
 
 ## Tests
 

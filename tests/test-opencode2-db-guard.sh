@@ -90,6 +90,31 @@ hold_lock() {
 
 lock_free() { flock -x -n "$1" true; }
 
+# hold_backup_window GUARDDIR SECONDS: another process holds the backup lock the
+# way `opencode2-db backup` does while it reads the database.  Waits until held.
+hold_backup_window() {
+    rm -f "${T}/window-held"
+    python3 - "${TOOL}" "$1" "$2" "${T}/window-held" << 'EOF' &
+import importlib.machinery
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+loader = importlib.machinery.SourceFileLoader("oc2db", sys.argv[1])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("oc2db", loader))
+loader.exec_module(mod)
+with mod.backup_window(Path(sys.argv[2])) as reason:
+    Path(sys.argv[4]).write_text("held" if reason is None else reason)
+    time.sleep(float(sys.argv[3]))
+EOF
+    PIDS+=($!)
+    for _ in $(seq 1 40); do
+        [[ -e "${T}/window-held" ]] && break
+        sleep 0.1
+    done
+}
+
 # ── library ─────────────────────────────────────────────────────────────
 
 D="$(new_data clean)"
@@ -139,6 +164,21 @@ build_holder "$(locks_of "${D}")/session@${HOST}@2.2.5.lock" "$(oc2db_file_id "$
 OUT="$(run_guard "${D}")"
 check "a live session of the same build is allowed" contains "${OUT}" 'rc=0'
 check "the session records its build id in the lock file" bash -c '[[ "$(head -n1 "$1")" == "$2" ]]' _ "$(locks_of "${D}")/session@${HOST}@2.2.5.lock" "$(oc2db_file_id "${NEW}")"
+
+# A backup job holds locks/backup@HOST.lock while it reads the database.  A
+# launch on ANOTHER host must refuse; on the same host it is harmless.  The
+# other host is faked with a hostname shim.
+mkdir -p "${T}/shim"
+printf '#!/bin/sh\necho other.example\n' > "${T}/shim/hostname"
+chmod +x "${T}/shim/hostname"
+D="$(new_data backuplock)"
+hold_backup_window "$(oc2db_guard_dir "${D}")" 5
+check "the backup lock is held by the tool" test "$(cat "${T}/window-held")" = held
+OUT="$(run_guard "${D}" PATH="${T}/shim:${PATH}")"
+check "a launch on another host is refused while a backup holds its lock" contains "${OUT}" 'rc=1'
+check "the refusal says a backup is running" contains "${OUT}" 'backup is running'
+OUT="$(run_guard "${D}")"
+check "a launch on the same host is allowed while a backup holds its lock" contains "${OUT}" 'rc=0'
 
 D="$(new_data stale)"
 mkdir -p "$(locks_of "${D}")"
@@ -273,6 +313,38 @@ for _ in $(seq 1 40); do
     sleep 0.5
 done
 check "the guard starts the real backup tool, which writes a backup" compgen -G "${T}/job/opencode-db-guard/backups/opencode-*.db.gz" > /dev/null
+# A backup of this host does not run while another host has a live session; it
+# is not an error for the background job (--if-due), the next launch retries.
+D="$(new_data skipbackup)"
+hold_lock "$(locks_of "${D}")/session@elsewhere.example@2.2.5.lock" 5
+OUT="$("${TOOL}" --data-dir "${D}" backup 2>&1)"
+RC=$?
+check "backup is skipped while another host has a live session" contains "${OUT}" 'another host'
+check "a skipped manual backup exits non-zero" test "${RC}" -ne 0
+check "a skipped backup writes nothing" bash -c '! compgen -G "$1/opencode-*.db.gz" > /dev/null' _ "$(oc2db_guard_dir "${D}")/backups"
+"${TOOL}" --data-dir "${D}" backup --if-due > /dev/null 2>&1
+check "a skipped --if-due backup exits 0" test "$?" -eq 0
+sleep 4
+
+# restore, rebuild and clear refuse while a backup holds its lock.
+D="$(new_data backupblocks)"
+hold_backup_window "$(oc2db_guard_dir "${D}")" 4
+OUT="$("${TOOL}" --data-dir "${D}" clear 2>&1)"
+check "clear refuses while a backup job holds its lock" contains "${OUT}" 'backup job'
+sleep 4
+
+# Two backups in the same second must not overwrite each other.
+mkdir -p "${T}/dup/opencode"
+cp "${DB}" "${T}/dup/opencode/opencode.db"
+"${TOOL}" --data-dir "${T}/dup/opencode" backup --keep 5 > /dev/null
+"${TOOL}" --data-dir "${T}/dup/opencode" backup --keep 5 > /dev/null
+check "two backups in quick succession keep both files" bash -c '[[ "$(ls "$1"/backups/opencode-*.db.gz | wc -l)" -eq 2 ]]' _ "${T}/dup/opencode-db-guard"
+
+# A rebuild never deletes an earlier rebuilt file, even in the same second.
+"${TOOL}" --data-dir "${T}/dup/opencode" rebuild > /dev/null 2>&1
+"${TOOL}" --data-dir "${T}/dup/opencode" rebuild > /dev/null 2>&1
+check "two rebuilds keep both rebuilt files" bash -c '[[ "$(ls "$1"/opencode.db.rebuilt-* | wc -l)" -eq 2 ]]' _ "${T}/dup/opencode"
+
 PD="${T}/py/share/opencode"
 GD="${T}/py/share/opencode-db-guard"
 
@@ -315,7 +387,7 @@ assert c.execute('select count(*) from session_message').fetchone()[0] == 300" "
 
 hold_lock "${GD}/locks/session@${HOST}@2.2.5.lock" 3
 OUT="$("${TOOL}" --data-dir "${PD}" restore --yes 2>&1)"
-check "restore refuses while a session lock is held" contains "${OUT}" 'sessions are running'
+check "restore refuses while a session lock is held" contains "${OUT}" 'using the database'
 sleep 3
 
 "${TOOL}" --data-dir "${PD}" rebuild --apply --yes > /dev/null

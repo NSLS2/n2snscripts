@@ -10,7 +10,8 @@
 # file can be reached from every workstation and login host.
 #
 # What oc2db_guard does, before OpenCode 2 starts:
-#   - refuses when another host holds a session lock (live session there);
+#   - refuses when another host holds a session lock (live session there) or
+#     a backup lock (its backup job is reading the database);
 #   - refuses when this host has a session of a different version, a session of
 #     the same version that recorded another build of the binary, or an
 #     OpenCode 2 process that is not the binary about to run (an old build still
@@ -163,9 +164,13 @@ oc2db_scan_processes() {
     done
 }
 
-# Probe every session lock file.  A file we can lock exclusively has no
-# holder: another host's or version's is stale and is removed.  Fills
-#   _OC2DB_HELD         "HOST VERSION" of live locks of another host or version
+# Probe every session lock file and every backup lock file (backup@HOST.lock,
+# held by `opencode2-db backup` while it reads the database).  A file we can
+# lock exclusively has no holder: another host's or version's is stale and is
+# removed.  A backup lock of this host is ignored: sessions and a backup on one
+# host are safe together.  Fills
+#   _OC2DB_HELD         "HOST VERSION" of live locks of another host or version;
+#                       VERSION is "backup" for a backup job on another host
 #   _OC2DB_BUILD_CLASH  "HOST VERSION" when the live holders of OUR lock file
 #                       (this host, this version) recorded another build id
 # A session writes its build id (device:inode of the binary) as the first line
@@ -173,11 +178,27 @@ oc2db_scan_processes() {
 # process yet is still compared.
 oc2db_probe_locks() {
     local _locks="$1" _own="$2" _bin_id="$3" _f _name _rest _host _ver _fd _recorded
+    local _me
+    _me="$(oc2db_host)"
     _OC2DB_HELD=()
     _OC2DB_BUILD_CLASH=()
-    for _f in "${_locks}"/session@*.lock; do
+    for _f in "${_locks}"/session@*.lock "${_locks}"/backup@*.lock; do
         [[ -e "${_f}" ]] || continue
         _name="${_f##*/}"
+        if [[ "${_name}" == backup@* ]]; then
+            _host="${_name#backup@}"
+            _host="${_host%.lock}"
+            [[ "${_host}" == "${_me}" ]] && continue
+            if { exec {_fd}<> "${_f}"; } 2> /dev/null; then
+                if flock -x -n "${_fd}" 2> /dev/null; then
+                    rm -f -- "${_f}"
+                else
+                    _OC2DB_HELD+=("${_host} backup")
+                fi
+                exec {_fd}>&-
+            fi
+            continue
+        fi
         if [[ "${_name}" == "${_own}" ]]; then
             if [[ -n "${_bin_id}" ]] && { exec {_fd}<> "${_f}"; } 2> /dev/null; then
                 if ! flock -x -n "${_fd}" 2> /dev/null; then
@@ -306,12 +327,16 @@ oc2db_guard() {
     if ((${#_OC2DB_HELD[@]} > 0)); then
         _details=()
         for _h in "${_OC2DB_HELD[@]}"; do
-            _details+=("session lock held by ${_h% *} (OpenCode ${_h#* })")
+            if [[ "${_h#* }" == "backup" ]]; then
+                _details+=("a database backup is running on ${_h% *}")
+            else
+                _details+=("session lock held by ${_h% *} (OpenCode ${_h#* })")
+            fi
         done
         _details+=("The database is on NFS; two hosts, or two OpenCode versions, must not use it together.")
         exec {_gfd}>&-
         # A session lock on this host with the same version is not in the list.
-        oc2db_refuse "a session is running with the same database" "${_details[@]}"
+        oc2db_refuse "the database is in use by another host or OpenCode version" "${_details[@]}"
         return 1
     fi
 
@@ -359,9 +384,12 @@ oc2db_guard() {
     return 0
 }
 
-# Start the daily backup in the background.  The job must not hold the session
-# lock, so it closes that descriptor first; it is detached so closing the
-# terminal does not kill it.
+# Start the daily backup in the background.  The job closes the session lock
+# descriptor first, so it never keeps the session lock alive after OpenCode
+# exits; while it reads the database it holds its own backup lock
+# (opencode2-db backup_window), which launches on other hosts refuse on, and it
+# skips the backup when another host has a live session.  It is detached so
+# closing the terminal does not kill it.
 oc2db_backup_if_due() {
     local _data="$1" _gdir="$2" _tool _keep="${OPENCODE2_DB_BACKUPS:-3}"
     [[ "${_keep}" == "0" ]] && return 0

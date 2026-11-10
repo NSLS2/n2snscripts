@@ -34,7 +34,10 @@
 #             not be used, stops --apply unless --accept-loss is given
 #   clear     remove the CHECK-FAILED flag without changing anything
 #
-# restore, rebuild and clear refuse to run while any session lock is held.
+# restore, rebuild and clear refuse to run while any session lock or backup
+# lock is held.  backup reads the database only when no other host has a live
+# session or backup, and holds locks/backup@HOST.lock while it does.  Nothing
+# here deletes a *.corrupt-* or *.rebuilt-* file.
 # Data directory default: ~/.local/share/opencode2/opencode.
 
 from __future__ import annotations
@@ -45,19 +48,22 @@ import fcntl
 import gzip
 import json
 import os
+import re
 import shutil
+import socket
 import sqlite3
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import IO, Iterator, List, Optional, Tuple
 
 DAY = 24 * 3600
 DB_NAME = "opencode.db"
 FLAG_NAME = "CHECK-FAILED"
 BACKUP_GLOB = "opencode-*.db.gz"
+BUSY = 5
 
 
 class ToolError(Exception):
@@ -110,10 +116,24 @@ def ago(timestamp: float) -> str:
 # ── locks ────────────────────────────────────────────────────────────────
 
 
-def held_sessions(gdir: Path) -> List[str]:
-    """Names of session lock files that somebody holds (flock probe)."""
+def this_host() -> str:
+    """The host name as the launchers put it in lock file names."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname()) or "unknown"
+
+
+def host_of(name: str) -> str:
+    """Host in a lock file name: session@HOST@VERSION.lock or backup@HOST.lock."""
+    part = name.split("@")[1]
+    if name.startswith("backup@") and part.endswith(".lock"):
+        part = part[: -len(".lock")]
+    return part
+
+
+def held_locks(gdir: Path) -> List[str]:
+    """Names of session and backup lock files that somebody holds (flock probe)."""
     held: List[str] = []
-    for lock in sorted((gdir / "locks").glob("session@*.lock")):
+    locks = gdir / "locks"
+    for lock in sorted(list(locks.glob("session@*.lock")) + list(locks.glob("backup@*.lock"))):
         try:
             fd = os.open(str(lock), os.O_RDWR)
         except OSError:
@@ -128,34 +148,77 @@ def held_sessions(gdir: Path) -> List[str]:
 
 
 def describe_lock(name: str) -> str:
+    if name.startswith("backup@"):
+        return "backup job on %s" % host_of(name)
     parts = name[len("session@") : -len(".lock")].split("@")
     if len(parts) == 2:
         return "%s (OpenCode %s)" % (parts[0], parts[1])
     return name
 
 
+def flock_wait(handle: IO[str], seconds: float) -> bool:
+    """Take an exclusive lock, waiting up to `seconds`; False when it did not come."""
+    deadline = time.time() + seconds
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.time() > deadline:
+                return False
+            time.sleep(0.5)
+
+
 @contextlib.contextmanager
 def exclusive(gdir: Path) -> Iterator[None]:
     """Hold guard.lock (no launcher can pass its checks) and require that no
-    session lock is held."""
+    session lock and no backup lock is held."""
     gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     (gdir / "locks").mkdir(exist_ok=True, mode=0o700)
     with open(str(gdir / "guard.lock"), "a+") as handle:
-        deadline = time.time() + 30
-        while True:
-            try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError:
-                if time.time() > deadline:
-                    raise ToolError("another launch holds %s/guard.lock" % gdir)
-                time.sleep(0.5)
-        held = held_sessions(gdir)
+        if not flock_wait(handle, 30):
+            raise ToolError("another launch holds %s/guard.lock" % gdir)
+        held = held_locks(gdir)
         if held:
             raise ToolError(
-                "OpenCode 2 sessions are running, close them first: " + ", ".join(describe_lock(name) for name in held)
+                "OpenCode 2 sessions or a backup are using the database, close them first: "
+                + ", ".join(describe_lock(name) for name in held)
             )
         yield
+
+
+@contextlib.contextmanager
+def backup_window(gdir: Path) -> Iterator[Optional[str]]:
+    """The right to read the database for a backup.  Under guard.lock (so no
+    launcher can pass its checks meanwhile) look for a live session or backup of
+    ANOTHER host; if there is none, take a shared lock on
+    locks/backup@HOST.lock, which launches on other hosts check, and hold it
+    until the block ends.  Yields None when the lock is held, otherwise the
+    reason it was not taken.  Sessions of this host do not matter: SQLite's WAL
+    is safe within one host."""
+    gdir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    locks = gdir / "locks"
+    locks.mkdir(exist_ok=True, mode=0o700)
+    me = this_host()
+    guard = open(str(gdir / "guard.lock"), "a+")
+    mine = None
+    reason: Optional[str] = None
+    try:
+        if not flock_wait(guard, 30):
+            reason = "another launch holds %s/guard.lock" % gdir
+        else:
+            others = [name for name in held_locks(gdir) if host_of(name) != me]
+            if others:
+                reason = "in use on another host: " + ", ".join(describe_lock(n) for n in others)
+            else:
+                mine = open(str(locks / ("backup@%s.lock" % me)), "a+")
+                fcntl.flock(mine, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        guard.close()
+        yield reason
+    finally:
+        guard.close()
+        if mine is not None:
+            mine.close()
 
 
 # ── SQLite helpers ───────────────────────────────────────────────────────
@@ -208,7 +271,21 @@ def cmd_backup(data_dir: Path, args: argparse.Namespace) -> int:
             return 0
         if args.delay:
             time.sleep(args.delay)
-        return run_backup(source, gdir, bdir, stamp, args.keep)
+        rc = run_backup(source, gdir, bdir, stamp, args.keep)
+        if rc == BUSY:
+            # Not an error for the background job: the next launch tries again.
+            return 0 if args.if_due else 1
+        return rc
+
+
+def new_backup_name(bdir: Path) -> str:
+    """A name no backup has: the stamp is to the second, so a second backup in
+    the same second waits for the next one rather than overwriting the first."""
+    while True:
+        name = "opencode-%s.db.gz" % now_utc().strftime("%Y%m%dT%H%M%SZ")
+        if not (bdir / name).exists():
+            return name
+        time.sleep(0.25)
 
 
 def run_backup(source: Path, gdir: Path, bdir: Path, stamp: Path, keep: int) -> int:
@@ -220,15 +297,19 @@ def run_backup(source: Path, gdir: Path, bdir: Path, stamp: Path, keep: int) -> 
             return 0
         copy = os.path.join(work, DB_NAME)
         say("backing up %s (%s)" % (source, human(size)))
-        src = sqlite3.connect("file:%s?mode=rw" % source, uri=True, timeout=60)
-        try:
-            dst = sqlite3.connect(copy)
+        with backup_window(gdir) as reason:
+            if reason is not None:
+                say("not backing up now, %s" % reason)
+                return BUSY
+            src = sqlite3.connect("file:%s?mode=rw" % source, uri=True, timeout=60)
             try:
-                src.backup(dst)
+                dst = sqlite3.connect(copy)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
             finally:
-                dst.close()
-        finally:
-            src.close()
+                src.close()
         check = sqlite3.connect(copy)
         try:
             problems = quick_check(check)
@@ -242,7 +323,7 @@ def run_backup(source: Path, gdir: Path, bdir: Path, stamp: Path, keep: int) -> 
             for line in lines:
                 say("  " + line)
             return 3
-        name = "opencode-%s.db.gz" % now_utc().strftime("%Y%m%dT%H%M%SZ")
+        name = new_backup_name(bdir)
         part = bdir / (".%s.part" % name)
         with open(copy, "rb") as raw, gzip.open(str(part), "wb", compresslevel=3) as packed:
             shutil.copyfileobj(raw, packed, 1 << 20)
@@ -291,8 +372,8 @@ def cmd_status(data_dir: Path, args: argparse.Namespace) -> int:
             print("    " + line)
     else:
         print("Damage flag    : none")
-    held = held_sessions(gdir) if (gdir / "locks").is_dir() else []
-    print("Session locks  : " + (", ".join(describe_lock(n) for n in held) if held else "none held"))
+    held = held_locks(gdir) if (gdir / "locks").is_dir() else []
+    print("Locks held     : " + (", ".join(describe_lock(n) for n in held) if held else "none held"))
     backups = list_backups(gdir)
     print("Backups        : %d" % len(backups))
     for path in backups:
@@ -471,6 +552,16 @@ def rebuild_project(src: sqlite3.Connection, dst: sqlite3.Connection) -> Optiona
         return None
 
 
+def new_rebuilt_path(data_dir: Path) -> Path:
+    """A path no earlier rebuild used (stamp to the second; wait, never reuse
+    or delete another run's file)."""
+    while True:
+        path = data_dir / (DB_NAME + ".rebuilt-" + now_utc().strftime("%Y%m%dT%H%M%SZ"))
+        if not path.exists():
+            return path
+        time.sleep(0.25)
+
+
 def cmd_rebuild(data_dir: Path, args: argparse.Namespace) -> int:
     gdir = guard_dir(data_dir)
     if not (data_dir / DB_NAME).exists():
@@ -481,9 +572,13 @@ def cmd_rebuild(data_dir: Path, args: argparse.Namespace) -> int:
         try:
             if not free_space_ok(work, size):
                 raise ToolError("not enough free space in %s" % work)
-            for leftover in data_dir.glob(DB_NAME + ".rebuilt-*"):
-                leftover.unlink()
-            result = data_dir / (DB_NAME + ".rebuilt-" + now_utc().strftime("%Y%m%dT%H%M%SZ"))
+            earlier = sorted(data_dir.glob(DB_NAME + ".rebuilt-*"))
+            if earlier:
+                say(
+                    "earlier rebuilt files are kept (delete them yourself when sure): "
+                    + ", ".join(p.name for p in earlier)
+                )
+            result = new_rebuilt_path(data_dir)
             valid, complete = build_rebuilt(data_dir, work, result)
             if not valid:
                 say("not swapping: the new database did not pass its checks; it is left at %s" % result)
