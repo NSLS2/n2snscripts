@@ -472,6 +472,10 @@ launcher ─┬─ helper (background): waits for the namespace, starts slirp4ne
   published) the helper prints the reason and slirp4netns's last messages,
   kills the still-waiting sandbox (its pid comes from bwrap's `--info-fd`), so
   the tool never runs, and then bwrap. The exit status is then 137, not 3.
+  The helper signals a process only after checking that it is the launcher
+  (the helper's own parent) or a child of the launcher. If the launcher is
+  already gone (`unshare` or the descriptor relay failed and printed why), the
+  helper notices within a poll interval, signals nothing, and exits.
 
 ### Runtime directory
 

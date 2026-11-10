@@ -2797,7 +2797,7 @@ _net_slirp_start() {
 #   Runs in a subshell; $$ is still the launcher, which is bwrap by then.
 #   _ENV_BIN is launch_sandbox's local (bash scoping is dynamic).
 _net_slirp_helper() {
-    local _own _ns="" _map="" _pid="$$" _r _out _i
+    local _own _ns="" _map="" _pid="$$" _r="" _rc _out _i
     local -a _api=()
     set +e
     exec 90>&- 91<&- 92>&-
@@ -2807,6 +2807,7 @@ _net_slirp_helper() {
     # namespace of its own, with the uid map written.
     _own="$(readlink /proc/self/ns/net)"
     for ((_i = 0; _i < 500; _i++)); do
+        _net_launcher_alive || _net_slirp_quit
         _ns="$(readlink "/proc/${_pid}/ns/net" 2> /dev/null)"
         _map="$(cat "/proc/${_pid}/uid_map" 2> /dev/null)"
         [[ -z "${_ns}" || "${_ns}" == "${_own}" || -z "${_map}" ]] || break
@@ -2820,7 +2821,14 @@ _net_slirp_helper() {
     _net_slirp_run "${_pid}" ${_api[@]+"${_api[@]}"} > /dev/null 2>&98 93<&- 94>&- 97<&- 99<&- &
     exec 95<&- 96>&- 98>&-
 
-    if ! IFS= read -r -t 30 -n 1 _r <&97 || [[ "${_r}" != 1 ]]; then
+    # Wait (up to 30 s) for slirp4netns; stop waiting if the launcher is gone.
+    for ((_i = 0; _i < 30; _i++)); do
+        IFS= read -r -t 1 -n 1 _r <&97
+        _rc=$?
+        ((_rc > 128)) || break
+        _net_launcher_alive || _net_slirp_quit
+    done
+    if [[ "${_r}" != 1 ]]; then
         _net_slirp_fail "slirp4netns did not become ready"
     fi
     if [[ ${#_NET_SLIRP_FWDS[@]} -gt 0 ]]; then
@@ -2847,14 +2855,46 @@ _net_slirp_run() {
         --ready-fd=96 --exit-fd=95 "$@" "${_pid}" tap0
 }
 
+# _net_ppid PID
+#   Print the parent pid of PID (from /proc/PID/stat; empty when PID is gone).
+_net_ppid() {
+    local _st _f
+    IFS= read -r _st < "/proc/$1/stat" 2> /dev/null || return 0
+    # Fields after the command name, which may contain spaces: state ppid ...
+    read -r -a _f <<< "${_st##*) }"
+    printf '%s' "${_f[1]}"
+}
+
+# _net_launcher_alive
+#   True while the calling helper's parent is still the launcher process
+#   ($$; it keeps that pid through exec).  While it is our parent the pid
+#   cannot have been reused, so it is safe to signal.  Once it has gone, we
+#   are re-parented and this is false.
+_net_launcher_alive() {
+    # BASHPID is read here: inside $(...) it would be the substitution's pid.
+    local _me="${BASHPID}"
+    [[ "$(_net_ppid "${_me}")" == "$$" ]]
+}
+
+# _net_slirp_quit
+#   The launcher is gone (unshare or the relay failed and has said why):
+#   clean up and exit without signalling anything.
+_net_slirp_quit() {
+    [[ -z "${_NET_SLIRP_DIR}" ]] || rm -rf "${_NET_SLIRP_DIR}"
+    exit 0
+}
+
 # _net_slirp_fail MESSAGE
 #   Report a failed network setup, kill the still-blocked sandbox (the tool
 #   has not started; its pid is read from bwrap's --info-fd) and then the
 #   launcher process ($$, by now bwrap), and exit the helper while it still
 #   holds the --block-fd pipe.  slirp4netns, if started, exits with bwrap
-#   (--exit-fd).
+#   (--exit-fd).  Only processes whose parent is checked are signalled: the
+#   sandbox must be a child of the launcher, the launcher still ours;
+#   otherwise (the launcher already gone) nothing is signalled.
 _net_slirp_fail() {
-    local _msg="$1" _info="" _line
+    local _msg="$1" _info="" _line _child
+    _net_launcher_alive || _net_slirp_quit
     printf '%s: network setup failed (slirp4netns): %s\n' "${0##*/}" "${_msg}" >&2
     tail -n 5 <&99 2> /dev/null | sed 's/^/    /' >&2
     printf '    The sandbox was stopped. Run with --share-net to start without network isolation.\n' >&2
@@ -2863,9 +2903,14 @@ _net_slirp_fail() {
         [[ "${_line}" != *"}"* ]] || break
     done
     if [[ "${_info}" =~ \"child-pid\":\ *([0-9]+) ]]; then
-        kill -KILL "${BASH_REMATCH[1]}" 2> /dev/null
+        _child="${BASH_REMATCH[1]}"
+        if [[ "$(_net_ppid "${_child}")" == "$$" ]]; then
+            kill -KILL "${_child}" 2> /dev/null
+        fi
     fi
-    kill -KILL "$$" 2> /dev/null
+    if _net_launcher_alive; then
+        kill -KILL "$$" 2> /dev/null
+    fi
     [[ -z "${_NET_SLIRP_DIR}" ]] || rm -rf "${_NET_SLIRP_DIR}"
     exit 1
 }
