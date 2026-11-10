@@ -106,7 +106,6 @@ Every `bw*` wrapper accepts these options:
 | `--publish PORT[:SANDBOXPORT]` | Make a server in the sandbox reachable on the host at a per-user, per-session loopback address. May be repeated. See [Network](#network) |
 | `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`) for `--publish` instead of the derived address, for example `127.0.0.1` for OAuth redirects |
 | `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `host.internal:SANDBOXPORT`. May be repeated (pasta only) |
-| `--net-log FILE` | Log every network flow to `FILE` on the host (`pasta --debug`; pasta only) |
 | `--share-net` | Share the host network instead of a private namespace (the behaviour before private namespaces); not with the forwarding options |
 | `--net-backend pasta\|slirp4netns` | Use only this backend for the private namespace (normally pasta, else slirp4netns) |
 
@@ -329,11 +328,11 @@ So sandboxes are isolated by default, with one explicit escape hatch.
 | Outbound traffic leaves from | the host's address | the host's address | the host |
 | DNS | `169.254.1.1`, forwarded to the host's resolver | `192.168.254.3`, forwarded to the host's resolver | the host's `resolv.conf` |
 | `--publish`, `--publish-addr` | yes | yes (at most 64 ports) | no |
-| `--host-port`, `--net-log` | yes | no: the launch stops (exit 3) rather than drop them | no |
+| `--host-port` | yes | no: the launch stops (exit 3) rather than drop it | no |
 | Speed | close to native | slower (user-mode TCP/IP); fine for API calls | native |
 
-With `--host-port` or `--net-log`, a host without a working pasta stops even
-if slirp4netns would work.
+With `--host-port`, a host without a working pasta stops even if slirp4netns
+would work.
 
 DNS: the host's resolver is usually on loopback (`127.0.0.53`), so the sandbox
 gets a generated `/etc/resolv.conf` naming the backend's DNS address, which the
@@ -413,13 +412,6 @@ root-managed `nftables` rules.
 
 To list the sandbox publications on a host:
 `ss -ltn 'src 127.0.0.0/8' | grep -v ' 127\.0\.'`.
-
-### Network log
-
-`--net-log FILE` passes `--log-file FILE --debug` to pasta: every flow is
-logged on the host, which is the data needed to write an egress allowlist.
-pasta keeps the newest 1 MiB. The wrapper warns when `FILE` is inside a
-read-write mount of the sandbox, where the agent could change it.
 
 ### Implementation notes: pasta
 
@@ -1100,5 +1092,5 @@ public function surface (sandbox construction, dynamic mount discovery,
 binary masking, environment scrubbing, `build_sandbox_context` with its
 `SANDBOX_CONTEXT_*` variables (see [Sandbox context](#sandbox-context)), and
 the network functions `detect_net_capabilities`, `net_add_publish`,
-`net_add_host_port`, `net_set_publish_addr`, `net_set_log_file`,
+`net_add_host_port`, `net_set_publish_addr`, `net_set_share`, `net_set_backend`,
 `net_print_help` and `build_net_isolation` (see [Network](#network)).

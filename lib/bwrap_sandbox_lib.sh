@@ -24,9 +24,10 @@
 #   - main() orchestrating the build sequence — must call build_extra_path_mounts
 #     after build_dynamic_tool_mounts, detect_net_capabilities after
 #     detect_kernel_capabilities, and build_net_isolation after build_etc_mounts
-#   - --publish / --publish-addr / --host-port / --net-log in parse_wrapper_args,
-#     through net_add_publish, net_set_publish_addr, net_add_host_port and
-#     net_set_log_file; net_print_help in show_help
+#   - --publish / --publish-addr / --host-port / --share-net / --net-backend in
+#     parse_wrapper_args, through net_add_publish, net_set_publish_addr,
+#     net_add_host_port, net_set_share and net_set_backend; net_print_help in
+#     show_help
 #
 # Usage (in tool wrapper scripts):
 #   SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
@@ -69,7 +70,7 @@ EXTRA_RW_PATHS=()
 
 # Private network namespace (see "Network isolation").  Filled by the
 # launchers' parse_wrapper_args through net_add_publish, net_add_host_port,
-# net_set_publish_addr, net_set_log_file and net_set_share; turned into pasta
+# net_set_publish_addr and net_set_share; turned into pasta
 # arguments by build_net_isolation.  NET_SHARE=1 (--share-net) keeps the
 # sandbox on the host network; NET_BACKEND_FORCE (--net-backend) restricts the
 # choice to one backend.  NET_PUBLISH and NET_HOST_PORTS hold validated specs
@@ -77,7 +78,6 @@ EXTRA_RW_PATHS=()
 NET_PUBLISH=()
 NET_PUBLISH_ADDR=""
 NET_HOST_PORTS=()
-NET_LOG_FILE=""
 NET_SHARE=0
 NET_BACKEND_FORCE=""
 PASTA_ARGS=()
@@ -2325,7 +2325,7 @@ in 1024-65535; N or LOW-HIGH ranges are accepted.
   --net-backend pasta|slirp4netns
                   Use only this backend for the private namespace (normally
                   pasta, else slirp4netns).  slirp4netns supports --publish
-                  but not --host-port or --net-log.
+                  but not --host-port.
   --publish PORT[:SANDBOXPORT]
                   Make a server inside the sandbox (port SANDBOXPORT, default
                   PORT) reachable on the host at http://127.H1.H2.S:PORT/, an
@@ -2342,7 +2342,6 @@ in 1024-65535; N or LOW-HIGH ranges are accepted.
                   sees a loopback client and may trust it.  May be repeated.
                   Refused: 631 (CUPS), 2375-2376 (Docker), 6000-6063 (X11),
                   41112 (Tailscale), 49374 (OpenCode 2 service).
-  --net-log FILE  Log every network flow (pasta --debug) to FILE on the host.
 
 NET_HELP_EOF
 }
@@ -2385,14 +2384,13 @@ net_set_share() {
 }
 
 # _net_forward_options
-#   Print the forward options given (--publish, --host-port, --net-log, as a
-#   space-separated list), nothing when none.
+#   Print the forward options given (--publish, --publish-addr, --host-port,
+#   as a space-separated list), nothing when none.
 _net_forward_options() {
     local -a _opts=()
     [[ ${#NET_PUBLISH[@]} -eq 0 ]] || _opts+=(--publish)
     [[ -z "${NET_PUBLISH_ADDR}" ]] || _opts+=(--publish-addr)
     [[ ${#NET_HOST_PORTS[@]} -eq 0 ]] || _opts+=(--host-port)
-    [[ -z "${NET_LOG_FILE}" ]] || _opts+=(--net-log)
     printf '%s' "${_opts[*]}"
 }
 
@@ -2434,8 +2432,8 @@ detect_net_capabilities() {
 
     _slirp_reason="not tried (--net-backend ${_want})"
     if [[ -z "${_want}" || "${_want}" == slirp4netns ]]; then
-        if [[ ${#NET_HOST_PORTS[@]} -gt 0 || -n "${NET_LOG_FILE}" ]]; then
-            _slirp_reason="does not support --host-port or --net-log (pasta only)"
+        if [[ ${#NET_HOST_PORTS[@]} -gt 0 ]]; then
+            _slirp_reason="does not support --host-port (pasta only)"
         elif _net_try_slirp; then
             _NET_BACKEND=slirp4netns
             _NET_PRIVATE=1
@@ -2608,7 +2606,7 @@ _net_session_dir() {
 #   --enable-sandbox/--enable-seccomp  as podman does, when /etc/resolv.conf
 #                            resolves inside /etc or /run (required by it).
 # --publish works through the API socket (add_hostfwd, IPv4 TCP, one port per
-# request); --host-port and --net-log have no slirp4netns equivalent.
+# request); --host-port has no slirp4netns equivalent.
 
 _SLIRP_BIN=""
 _SLIRP_ARGS=()
@@ -3074,22 +3072,6 @@ net_set_publish_addr() {
     NET_PUBLISH_ADDR="$1"
 }
 
-# net_set_log_file PATH
-#   --net-log: have pasta log every flow (debug level) to PATH on the host.
-net_set_log_file() {
-    local _dir
-    if [[ -z "$1" ]]; then
-        echo "Error: --net-log requires a file name." >&2
-        exit 1
-    fi
-    _dir="$(dirname -- "$1")"
-    if [[ ! -d "${_dir}" || ! -w "${_dir}" ]]; then
-        echo "Error: --net-log: directory '${_dir}' does not exist or is not writable." >&2
-        exit 1
-    fi
-    NET_LOG_FILE="$(readlink -f -- "${_dir}")/${1##*/}"
-}
-
 # _net_listeners
 #   Fill _NET_LISTEN ("ADDR PORT" lines) from the host's listening TCP sockets
 #   (ss -Hltn).  Wildcard addresses (0.0.0.0, *, ::) are written as `*`, and
@@ -3336,7 +3318,7 @@ _net_join() {
 }
 
 # build_net_isolation
-#   Finish PASTA_ARGS from the --publish / --host-port / --net-log options,
+#   Finish PASTA_ARGS from the --publish / --host-port options,
 #   add the bwrap namespace options pasta needs, generate /etc/resolv.conf and
 #   /etc/hosts, and export BWRAP_NET_*.  On the host network (see
 #   detect_net_capabilities) only mount the host's resolv.conf and hosts and
@@ -3438,10 +3420,6 @@ build_net_isolation() {
         done
     fi
 
-    if [[ -n "${NET_LOG_FILE}" ]]; then
-        PASTA_ARGS+=(--log-file "${NET_LOG_FILE}" --debug)
-    fi
-
     # DNS: pasta forwards queries for _NET_DNS_FORWARD_ADDR, slirp4netns for
     # _NET_SLIRP_DNS, to the host's first nameserver.  Only IPv4.
     if [[ -r /etc/resolv.conf ]] &&
@@ -3499,9 +3477,6 @@ _net_print_report() {
         printf '%s: host-port  host %s  ->  sandbox %s  (host service sees a loopback client)\n' \
             "${_launcher}" "${_spec%%|*}" "${_spec#*|}" >&2
     done
-    if [[ -n "${NET_LOG_FILE}" ]]; then
-        printf '%s: network log  %s\n' "${_launcher}" "${NET_LOG_FILE}" >&2
-    fi
 }
 
 # _net_require_configured
@@ -3514,28 +3489,6 @@ _net_require_configured() {
         echo "Error: ${0##*/}: network isolation was not set up (detect_net_capabilities / build_net_isolation missing)." >&2
         exit 1
     fi
-}
-
-# _net_warn_log_visible
-#   Warn when the --net-log file lies under a read-write mount, where the
-#   agent could read or rewrite it.  Called by print_dry_run and
-#   launch_sandbox, once every mount is known.
-_net_warn_log_visible() {
-    [[ -n "${NET_LOG_FILE}" ]] || return 0
-    local _i=0 _flag
-    while [[ ${_i} -lt ${#BWRAP_ARGS[@]} ]]; do
-        _flag="${BWRAP_ARGS[${_i}]}"
-        _bwrap_flag_arity "${_flag}"
-        case "${_flag}" in
-            --bind | --bind-try)
-                if _is_prefix_of "${BWRAP_ARGS[$((_i + 1))]}" "${NET_LOG_FILE}"; then
-                    echo "Warning: --net-log: ${NET_LOG_FILE} is under a read-write mount (${BWRAP_ARGS[$((_i + 1))]}); the agent can read and change it." >&2
-                    return 0
-                fi
-                ;;
-        esac
-        _i=$((_i + 1 + _BWRAP_FLAG_ARITY))
-    done
 }
 
 # ── OpenCode config requirement ───────────────────────────────────
@@ -5087,7 +5040,6 @@ _is_secret_env_name() {
 print_dry_run() {
     verify_n2c_state_not_exposed
     _net_require_configured
-    _net_warn_log_visible
     local _BWRAP_BIN _ENV_BIN _BASH_BIN
     _BWRAP_BIN="$(resolve_bwrap_bin)"
     _ENV_BIN="$(resolve_env_bin)"
@@ -5213,7 +5165,6 @@ print_dry_run() {
 launch_sandbox() {
     verify_n2c_state_not_exposed
     _net_require_configured
-    _net_warn_log_visible
     local _BWRAP_BIN _ENV_BIN _BASH_BIN _n
     _BWRAP_BIN="$(resolve_bwrap_bin)"
     _ENV_BIN="$(resolve_env_bin)"
