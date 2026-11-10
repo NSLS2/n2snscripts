@@ -129,5 +129,9 @@ def forward(listener, connect, log=None, label=""):
 
 
 def port_range(spec):
-    lo, _, hi = spec.partition("-")
-    return range(int(lo), int(hi or lo) + 1)
+    """Ports of a pasta port list: N, LO-HI, comma-separated."""
+    ports = []
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        ports.extend(range(int(lo), int(hi or lo) + 1))
+    return ports

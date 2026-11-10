@@ -933,13 +933,16 @@ bwopencode2 --serve-ssh-config
   server; stop it with Ctrl-C in its terminal.
 - **Published like `--publish`.** The server's port is added to
   [`--publish`](#opening-ports), so it is reachable on
-  the host only at your publish address `127.H1.H2.S:PORT` (normally `.1`; the
-  launcher prints it), never on another address. Inside the private network
+  the host only at your first publish address `127.H1.H2.1:PORT` (the
+  launcher prints it), **always**: the session's publish address is fixed to
+  `.1` and never moves to another index, so the `--serve-ssh-config` alias
+  always reaches it. If one of the session's ports is taken there (another
+  of your `--publish` ports), the launch stops and says so instead.
+  `--publish-addr` is refused with `--serve`. Inside the private network
   namespace the server listens on `0.0.0.0`, because forwarded connections
   arrive at the namespace's interface; nothing else reaches it. With
-  `--share-net` the server listens on `127.H1.H2.1` itself. `--publish-addr
-  127.0.0.1` gives the old address. Reach it from another machine through an
-  ssh tunnel. Works with both network backends.
+  `--share-net` the server listens on `127.H1.H2.1` itself. Reach it from
+  another machine through an ssh tunnel. Works with both network backends.
 - **Free port from a fixed range**, `24700-24709` by default (ten sessions at
   once). The range sits below the kernel's ephemeral range (32768-60999 on
   Linux), so no outgoing connection takes a server port, and clear of 49374
@@ -948,16 +951,15 @@ bwopencode2 --serve-ssh-config
   if it overlaps the ephemeral range). `--serve-port N` asks for one port in
   the range and fails if it is taken, so a saved tunnel always matches.
 - **The ssh tunnel.** At start the launcher prints
-  `ssh -L P:127.H1.H2.S:P <host>` with the host from `hostname -f`; then open
+  `ssh -L P:127.H1.H2.1:P <host>` with the host from `hostname -f`; then open
   `http://127.0.0.1:P/` on the machine with the browser. For all ports at
   once, `bwopencode2 --serve-ssh-config` (run on the host, as the user who runs
   the sessions: the address depends on the uid) prints a block for
   `~/.ssh/config` on the machine with the browser (alias `<host>-oc`, one
   `LocalForward` per port of the range to `127.H1.H2.1`,
   `ExitOnForwardFailure no` so a busy local port does not stop the others).
-  The port is chosen free on `127.H1.H2.1`, so a session normally gets that
-  address; if it does not (another of your `--publish` ports is busy there),
-  the launcher says that the alias does not reach it. Keep the same port number
+  The port is chosen free on `127.H1.H2.1`, and not claimed there by another
+  of your sandboxes. Keep the same port number
   at both ends: the browser cookie is named by it (see below). Add `User` and
   `ProxyJump` to the alias as needed. Each user has their own address, so
   sessions of different users on one host no longer compete for
@@ -969,7 +971,7 @@ bwopencode2 --serve-ssh-config
   directly: it starts the server, waits until it answers, asks it for a
   one-time pairing code and prints the link twice, for the tunnel
   (`http://127.0.0.1:<port>/auth/connect/<code>`) and for this host
-  (`http://127.H1.H2.S:<port>/...`). Open one to be signed in, with the 30-day cookie, without typing the password.
+  (`http://127.H1.H2.1:<port>/...`). Open one to be signed in, with the 30-day cookie, without typing the password.
   The link works once and expires after 5 minutes; after that, or if the
   printed link failed, click **Use password** and enter the password. The
   password reaches `curl` on its standard input (`-K -`), never on a command

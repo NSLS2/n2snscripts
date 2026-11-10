@@ -77,6 +77,9 @@ EXTRA_RW_PATHS=()
 # "PORTS[:SANDBOXPORTS]" (PORTS is N or LOW-HIGH).
 NET_PUBLISH=()
 NET_PUBLISH_ADDR=""
+# Set (to the option's name) when a launcher fixes NET_PUBLISH_ADDR itself
+# (bwopencode2 --serve): the address must then not move, and errors say why.
+NET_PUBLISH_ADDR_FIXED_BY=""
 NET_HOST_PORTS=()
 NET_SHARE=0
 NET_BACKEND_FORCE=""
@@ -3469,6 +3472,28 @@ _net_claimed_port() {
     done
 }
 
+# net_publish_port_claimed ADDR PORT
+#   True when a live claim of another launch holds host PORT on ADDR.  Read
+#   without the lock (for an early choice, such as the --serve port); the
+#   final check is made under the lock by _net_derive_publish_addr.
+net_publish_port_claimed() {
+    local _f _pid _start _ports _r
+    _net_runtime_base
+    for _f in "${_NET_RUNTIME_BASE}/claims/$1".*; do
+        [[ -f "${_f}" ]] || continue
+        _pid="$(sed -n 's/^pid=//p' "${_f}" 2> /dev/null)"
+        _start="$(sed -n 's/^start=//p' "${_f}" 2> /dev/null)"
+        if [[ "${_pid}" == "$$" ]] || ! bwrap_proc_is "${_pid}" "${_start}"; then
+            continue
+        fi
+        _ports="$(sed -n 's/^ports=//p' "${_f}" 2> /dev/null)"
+        for _r in ${_ports}; do
+            ((${_r%-*} <= $2 && $2 <= ${_r#*-})) && return 0
+        done
+    done
+    return 1
+}
+
 # _net_claims_write
 #   Record this launch's claim on _NET_PUBLISH_ADDR_EFFECTIVE.
 _net_claims_write() {
@@ -3561,10 +3586,13 @@ _net_choose_publish_addr() {
         _net_busy_port "${NET_PUBLISH_ADDR}"
         if [[ -n "${_NET_BUSY_PID}" ]]; then
             echo "Error: --publish: port ${_NET_BUSY} on ${NET_PUBLISH_ADDR} is claimed by another of your sandboxes (launcher pid ${_NET_BUSY_PID})." >&2
-            exit 1
+        elif [[ -n "${_NET_BUSY}" ]]; then
+            echo "Error: --publish: port ${_NET_BUSY} is already in use on ${NET_PUBLISH_ADDR} (see: ss -ltnp)." >&2
         fi
         if [[ -n "${_NET_BUSY}" ]]; then
-            echo "Error: --publish: port ${_NET_BUSY} is already in use on ${NET_PUBLISH_ADDR} (see: ss -ltnp)." >&2
+            if [[ -n "${NET_PUBLISH_ADDR_FIXED_BY}" ]]; then
+                echo "       ${NET_PUBLISH_ADDR_FIXED_BY} always publishes on ${NET_PUBLISH_ADDR}; choose other --publish ports, or run again." >&2
+            fi
             exit 1
         fi
         return 0

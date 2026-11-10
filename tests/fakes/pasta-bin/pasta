@@ -101,7 +101,8 @@ if child == 0:
             os._exit(1)
     os.write(ready_w, b"1")
     os.close(ready_w)
-    os.read(go_r, 1)
+    if os.read(go_r, 1) != b"1":
+        os._exit(1)  # pasta failed during setup: never start the command
     os.close(go_r)
     try:
         os.execvp(cmd[0], cmd)
@@ -120,10 +121,11 @@ import socket  # noqa: E402
 
 for spec in fwd_t:
     addr, _, ports = spec.rpartition("/")
-    hports, _, gports = ports.partition(":")
-    hr = list(_nsproxy.port_range(hports))
-    gr = list(_nsproxy.port_range(gports or hports))
-    for hp, gp in zip(hr, gr):
+    pairs = []
+    for part in ports.split(","):
+        hports, _, gports = part.partition(":")
+        pairs += zip(_nsproxy.port_range(hports), _nsproxy.port_range(gports or hports))
+    for hp, gp in pairs:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
@@ -138,8 +140,11 @@ for spec in fwd_t:
         _nsproxy.forward(s, lambda gp=gp: proxy.connect(NS_ADDR, gp), log, "-t %d" % hp)
 for spec in fwd_T:
     addr, _, ports = spec.rpartition("/")
-    sports, _, hports = ports.partition(":")
-    for sp, hp in zip(_nsproxy.port_range(sports), _nsproxy.port_range(hports or sports)):
+    pairs = []
+    for part in ports.split(","):
+        sports, _, hports = part.partition(":")
+        pairs += zip(_nsproxy.port_range(sports), _nsproxy.port_range(hports or sports))
+    for sp, hp in pairs:
         s = proxy.listen(addr or "127.0.0.1", sp)
         _nsproxy.forward(s, lambda hp=hp: socket.create_connection(("127.0.0.1", hp)), log, "-T %d" % sp)
 
