@@ -27,7 +27,8 @@ option list; the tables below summarise the common surface.
   `/usr/libexec/platform-python`).
 - For the [network log](#network-log): `systemd-cat` (systemd) with a running
   journal, or `logger` (util-linux) with `/dev/log`. Without either the
-  wrappers warn and run without the log.
+  wrappers warn and run without the log. Python 3.6+ (standard library) to
+  condense it and to name destinations (DNS relay).
 
 ## Managed system paths
 
@@ -431,8 +432,30 @@ change them, and they are the data needed for a later egress allowlist.
 | Record | Content |
 | --- | --- |
 | start | `event=start session=ID launcher=... user=... uid=... pid=... backend=... flows=logged\|unavailable publish=ADDR:PORTS host_ports=... dir=...` |
-| each pasta line | `session=ID <pasta debug line>` (setup, then a line for each flow and its state changes) |
+| pasta | `session=ID pasta version=... pid=...`, and pasta's warnings and errors (`pasta level=error msg=...`) |
+| dns | `session=ID dns name=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21` |
+| open | `session=ID flow=7 open proto=tcp dir=out src=ADDR:PORT dst=140.82.112.21:443 name=github.com t=21.359` |
+| close | `session=ID flow=7 close proto=tcp dir=out dst=140.82.112.21:443 name=github.com t=33.770 secs=12.411` |
+| fail | `session=ID flow=9 fail ...`: a connection that never became active (refused, unreachable) |
 | end | `event=end session=ID ...`, when the sandbox has exited |
+
+Every line is `key=value` (logfmt), so Loki's `| logfmt` can filter on any
+field, for example the names an agent reached:
+`{syslog_identifier="bwrap-net"} | logfmt | dir="out"` grouped by `name`.
+
+- `dir` is `out` (the sandbox to the network), `publish` (a host client to a
+  `--publish` port) or `host-port` (the sandbox to a `--host-port` service).
+  `via=` is the address on the other side when it differs (the sandbox port
+  for `publish`). `t` is seconds since pasta started; `secs` is the
+  connection's duration. Flows still open when the session ends get a close
+  with `reason=session-end`.
+- `flow` is pasta's flow slot, which it reuses: it identifies a connection
+  only between its open and its close.
+- pasta logs no byte counts.
+- `name` is the name of the last lookup, through the DNS relay, that returned
+  the destination address. It is a record, not proof: several names can share
+  one address (CDNs), and a lookup that bypasses the relay (a query sent to
+  `169.254.1.1` directly, DNS over HTTPS) leaves no name.
 
 - **Tag** (`SYSLOG_IDENTIFIER`): `bwrap-net`. `journalctl -t bwrap-net` shows
   all sessions; `journalctl -t bwrap-net -g ID` one. Inside the sandbox
@@ -468,6 +491,31 @@ change them, and they are the data needed for a later egress allowlist.
     before the marker (a failed start), the supervisor prints pasta's lines on
     your terminal, prefixed `<launcher>: pasta:`, just after the launcher has
     exited.
+  - **Condensed.** pasta's debug log has about 34 lines per connection (state
+    changes, timers, ACK and buffer bookkeeping) and repeats its setup. The
+    supervisor sends it through `lib/bwrap_netlog.py condense`, which keeps one
+    line when a connection opens and one when it closes, plus pasta's warnings
+    and errors, and drops the rest (in a real session, 5000 lines became
+    280). It writes to `systemd-cat` / `logger` itself.
+- **DNS relay (pasta).** To name destinations, `lib/bwrap_netlog.py dns`
+  listens on `127.53.0.1:53` (UDP and TCP) in the sandbox's network namespace,
+  forwards each lookup to `169.254.1.1` (pasta's DNS forward) and writes one
+  `dns` line per lookup to the log. The condenser keeps a map from the answers'
+  addresses to names. The sandbox's `/etc/resolv.conf` lists the relay first
+  and `169.254.1.1` second, so lookups go on working, at once, if the relay is
+  down (its port is then closed); pasta's own leg of a relayed lookup (UDP to
+  `169.254.1.1:53`) is not logged as a connection.
+  - The descriptor relay starts it before bwrap, as root of pasta's user
+    namespace, which may bind port 53 there; it then drops every capability.
+    It runs outside bwrap: the agent cannot see it (separate process
+    namespace), and cannot take its port (it has no capabilities).
+  - The descriptor relay waits until it listens (it says so on a pipe) before
+    starting bwrap, at most 0.25 s, so the first lookups are logged too. In
+    practice that is a Python start, some tens of milliseconds.
+  - It exits when bwrap does.
+- Both need Python 3.6 or later, standard library only (RHEL 8's
+  `/usr/libexec/platform-python`, else `python3`). Without it pasta's lines go
+  to the log unfiltered, and DNS goes straight to `169.254.1.1`.
 
 ### Implementation notes: pasta
 

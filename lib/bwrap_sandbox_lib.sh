@@ -2618,6 +2618,12 @@ _net_session_dir() {
 # (slirp4netns has no flow log); the supervisor just waits for the end.
 
 _NET_LOG_TAG="bwrap-net"
+# Condenser and DNS relay (lib/bwrap_netlog.py), and the relay's address in
+# the sandbox's network namespace.
+_NET_LOG_HELPER="${BASH_SOURCE[0]%/*}/bwrap_netlog.py"
+_NET_LOG_PY=""
+_NET_DNS_RELAY=0
+_NET_DNS_RELAY_ADDR="127.53.0.1"
 _NET_LOG_TOOL=""
 _NET_LOG_TOOLS=()
 _NET_LOG_SESSION=""
@@ -2650,6 +2656,15 @@ _net_log_detect() {
     _NET_LOG_TOOL="${_NET_LOG_TOOLS[0]:-}"
     _NET_LOG_FLOWS=0
     [[ -z "${_NET_LOG_TOOL}" || "${_NET_BACKEND}" != pasta ]] || _NET_LOG_FLOWS=1
+    # With Python the flow log is condensed (one line per open and close)
+    # and the DNS relay names the destinations; without it pasta's lines go
+    # to the log as they are.
+    _NET_LOG_PY=""
+    _NET_DNS_RELAY=0
+    if [[ "${_NET_LOG_FLOWS}" -eq 1 && -r "${_NET_LOG_HELPER}" ]]; then
+        _NET_LOG_PY="$(_net_python)"
+        [[ -z "${_NET_LOG_PY}" ]] || _NET_DNS_RELAY=1
+    fi
     SANDBOX_ENV+=("BWRAP_SESSION=${_NET_LOG_SESSION}")
 }
 
@@ -2702,10 +2717,12 @@ _net_log_start() {
         _NET_LOG_TOOL=""
     done
     if [[ -z "${_NET_LOG_TOOL}" ]]; then
+        _NET_DNS_RELAY=0
         printf 'Warning: %s: neither systemd-cat (journal) nor logger (/dev/log) can write to the system log;\n' "${_launcher}" >&2
         printf '         this network session is not logged.\n' >&2
         _NET_LOG_TOOL=""
         _NET_LOG_FLOWS=0
+        _NET_LOG_PY=""
         return 0
     fi
     if [[ -t 2 ]]; then
@@ -2733,7 +2750,13 @@ _net_log_start() {
             mkfifo -m 0600 "${_NET_LOG_ERR_FIFO}"
             _err="${_NET_LOG_ERR_FIFO}"
         fi
-        _BWRAP_FD_RELAY=(2 note "${_NET_LOG_MARKER}" 2 append "${_err}" ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
+        local -a _pre=(2 note "${_NET_LOG_MARKER}")
+        if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+            # The DNS relay, started by the descriptor relay in the sandbox's
+            # network namespace (outside bwrap), logs on the same FIFO.
+            _pre+=(2 spawn "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_FORWARD_ADDR}")
+        fi
+        _BWRAP_FD_RELAY=("${_pre[@]}" 2 append "${_err}" ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
     fi
     _net_log_supervisor &
 }
@@ -2742,7 +2765,7 @@ _net_log_start() {
 #   The background half of the network log (see "Network log").  Runs in a
 #   subshell; $$ is still the launcher, which is pasta (or bwrap) by then.
 _net_log_supervisor() {
-    local _sink _fifo _line="" _part="" _rc _started=0 _dead=0 _bridge="" _i
+    local _sink _prefix _fifo _line="" _part="" _rc _started=0 _dead=0 _bridge="" _i
     local -a _early=()
     set +e
     # Signals meant for the session (Ctrl-C, a hangup, `kill` of its process
@@ -2750,7 +2773,16 @@ _net_log_supervisor() {
     # the launcher has gone.
     trap '' INT QUIT TSTP HUP TERM PIPE
     exec < /dev/null > /dev/null
-    exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
+    if [[ -n "${_NET_LOG_PY}" ]]; then
+        # The condenser writes session=ID itself.
+        exec {_sink}> >(exec setsid "${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense \
+            --session "${_NET_LOG_SESSION}" --dns-forward "${_NET_DNS_FORWARD_ADDR}" \
+            -- "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
+        _prefix=""
+    else
+        exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
+        _prefix="session=${_NET_LOG_SESSION} "
+    fi
 
     if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
         exec {_fifo}<> "${_NET_LOG_FIFO}"
@@ -2780,14 +2812,14 @@ _net_log_supervisor() {
                 [[ ${#_early[@]} -ge 200 ]] || _early+=("${_line}")
             fi
             if [[ "${_dead}" -eq 0 ]] &&
-                ! printf 'session=%s %s\n' "${_NET_LOG_SESSION}" "${_line}" 1>&"${_sink}" 2> /dev/null; then
+                ! printf '%s%s\n' "${_prefix}" "${_line}" 1>&"${_sink}" 2> /dev/null; then
                 _dead=1
             fi
         done
         # pasta has exited: drain what it left in the pipe.
         while IFS= read -r -t 0.2 _line <&"${_fifo}"; do
             [[ "${_dead}" -eq 1 ]] ||
-                printf 'session=%s %s\n' "${_NET_LOG_SESSION}" "${_part}${_line}" 1>&"${_sink}" 2> /dev/null || _dead=1
+                printf '%s%s\n' "${_prefix}" "${_part}${_line}" 1>&"${_sink}" 2> /dev/null || _dead=1
             _part=""
         done
         exec {_fifo}<&-
@@ -2847,6 +2879,17 @@ _net_log_print_dry_run() {
         printf '# and pasta gets --debug --log-file <session dir>/netlog --log-size %s (not --quiet)\n' "${_NET_LOG_PASTA_SIZE}"
         printf '# with its stderr on that FIFO; a supervisor copies each line to the log and the\n'
         printf '# relay first reopens your stderr.  The end record is written when pasta exits.\n'
+        if [[ -n "${_NET_LOG_PY}" ]]; then
+            printf '# The lines are condensed (one per connection opened and closed) by
+'
+            printf '#   %s -I %s condense
+' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}"
+            printf '# and the relay first starts the DNS relay on %s:53 in the namespace:
+' "${_NET_DNS_RELAY_ADDR}"
+            printf '#   %s -I %s dns %s %s <relay pid>
+' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
+                "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_FORWARD_ADDR}"
+        fi
     else
         printf '# and a supervisor writes the end record when the sandbox exits (no flow log\n'
         printf '# with %s).\n' "${_NET_BACKEND}"
@@ -2951,6 +2994,20 @@ for spec in sys.argv[2:]:
         sys.exit("%s:%s -> sandbox port %s: %s" % (addr, hport, gport, reply.get("error", reply)))
 '
 
+# _net_python
+#   Print the Python used by the network helpers (RHEL 8's platform-python,
+#   else python3), nothing when there is none.  They need the standard
+#   library of Python 3.6 or later only.
+_net_python() {
+    local _p
+    for _p in /usr/libexec/platform-python "$(command -v python3 2> /dev/null || true)"; do
+        if [[ -n "${_p}" && -x "${_p}" ]]; then
+            printf '%s' "${_p}"
+            return 0
+        fi
+    done
+}
+
 # _net_try_slirp
 #   Return 0 when slirp4netns can be used (set _SLIRP_BIN, _SLIRP_ARGS and,
 #   for --publish, _NET_PY_BIN), else 1 with the reason in _NET_TRY_REASON.
@@ -2999,12 +3056,7 @@ _net_try_slirp() {
     fi
     _NET_PY_BIN=""
     if [[ ${#NET_PUBLISH[@]} -gt 0 ]]; then
-        for _n in /usr/libexec/platform-python "$(command -v python3 2> /dev/null || true)"; do
-            if [[ -n "${_n}" && -x "${_n}" ]]; then
-                _NET_PY_BIN="${_n}"
-                break
-            fi
-        done
+        _NET_PY_BIN="$(_net_python)"
         if [[ -z "${_NET_PY_BIN}" ]]; then
             _NET_TRY_REASON="--publish needs python3 (or /usr/libexec/platform-python) to configure it"
             return 1
@@ -3766,6 +3818,11 @@ build_net_isolation() {
     fi
     _NET_DNS_EFFECTIVE="${_dns}"
     _resolv="nameserver ${_dns}"$'\n'"options edns0"
+    if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+        # The DNS relay first (logged); the backend's address second, which a
+        # resolver uses at once when the relay is not up (port closed).
+        _resolv="nameserver ${_NET_DNS_RELAY_ADDR}"$'\n'"${_resolv}"
+    fi
     bwrap_fd_from_data "generated /etc/resolv.conf" "${_resolv}"
     BWRAP_ARGS+=(--ro-bind-data "${_BWRAP_FD}" /etc/resolv.conf)
 
@@ -4815,7 +4872,11 @@ _bwrap_context_network() {
     fi
     _t+="This sandbox has its own network namespace (${_NET_BACKEND})."
     _t+=" Outbound connections work and leave from the host's address;"
-    _t+=" DNS goes to \`${_NET_DNS_EFFECTIVE}\`, which is forwarded to the host's resolver."
+    if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+        _t+=" DNS goes to \`${_NET_DNS_RELAY_ADDR}\`, a relay that logs each lookup, and on to \`${_NET_DNS_EFFECTIVE}\`, which is forwarded to the host's resolver."
+    else
+        _t+=" DNS goes to \`${_NET_DNS_EFFECTIVE}\`, which is forwarded to the host's resolver."
+    fi
     _t+=" Services listening on the host's loopback (\`127.0.0.1\`, \`localhost\`) are not reachable from here,"
     _t+=" and nothing you listen on here is reachable from the host, except as listed below."
     _t+=" \`127.0.0.1\` here is the sandbox's own loopback."
@@ -5144,6 +5205,12 @@ _bwrap_toml_string() {
 #   note TEXT  the relay prints TEXT on the descriptor (a marker on stderr).
 #   append PATH  the relay opens PATH for appending on the descriptor (the
 #              user's stderr again).
+#   spawn PY HELPER LISTEN UPSTREAM  the relay starts the DNS relay
+#              (`PY -I -S HELPER dns LISTEN UPSTREAM <relay pid>`) in the
+#              background, its output on the descriptor, and waits until it
+#              listens (it says so on descriptor 3; a Python start, some tens
+#              of milliseconds), at most 0.25 s, so the first lookups are
+#              logged too.
 
 # _bwrap_fd_check_room
 #   Exit 1 when the reserved numbers would reach 90, where the slirp4netns
@@ -5221,6 +5288,12 @@ while [[ $# -gt 0 && "$1" != -- ]]; do
             eval "exec $1>>\"\$3\"" || { echo "$0: cannot open $3" >&2; exit 126; }
             shift 3
             ;;
+        spawn)
+            coproc _bwrap_dns { exec "$3" -I -S "$4" dns "$5" "$6" "$$" 3>&1 1>&"$1" 2>&"$1" < /dev/null; }
+            read -r -t 0.25 _v <&"${_bwrap_dns[0]}"
+            eval "exec ${_bwrap_dns[0]}<&- ${_bwrap_dns[1]}>&-"
+            shift 6
+            ;;
         *)
             echo "$0: bad relay entry: $2" >&2
             exit 126
@@ -5256,12 +5329,14 @@ _bwrap_fd_data_numbers() {
     local _r=0
     _BWRAP_FD_DATA_NUMS=()
     while [[ ${_r} -lt ${#_BWRAP_FD_RELAY[@]} ]]; do
-        if [[ "${_BWRAP_FD_RELAY[$((_r + 1))]}" != data ]]; then
-            _r=$((_r + 3))
-        else
-            _BWRAP_FD_DATA_NUMS+=("${_BWRAP_FD_RELAY[${_r}]}")
-            _r=$((_r + 2))
-        fi
+        case "${_BWRAP_FD_RELAY[$((_r + 1))]}" in
+            data)
+                _BWRAP_FD_DATA_NUMS+=("${_BWRAP_FD_RELAY[${_r}]}")
+                _r=$((_r + 2))
+                ;;
+            spawn) _r=$((_r + 6)) ;;
+            *) _r=$((_r + 3)) ;;
+        esac
     done
 }
 
