@@ -152,6 +152,8 @@ def describe_lock(name: str) -> str:
         return "backup job on %s" % host_of(name)
     parts = name[len("session@") : -len(".lock")].split("@")
     if len(parts) == 2:
+        if parts[1].startswith("unknown"):
+            return "%s (OpenCode, version unknown)" % parts[0]
         return "%s (OpenCode %s)" % (parts[0], parts[1])
     return name
 

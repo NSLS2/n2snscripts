@@ -33,6 +33,7 @@ Three parts:
 | An OpenCode 2 process of this user on this host runs a different binary (an old build still running after an upgrade), in any PID namespace | Refuse |
 | An unsandboxed OpenCode 2 process of this user on this host took no part in the locking (an older wrapper, started by hand, or the background service) | Refuse |
 | Same host, same version, sessions that hold their lock | Allow; any number may run together |
+| The version of the binary about to run cannot be read (the ansible wrapper script is used instead of the installed binary, or `--version` fails or takes over 10 s) | Refuse when any other session is live; otherwise allow, with a lock file of its own (`session@<host>@unknown-<pid>.lock`) that no other session shares, so every later launch refuses until it ends |
 | `OPENCODE2_DB_GUARD=off` | Skip every check, print a warning and log it |
 | No `flock`, or the lock directory cannot be created | Warn and start (the guard must not stop people for a reason that is not a hazard) |
 
@@ -75,6 +76,7 @@ directory read-write) cannot reach the locks, the backups or the flag:
 ~/.local/share/opencode2/opencode-db-guard/
     guard.lock
     locks/session@<host>@<version>.lock
+    locks/session@<host>@unknown-<pid>.lock     a session whose version could not be read
     locks/backup@<host>.lock                    held while a backup reads the database
     backups/opencode-<UTC>.db.gz                newest 3
     backups/last-success, backup.lock
@@ -170,9 +172,11 @@ exec "$bin" "$@"          # the lock descriptor stays open across exec
 
 `oc2db_guard DATA_DIR [BIN]` returns 1 after printing why not. Pass the
 OpenCode 2 binary as `BIN` so the version is read from it and running processes
-can be compared with it; without it the version is `unknown` and the
-different-build check is skipped. It exports `OC2DB_GUARDED=1`, which is how
-other launches recognise an unsandboxed process that took part in the locking.
+can be compared with it; without it the version is `unknown`, the
+different-build check is skipped, and the session takes a lock file of its own
+(see the table above), so two sessions of unknown version never run together.
+It exports `OC2DB_GUARDED=1`, which is how other launches recognise an
+unsandboxed process that took part in the locking.
 
 Do not call it for commands that never open the database (`--help`,
 `--version`, `upgrade`, `update`, `uninstall`): `oc2db_needs_guard "$@"` returns

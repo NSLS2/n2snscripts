@@ -22,7 +22,9 @@
 #   - refuses when the last daily check found damage (flag file);
 #   - otherwise takes a shared lock on a per host and version lock file, held
 #     on a file descriptor that the caller's `exec` passes to OpenCode.  The
-#     lock lasts as long as that descriptor stays open in any process.
+#     lock lasts as long as that descriptor stays open in any process.  When
+#     the version cannot be read the lock file is per process id instead, so
+#     such a session never shares a lock and any later launch refuses on it.
 #   - starts the daily backup (bin/opencode2-db backup --if-due) in the
 #     background when it is due.
 #
@@ -299,7 +301,14 @@ oc2db_guard() {
         _ver="$(oc2db_version "${_bin}")"
         _bin_id="$(oc2db_file_id "${_bin}" || true)"
     fi
-    _own="session@${_host}@${_ver}.lock"
+    # A version that could not be read says nothing about the build, so such a
+    # session gets a lock file of its own (by process id): no other session
+    # shares it, and any later launch on this host refuses on it.
+    if [[ "${_ver}" == "unknown" ]]; then
+        _own="session@${_host}@unknown-$$.lock"
+    else
+        _own="session@${_host}@${_ver}.lock"
+    fi
 
     # One launch checks at a time, so two launches cannot both pass.
     if ! { exec {_gfd}<> "${_gdir}/guard.lock"; } 2> /dev/null; then
@@ -329,10 +338,15 @@ oc2db_guard() {
         for _h in "${_OC2DB_HELD[@]}"; do
             if [[ "${_h#* }" == "backup" ]]; then
                 _details+=("a database backup is running on ${_h% *}")
+            elif [[ "${_h#* }" == unknown* ]]; then
+                _details+=("session lock held by ${_h% *} (OpenCode, version could not be read)")
             else
                 _details+=("session lock held by ${_h% *} (OpenCode ${_h#* })")
             fi
         done
+        if [[ "${_ver}" == "unknown" ]]; then
+            _details+=("The version of this OpenCode 2 could not be read, so it cannot be shown to be the same build as a running session.")
+        fi
         _details+=("The database is on NFS; two hosts, or two OpenCode versions, must not use it together.")
         exec {_gfd}>&-
         # Only backup jobs: they are short, so say to wait, not to close a session.

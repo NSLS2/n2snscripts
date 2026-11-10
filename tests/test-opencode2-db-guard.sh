@@ -166,6 +166,43 @@ OUT="$(run_guard "${D}")"
 check "a live session of the same build is allowed" contains "${OUT}" 'rc=0'
 check "the session records its build id in the lock file" bash -c '[[ "$(head -n1 "$1")" == "$2" ]]' _ "$(locks_of "${D}")/session@${HOST}@2.2.5.lock" "$(oc2db_file_id "${NEW}")"
 
+# A version that cannot be read gets a lock of its own, so two such sessions
+# (which may be different builds) never share one.
+mkdir -p "${T}/inst/noversion"
+printf '#!/bin/sh\nexit 1\n' > "${T}/inst/noversion/opencode.exe"
+chmod +x "${T}/inst/noversion/opencode.exe"
+NOVER="${T}/inst/noversion/opencode.exe"
+run_guard_bin() { # run_guard_bin DATA BIN: like run_guard, with another binary path
+    env OC2DB_TOOL=/nonexistent bash -c '
+        set -euo pipefail; source "$1"; OC2DB_PROG=test
+        oc2db_guard "$2" "$3" && echo rc=0 || echo "rc=$?"' _ "${LIB}" "$1" "$2" 2>&1
+}
+D="$(new_data unknownver)"
+OUT="$(run_guard_bin "${D}" "${NOVER}")"
+check "a launch whose version cannot be read is allowed on a clean start" contains "${OUT}" 'rc=0'
+check "it takes a lock file of its own, not a shared one" bash -c 'ls "$1"/session@"$2"@unknown-*.lock > /dev/null 2>&1 && [[ ! -e "$1/session@$2@unknown.lock" ]]' _ "$(locks_of "${D}")" "${HOST}"
+OUT="$(run_guard_bin "${D}" "${NOVER}")"
+check "a later launch removes the lock file of an ended session of unknown version" test "$(find "$(locks_of "${D}")" -name 'session@*unknown-*.lock' | wc -l)" -eq 1
+
+D="$(new_data unknownver-two)"
+bash -c 'set -euo pipefail; source "$1"; oc2db_guard "$2" "$3"; exec sleep 6' _ "${LIB}" "${D}" "${NOVER}" &
+PIDS+=($!)
+sleep 1
+OUT="$(run_guard_bin "${D}" "${NOVER}")"
+check "a second launch of unknown version is refused while one is running" contains "${OUT}" 'rc=1'
+check "the refusal says the version could not be read" contains "${OUT}" 'could not be read'
+OUT="$(run_guard "${D}")"
+check "a launch of a known version is refused while one of unknown version is running" contains "${OUT}" 'rc=1'
+OUT="$(run_guard_bin "${D}" "")"
+check "an empty binary path counts as an unknown version too" contains "${OUT}" 'rc=1'
+
+D="$(new_data knownthenunknown)"
+bash -c 'set -euo pipefail; source "$1"; oc2db_guard "$2" "$3"; exec sleep 6' _ "${LIB}" "${D}" "${NEW}" &
+PIDS+=($!)
+sleep 1
+OUT="$(run_guard_bin "${D}" "${NOVER}")"
+check "a launch of unknown version is refused while one of a known version is running" contains "${OUT}" 'rc=1'
+
 # A backup job holds locks/backup@HOST.lock while it reads the database.  A
 # launch on ANOTHER host must refuse; on the same host it is harmless.  The
 # other host is faked with a hostname shim.
