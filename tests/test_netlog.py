@@ -165,41 +165,68 @@ class DnsParseTest(unittest.TestCase):
             with self.assertRaises((ValueError, struct.error, IndexError)):
                 netlog.parse_query(bad)
 
+    def test_logfmt_control_characters(self):
+        self.assertEqual(netlog._value("bad\nname\r\x1b"), "bad\\x0aname\\x0d\\x1b")
+
 
 class DnsRelayTest(unittest.TestCase):
     def setUp(self):
+        self.stop = threading.Event()
         self.up_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.up_udp.bind(("127.0.0.1", 0))
+        self.up_udp.settimeout(0.2)
         port = self.up_udp.getsockname()[1]
         self.up_tcp = socket.socket()
         self.up_tcp.bind(("127.0.0.1", port))
         self.up_tcp.listen()
-        threading.Thread(target=self._serve_udp, daemon=True).start()
-        threading.Thread(target=self._serve_tcp, daemon=True).start()
+        self.up_tcp.settimeout(0.2)
+        self.up_udp_thread = threading.Thread(target=self._serve_udp)
+        self.up_tcp_thread = threading.Thread(target=self._serve_tcp)
+        self.up_udp_thread.start()
+        self.up_tcp_thread.start()
         self.out = io.StringIO()
         self.relay = netlog.DnsRelay("127.0.0.1:0", "127.0.0.1:%d" % port, self.out)
         self.relay.listen = ("127.0.0.1", 0)
         self.relay.bind()
-        lport = self.relay.udp.getsockname()[1]
-        self.relay.tcp.close()
-        self.relay.tcp = socket.socket()
-        self.relay.tcp.bind(("127.0.0.1", lport))
-        self.relay.tcp.listen()
-        self.addr = ("127.0.0.1", lport)
-        threading.Thread(target=self.relay.serve, daemon=True).start()
+        self.addr = self.relay.udp.getsockname()
+        self.relay_thread = threading.Thread(target=self.relay.serve)
+        self.relay_thread.start()
+
+    def tearDown(self):
+        self.stop.set()
+        self.relay.close()
+        self.relay_thread.join(timeout=3)
+        self.up_udp.close()
+        self.up_tcp.close()
+        self.up_udp_thread.join(timeout=3)
+        self.up_tcp_thread.join(timeout=3)
 
     def _serve_udp(self):
-        while True:
-            q, a = self.up_udp.recvfrom(4096)
-            self.up_udp.sendto(answer(q), a)
+        while not self.stop.is_set():
+            try:
+                q, a = self.up_udp.recvfrom(4096)
+                self.up_udp.sendto(answer(q), a)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
 
     def _serve_tcp(self):
-        while True:
-            c, _ = self.up_tcp.accept()
-            n = struct.unpack("!H", c.recv(2))[0]
-            r = answer(c.recv(n))
-            c.sendall(struct.pack("!H", len(r)) + r)
-            c.close()
+        while not self.stop.is_set():
+            try:
+                c, _ = self.up_tcp.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with c:
+                c.settimeout(1)
+                try:
+                    n = struct.unpack("!H", c.recv(2))[0]
+                    r = answer(c.recv(n))
+                    c.sendall(struct.pack("!H", len(r)) + r)
+                except (OSError, struct.error):
+                    pass
 
     def wait_lines(self, n):
         for _ in range(50):
@@ -209,22 +236,73 @@ class DnsRelayTest(unittest.TestCase):
         return self.out.getvalue().splitlines()
 
     def test_udp(self):
-        c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        c.settimeout(3)
-        c.sendto(query("www.example.org"), self.addr)
-        self.assertEqual(netlog.parse_answers(c.recv(4096))[1], ["example.org", "192.0.2.10"])
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
+            c.settimeout(3)
+            c.sendto(query("www.example.org"), self.addr)
+            self.assertEqual(netlog.parse_answers(c.recv(4096))[1], ["example.org", "192.0.2.10"])
         self.assertEqual(
             self.wait_lines(1),
             ["bwrap-dns domain=www.example.org type=A proto=udp rcode=NOERROR answers=192.0.2.10 cname=example.org"],
         )
 
     def test_tcp(self):
-        c = socket.create_connection(self.addr, timeout=3)
-        q = query("www.example.org", 28)
-        c.sendall(struct.pack("!H", len(q)) + q)
-        n = struct.unpack("!H", c.recv(2))[0]
-        self.assertEqual(len(c.recv(n)), n)
+        with socket.create_connection(self.addr, timeout=3) as c:
+            c.settimeout(3)
+            for _ in range(2):
+                q = query("www.example.org", 28)
+                c.sendall(struct.pack("!H", len(q)) + q)
+                n = struct.unpack("!H", c.recv(2))[0]
+                self.assertEqual(len(c.recv(n)), n)
         self.assertIn("type=AAAA proto=tcp rcode=NOERROR", self.wait_lines(1)[0])
+        self.assertEqual(len(self.wait_lines(2)), 2)
+
+    def test_dns_name_does_not_forge_log_lines(self):
+        q = query("bad\nname.example.org")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
+            c.settimeout(3)
+            c.sendto(q, self.addr)
+            c.recv(4096)
+        lines = self.wait_lines(1)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("domain=bad\\x0aname.example.org", lines[0])
+
+    def test_cname_does_not_forge_log_lines(self):
+        q = query("www.example.org")
+        r = answer(q).replace(b"\x07example\x03org", b"\x07xx:\nabc\x03org")
+        self.relay.log(q, r, "udp")
+        self.assertEqual(len(self.out.getvalue().splitlines()), 1)
+        self.assertIn("cname=xx:\\x0aabc.org", self.out.getvalue())
+
+    def test_overload_is_bounded_and_fails_fast(self):
+        gate = threading.Event()
+        relay = netlog.DnsRelay("127.0.0.1:0", "127.0.0.1:53", workers=1, pending=1)
+        before = len([t for t in threading.enumerate() if t.name.startswith("bwrap-dns")])
+        try:
+            self.assertTrue(relay._submit(gate.wait, 2))
+            self.assertTrue(relay._submit(gate.wait, 2))
+            self.assertFalse(relay._submit(gate.wait, 2))
+            after = len([t for t in threading.enumerate() if t.name.startswith("bwrap-dns")])
+            self.assertLessEqual(after - before, 1)
+        finally:
+            gate.set()
+            relay.close()
+
+    def test_overload_returns_servfail(self):
+        gate = threading.Event()
+        relay = netlog.DnsRelay("127.0.0.1:0", "%s:%d" % self.relay.upstream, io.StringIO(), workers=1, pending=0)
+        relay.bind()
+        serve_thread = threading.Thread(target=relay.serve)
+        serve_thread.start()
+        try:
+            self.assertTrue(relay._submit(gate.wait, 2))
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
+                c.settimeout(3)
+                c.sendto(query("www.example.org"), relay.udp.getsockname())
+                self.assertEqual(netlog.parse_answers(c.recv(4096))[0], "SERVFAIL")
+        finally:
+            gate.set()
+            relay.close()
+            serve_thread.join(timeout=3)
 
 
 if __name__ == "__main__":

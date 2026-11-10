@@ -30,6 +30,8 @@ Output lines are logfmt (key=value), so Loki's `| logfmt` can filter them:
 # Kept to what the DNS relay needs: it starts while the sandbox starts, and
 # lookups made before it listens skip it (see bwrap_sandbox_lib.sh).
 import ctypes
+import ipaddress
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import signal
@@ -63,6 +65,9 @@ def _hostport(addr, port):
 
 def _value(text):
     """A logfmt value: quoted when it contains a space, = or a quote."""
+    # DNS labels are arbitrary bytes, not necessarily valid hostnames.  Never
+    # allow one to turn into a second journal record or a terminal control.
+    text = "".join("\\x%02x" % ord(c) if ord(c) < 32 or ord(c) == 127 else c for c in text)
     if text and not re.search(r'[\s="]', text):
         return text
     return '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"')
@@ -310,11 +315,32 @@ def _addr(spec, port=53):
 
 
 class DnsRelay:
-    def __init__(self, listen, upstream, out=None):
+    def __init__(self, listen, upstream, out=None, workers=16, pending=32):
         self.listen = _addr(listen)
         self.upstream = _addr(upstream)
         self.out = out or sys.stdout
         self.lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(workers + pending)
+        self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="bwrap-dns")
+        self.stopping = threading.Event()
+
+    def _submit(self, fn, *args):
+        if not self.slots.acquire(False):
+            return False
+        try:
+            future = self.pool.submit(fn, *args)
+        except RuntimeError:
+            self.slots.release()
+            return False
+        future.add_done_callback(lambda _: self.slots.release())
+        return True
+
+    def close(self):
+        self.stopping.set()
+        for sock in (getattr(self, "udp", None), getattr(self, "tcp", None)):
+            if sock is not None:
+                sock.close()
+        self.pool.shutdown(wait=True)
 
     def log(self, query, response, proto):
         try:
@@ -328,15 +354,21 @@ class DnsRelay:
                 rcode, answers = parse_answers(response)
             except (ValueError, struct.error, IndexError):
                 rcode, answers = "UNPARSED", []
-        addrs = [a for a in answers if re.match(r"^[0-9.]+$", a) or ":" in a]
-        cnames = [a for a in answers if a not in addrs]
+        addrs, cnames = [], []
+        for a in answers:
+            try:
+                ipaddress.ip_address(a)
+            except ValueError:
+                cnames.append(a)
+            else:
+                addrs.append(a)
         line = "bwrap-dns domain=%s type=%s proto=%s rcode=%s answers=%s%s\n" % (
             _value(name),
             qtype,
             proto,
             rcode,
             ",".join(addrs) or "-",
-            " cname=%s" % ",".join(cnames) if cnames else "",
+            " cname=%s" % _value(",".join(cnames)) if cnames else "",
         )
         with self.lock:
             try:
@@ -348,12 +380,11 @@ class DnsRelay:
     def _udp_one(self, srv, query, client):
         response = None
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(5)
-            s.connect(self.upstream)
-            s.send(query)
-            response = s.recv(65535)
-            s.close()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(5)
+                s.connect(self.upstream)
+                s.send(query)
+                response = s.recv(65535)
         except OSError:
             pass
         # Log before answering: the client connects as soon as it has the
@@ -375,44 +406,80 @@ class DnsRelay:
         return data
 
     def _tcp_one(self, conn):
-        try:
+        with conn:
             conn.settimeout(10)
-            up = socket.create_connection(self.upstream, timeout=5)
             while True:
                 try:
                     hdr = self._recv_exact(conn, 2)
+                    query = self._recv_exact(conn, struct.unpack("!H", hdr)[0])
+                    # DNS servers may close after one response.  A fresh
+                    # connection per query also avoids replaying a request
+                    # after an ambiguous upstream failure.
+                    with socket.create_connection(self.upstream, timeout=5) as up:
+                        up.settimeout(10)
+                        up.sendall(hdr + query)
+                        rhdr = self._recv_exact(up, 2)
+                        response = self._recv_exact(up, struct.unpack("!H", rhdr)[0])
+                    self.log(query, response, "tcp")
+                    conn.sendall(rhdr + response)
                 except OSError:
                     break
-                query = self._recv_exact(conn, struct.unpack("!H", hdr)[0])
-                up.sendall(hdr + query)
-                rhdr = self._recv_exact(up, 2)
-                response = self._recv_exact(up, struct.unpack("!H", rhdr)[0])
-                self.log(query, response, "tcp")
-                conn.sendall(rhdr + response)
-            up.close()
-        except OSError:
+
+    def _overloaded(self, query, client):
+        # A quick SERVFAIL gives clients a chance to use their next resolver.
+        # Only respond when we can safely copy a single complete question.
+        try:
+            if len(query) < 12 or struct.unpack("!H", query[4:6])[0] != 1:
+                return
+            _, end = _read_name(query, 12)
+            end += 4  # QTYPE and QCLASS
+            if end > len(query):
+                return
+            flags = struct.unpack("!H", query[2:4])[0]
+            reply = query[:2] + struct.pack("!HHHHH", 0x8002 | (flags & 0x0100), 1, 0, 0, 0) + query[12:end]
+            self.log(query, reply, "udp")
+            self.udp.sendto(reply, client)
+        except (ValueError, struct.error, OSError, IndexError):
             pass
-        finally:
-            conn.close()
 
     def bind(self):
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp.bind(self.listen)
         self.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.tcp.bind(self.listen)
+        # Port zero is useful for isolated tests; TCP must share UDP's port.
+        self.tcp.bind(self.udp.getsockname())
         self.tcp.listen(16)
 
     def serve(self):
         def tcp_loop():
-            while True:
-                conn, _ = self.tcp.accept()
-                threading.Thread(target=self._tcp_one, args=(conn,), daemon=True).start()
+            while not self.stopping.is_set():
+                try:
+                    conn, _ = self.tcp.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not self._submit(self._tcp_one, conn):
+                    conn.close()
 
-        threading.Thread(target=tcp_loop, daemon=True).start()
-        while True:
-            query, client = self.udp.recvfrom(65535)
-            threading.Thread(target=self._udp_one, args=(self.udp, query, client), daemon=True).start()
+        self.tcp.settimeout(0.2)
+        self.udp.settimeout(0.2)
+        tcp_thread = threading.Thread(target=tcp_loop, daemon=True)
+        tcp_thread.start()
+        try:
+            while not self.stopping.is_set():
+                try:
+                    query, client = self.udp.recvfrom(65535)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not self._submit(self._udp_one, self.udp, query, client):
+                    self._overloaded(query, client)
+        finally:
+            tcp_thread.join()
+            self.close()
 
 
 def _drop_capabilities():

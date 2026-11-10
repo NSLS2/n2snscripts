@@ -71,6 +71,7 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 - `bash` >= 4.x (the `bw*` wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0 for the `bw*` wrappers
   - binary masking is verified on RHEL 8.10 (`bubblewrap-0.4.0-3.el8_10`) and EL9 (0.6.3)
+- GNU `timeout` (coreutils) to bound the `pasta` network-backend probe
 - `pasta` (package `passt`, RHEL 9+) or `slirp4netns` (RHEL 8 AppStream),
   with `/dev/net/tun` and unprivileged user namespaces, for the private network
   namespace of the `bw*` wrappers; without either they stop unless run with

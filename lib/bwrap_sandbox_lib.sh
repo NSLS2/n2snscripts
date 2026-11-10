@@ -2473,7 +2473,7 @@ detect_net_capabilities() {
 #   assumed to work.
 _NET_TRY_REASON=""
 _net_try_pasta() {
-    local _out
+    local _out _rc
     _NET_TRY_REASON=""
     _PASTA_BIN="$(command -v pasta 2> /dev/null || true)"
     if [[ -z "${_PASTA_BIN}" || ! -x "${_PASTA_BIN}" ]]; then
@@ -2482,8 +2482,14 @@ _net_try_pasta() {
     fi
     # --no-pidns (2026-09) is not in RHEL 9 / EPEL builds; without it pasta
     # adds a PID namespace, inside which bwrap nests its own.
-    if "${_PASTA_BIN}" --help 2>&1 | grep -q -e '--no-pidns'; then
-        _PASTA_HAS_NO_PIDNS=1
+    if _out="$(timeout --signal=TERM --kill-after=2s 5s "${_PASTA_BIN}" --help 2>&1)"; then
+        [[ "${_out}" != *--no-pidns* ]] || _PASTA_HAS_NO_PIDNS=1
+    else
+        _rc=$?
+        if [[ ${_rc} -eq 124 || ${_rc} -eq 137 ]]; then
+            _NET_TRY_REASON="'pasta --help' timed out after 5 seconds"
+            return 1
+        fi
     fi
     _net_baseline_args
     [[ "${DRY_RUN}" -eq 0 ]] || return 0
@@ -2491,12 +2497,19 @@ _net_try_pasta() {
         _NET_TRY_REASON="/dev/net/tun is missing on the host"
         return 1
     fi
-    if ! _out="$("${_PASTA_BIN}" "${PASTA_ARGS[@]}" -- "$(command -v true)" 2>&1)"; then
-        _out="${_out%%$'\n'*}"
-        _NET_TRY_REASON="a test run failed${_out:+: ${_out}} (are unprivileged user namespaces disabled?)"
+    if _out="$(timeout --signal=TERM --kill-after=2s 10s \
+        "${_PASTA_BIN}" "${PASTA_ARGS[@]}" -- /usr/bin/true 2>&1)"; then
+        return 0
+    else
+        _rc=$?
+        if [[ ${_rc} -eq 124 || ${_rc} -eq 137 ]]; then
+            _NET_TRY_REASON="the test run timed out after 10 seconds"
+        else
+            _out="${_out%%$'\n'*}"
+            _NET_TRY_REASON="a test run failed${_out:+: ${_out}} (are unprivileged user namespaces disabled?)"
+        fi
         return 1
     fi
-    return 0
 }
 
 # ── Per-user runtime directory ───────────────────────────────────

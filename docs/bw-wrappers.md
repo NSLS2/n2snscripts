@@ -506,6 +506,10 @@ field, for example the domains an agent reached:
   and `169.254.1.1` second, so lookups go on working, at once, if the relay is
   down (its port is then closed); pasta's own leg of a relayed lookup (UDP to
   `169.254.1.1:53`) is not logged as a connection.
+  - The relay limits itself to 16 workers and 32 queued requests. On overload,
+    a UDP query gets a logged `SERVFAIL` (allowing the client's next resolver
+    to answer); a new TCP connection is closed. Each TCP query uses its own
+    upstream connection, even if the client keeps its connection open.
   - The descriptor relay starts it before bwrap, as root of pasta's user
     namespace, which may bind port 53 there; it then drops every capability.
     It runs outside bwrap: the agent cannot see it (separate process

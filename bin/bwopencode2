@@ -713,9 +713,11 @@ trap 'kill "$srv" 2>/dev/null' INT TERM HUP
 # Wait up to about 30 s for the server to answer; without credentials /api/info
 # gives 401, which is enough to know it is listening.
 ready=0
-for _ in $(seq 60); do
+deadline=$((SECONDS + 30))
+while ((SECONDS < deadline)); do
     kill -0 "$srv" 2> /dev/null || break
-    code=$(curl -s -o /dev/null -w '%{http_code}' "${base}/api/info") || code=000
+    code=$(curl -s --noproxy '*' --connect-timeout 1 --max-time 2 \
+        -o /dev/null -w '%{http_code}' "${base}/api/info") || code=000
     if [[ $code == 401 || $code == 200 ]]; then
         ready=1
         break
@@ -726,7 +728,8 @@ done
 {
     if [[ $ready -eq 1 ]]; then
         resp=$(printf 'user = "opencode:%s"\n' "$OPENCODE_PASSWORD" |
-            curl -s -K - -X POST "${base}/api/pair") || resp=""
+            curl -s --noproxy '*' --connect-timeout 1 --max-time 5 \
+                -K - -X POST "${base}/api/pair") || resp=""
         if [[ $resp =~ \"code\":\"([A-Za-z0-9_-]+)\" ]]; then
             printf '\nbwopencode2: pairing link (works once, expires in 5 minutes):\n'
             printf '  through the ssh tunnel:  http://127.0.0.1:%s/auth/connect/%s\n' "$port" "${BASH_REMATCH[1]}"
