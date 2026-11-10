@@ -546,6 +546,28 @@ cache directories, and the OpenCode 1 ones are never mounted, even when an
 `opencode2` directory does not exist yet (data and cache are created on first
 run).
 
+### Database guard
+
+The OpenCode 2 database (`opencode.db` in the data directory) is on NFS and is
+always opened in WAL mode, which SQLite does not support from more than one
+host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
+(`lib/opencode2-db-lock.sh`):
+
+- it refuses to start while another host, or another OpenCode 2 build on this
+  host, is using the same data directory, or after the last daily check found
+  damage;
+- it holds a shared lock for the life of the sandbox (a file descriptor that
+  the final `exec` passes on to `bwrap`), so sessions on this host and version
+  can run together;
+- it starts a daily background backup (`opencode2-db backup --if-due`) and keeps
+  the newest 3 compressed copies.
+
+`OPENCODE2_DB_GUARD=off bwopencode2 ...` skips the checks once; `--exec`,
+`--dry-run`, `--help` and `--version` never run them. The lock, backup and flag
+files are in `~/.local/share/opencode2/opencode-db-guard`, which is not mounted
+in the sandbox. The rules, the recovery steps (`opencode2-db restore` and
+`rebuild`) and the limits are in [opencode2-db.md](opencode2-db.md).
+
 ### What is kept out of the sandbox
 
 - **`service.json`**: OpenCode 2 keeps background-service settings (including

@@ -24,6 +24,7 @@ docs/   Per-script and per-library documentation
 | `bwcopilot` | GitHub Copilot CLI in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwopencode` | OpenCode in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
 | `bwopencode2` | OpenCode 2 (`opencode2`) in a bubblewrap sandbox | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
+| `opencode2-db` | Back up, check and recover the OpenCode 2 database | [docs/opencode2-db.md](docs/opencode2-db.md) |
 | `gh-protect-branch` | Apply NSLS-II standard branch protection to a GitHub repo (all branches); enables secret scanning and push protection; optionally restricts branch creation to named patterns | [docs/gh-protect-branch.md](docs/gh-protect-branch.md) |
 | `pemdecompose` | List and verify certificates in a PEM file | [docs/pemdecompose.md](docs/pemdecompose.md) |
 
@@ -34,6 +35,7 @@ All `bw*` wrappers share `lib/bwrap_sandbox_lib.sh` for sandbox construction.
 | Library | Purpose | Docs |
 | --- | --- | --- |
 | `bwrap_sandbox_lib.sh` | Shared sandbox-building primitives for `bw*` wrappers | [docs/bw-wrappers.md](docs/bw-wrappers.md) |
+| `opencode2-db-lock.sh` | Database guard (`oc2db_guard`) for OpenCode 2 launchers: locks, version and host checks, daily backup | [docs/opencode2-db.md](docs/opencode2-db.md) |
 | `gpg-passwd.sh` | `decrypt_env_file` helper for GPG-encrypted env files | [docs/gpg-passwd.md](docs/gpg-passwd.md) |
 
 These libraries are sourced, not executed. Each library's header comment
@@ -72,6 +74,8 @@ Add those three exports to your `~/.bashrc` or `~/.zshrc` for persistence.
 - `gpg(1)` for `gpg-passwd.sh`
 - `openssl(1)` for `pemdecompose`
 - `python3 >= 3.9` (stdlib only, no pip dependencies) for `azoidcapp`
+- `python3 >= 3.7` (stdlib only) and `flock(1)` for `opencode2-db` and the
+  OpenCode 2 database guard
 - `az` (Azure CLI) logged in via `az login` for `azoidcapp`
 - `gh(1)` authenticated with `admin:repo` scope for `gh-protect-branch`
 
@@ -106,6 +110,11 @@ persists in its data directory), always runs OpenCode 2 with `--standalone`
 `OPENCODE_*` environment variables, does not mount `service.json`, and never mounts
 the git `credentials` file; see [docs/bw-wrappers.md](docs/bw-wrappers.md). See each script's `--help` for
 the authoritative option list.
+
+`bwopencode2` also guards the OpenCode 2 database, which is on NFS: it refuses
+to start while another host, or another OpenCode 2 build, is using it, and
+makes a daily backup. `opencode2-db status|restore|rebuild` inspects and
+recovers it; see [docs/opencode2-db.md](docs/opencode2-db.md).
 
 Security notes: every launcher runs `/opt/nsls2/libexec/agent-account-check`
 first when installed (refuses root and shared/service accounts);

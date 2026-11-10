@@ -56,6 +56,12 @@ repos:
         entry: pixi run --frozen -e dev mypy --python-version 3.10 bin/azoidcapp
         pass_filenames: false
         always_run: true
+      - id: mypy-opencode2-db
+        name: mypy opencode2-db (pixi dev)
+        language: system
+        entry: pixi run --frozen -e dev mypy --python-version 3.10 bin/opencode2-db
+        pass_filenames: false
+        always_run: true
 
   # ────────────────────────────────────────────────────────────
   # Spelling
