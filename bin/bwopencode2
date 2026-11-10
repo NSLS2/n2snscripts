@@ -585,7 +585,8 @@ serve_claim_is_live() {
     [[ -e "${_f}" ]] || return 1
     _pid="$(sed -n 's/^pid=//p' "${_f}" 2> /dev/null | head -n 1)"
     if [[ "${_pid}" =~ ^[0-9]+$ ]]; then
-        kill -0 "${_pid}" 2> /dev/null
+        # The start time guards against a reused pid (see bwrap_proc_is).
+        bwrap_proc_is "${_pid}" "$(sed -n 's/^start=//p' "${_f}" 2> /dev/null | head -n 1)"
         return
     fi
     _mtime="$(stat -c %Y "${_f}" 2> /dev/null || echo 0)"
@@ -604,6 +605,7 @@ serve_claim_port() {
     (set -o noclobber && : > "${_f}") 2> /dev/null || return 1
     {
         printf 'pid=%s\n' "$$"
+        printf 'start=%s\n' "$(bwrap_proc_start_time "$$")"
         printf 'port=%s\n' "${_port}"
         printf 'host=%s\n' "$(serve_host_name)"
         printf 'dir=%s\n' "${_PWD}"

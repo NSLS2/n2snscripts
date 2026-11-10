@@ -379,11 +379,21 @@ interface, not its loopback; the context file tells the agent so. A port that
 something on the host already holds on every address (`0.0.0.0:PORT`) is
 refused at launch.
 
+The backend binds the address only after the launcher has started it, so the
+choice is made under a lock (`flock` on `claims.lock` in the
+[runtime directory](#runtime-directory)), and each launch leaves a claim
+(`claims/ADDR.PID`: launcher pid and its start time, host ports, launcher,
+directory). Sandboxes of one user started at the same moment therefore get
+different addresses. A claim whose process is gone (checked with the start
+time, so a reused pid does not count) is removed by the next launch. A program
+outside the launchers can still take a port first; pasta and slirp4netns then
+fail to bind it and the launch stops.
+
 **`--publish-addr ADDR`** replaces the derived address with `ADDR` (in
 `127.0.0.0/8`). Use `127.0.0.1` for OAuth flows whose registered redirect URI
 names it (some agent logins and MCP servers open a browser on the host that
 calls back into the sandbox). The launch then fails if a requested port is
-already in use on `ADDR`.
+already in use or claimed by another of your sandboxes on `ADDR`.
 
 **`--host-port`** makes one host loopback service visible in the sandbox as
 `host.internal`, so the agent's own `127.0.0.1:PORT` stays free (it can run its

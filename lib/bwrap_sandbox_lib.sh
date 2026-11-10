@@ -3117,16 +3117,130 @@ _net_listeners() {
     done < <(ss -Hltn 2> /dev/null || true)
 }
 
+# ── Publish claims ───────────────────────────────────────────────
+# Choosing a publish address reads the listeners once (ss), and the backend
+# binds the address only later, after the launcher has exec'd.  Two launches
+# of one user at the same moment could therefore pick the same address and
+# port.  So the choice is made under a lock, and each launch records what it
+# chose in a claim file that later launches respect:
+#
+#   <runtime dir>/claims.lock          flock, held only while choosing
+#   <runtime dir>/claims/ADDR.PID      pid=, start=, ports= (host ports)
+#
+# PID is the launcher's pid, which stays the pid of pasta (or of bwrap with
+# slirp4netns) for the whole session; start= is its start time, so a reused
+# pid does not keep a claim alive.  A claim whose process is gone is stale and
+# is removed by the next launch.  Nothing is removed at exit (the launcher has
+# exec'd).  Not covered: a program outside the launchers binding the address
+# first; the backend then fails to bind and the launch stops.
+
+_NET_CLAIMS_DIR=""
+_NET_CLAIMS_LOCK_FD=""
+
+# bwrap_proc_start_time PID
+#   Print the start time of PID (field 22 of /proc/PID/stat, in clock ticks
+#   since boot); empty when PID is gone.
+bwrap_proc_start_time() {
+    local _st _f
+    IFS= read -r _st < "/proc/$1/stat" 2> /dev/null || return 0
+    read -r -a _f <<< "${_st##*) }"
+    printf '%s' "${_f[19]}"
+}
+
+# bwrap_proc_is PID START
+#   True when PID runs and started at START (see bwrap_proc_start_time).
+bwrap_proc_is() {
+    [[ "$1" =~ ^[0-9]+$ && -n "$2" && "$(bwrap_proc_start_time "$1")" == "$2" ]]
+}
+
+# _net_claims_begin
+#   Take the claims lock (waiting up to 10 s) and remove stale claims.
+_net_claims_begin() {
+    local _f _pid _start
+    _net_runtime_base
+    _NET_CLAIMS_DIR="${_NET_RUNTIME_BASE}/claims"
+    [[ -d "${_NET_CLAIMS_DIR}" ]] || mkdir -m 0700 -- "${_NET_CLAIMS_DIR}"
+    if command -v flock > /dev/null 2>&1; then
+        exec {_NET_CLAIMS_LOCK_FD}>> "${_NET_RUNTIME_BASE}/claims.lock"
+        if ! flock -w 10 "${_NET_CLAIMS_LOCK_FD}"; then
+            echo "Error: --publish: another launch holds ${_NET_RUNTIME_BASE}/claims.lock." >&2
+            exit 1
+        fi
+    else
+        echo "Warning: flock (util-linux) not found: two launches at the same moment may pick the same publish address." >&2
+    fi
+    for _f in "${_NET_CLAIMS_DIR}"/*; do
+        [[ -f "${_f}" ]] || continue
+        _pid="$(sed -n 's/^pid=//p' "${_f}" 2> /dev/null)"
+        _start="$(sed -n 's/^start=//p' "${_f}" 2> /dev/null)"
+        bwrap_proc_is "${_pid}" "${_start}" || rm -f -- "${_f}"
+    done
+}
+
+# _net_claimed_port ADDR
+#   Set _NET_BUSY / _NET_BUSY_PID to the first published host port that a
+#   live claim of another launch holds on ADDR (claims are pruned by
+#   _net_claims_begin).  Does nothing outside _net_claims_begin/_end.
+_net_claimed_port() {
+    local _want="$1" _f _pid _ports _r _lo _hi _i
+    [[ -n "${_NET_CLAIMS_DIR}" ]] || return 0
+    for _f in "${_NET_CLAIMS_DIR}/${_want}".*; do
+        [[ -f "${_f}" ]] || continue
+        _pid="$(sed -n 's/^pid=//p' "${_f}" 2> /dev/null)"
+        [[ "${_pid}" != "$$" ]] || continue
+        _ports="$(sed -n 's/^ports=//p' "${_f}" 2> /dev/null)"
+        for _r in ${_ports}; do
+            _lo="${_r%-*}"
+            _hi="${_r#*-}"
+            for _i in "${!_NET_PUB_LO[@]}"; do
+                if ((_lo <= _NET_PUB_HI[_i] && _hi >= _NET_PUB_LO[_i])); then
+                    _NET_BUSY="$((_lo > _NET_PUB_LO[_i] ? _lo : _NET_PUB_LO[_i]))"
+                    _NET_BUSY_PID="${_pid}"
+                    return 0
+                fi
+            done
+        done
+    done
+}
+
+# _net_claims_write
+#   Record this launch's claim on _NET_PUBLISH_ADDR_EFFECTIVE.
+_net_claims_write() {
+    local _i _ports=""
+    for _i in "${!_NET_PUB_LO[@]}"; do
+        _ports+="${_ports:+ }${_NET_PUB_LO[${_i}]}-${_NET_PUB_HI[${_i}]}"
+    done
+    printf 'pid=%s\nstart=%s\nports=%s\nlauncher=%s\ndir=%s\n' \
+        "$$" "$(bwrap_proc_start_time "$$")" "${_ports}" "${0##*/}" "${PWD}" \
+        > "${_NET_CLAIMS_DIR}/${_NET_PUBLISH_ADDR_EFFECTIVE}.$$"
+}
+
+# _net_claims_end
+#   Release the claims lock.
+_net_claims_end() {
+    if [[ -n "${_NET_CLAIMS_LOCK_FD}" ]]; then
+        exec {_NET_CLAIMS_LOCK_FD}>&-
+        _NET_CLAIMS_LOCK_FD=""
+    fi
+    _NET_CLAIMS_DIR=""
+}
+
 # _net_busy_port ADDR
 #   Set _NET_BUSY to the first published host port that a listener already
-#   holds on ADDR (or on a wildcard address), empty when none.  _NET_BUSY_WILD
-#   is 1 when that listener is a wildcard one.
+#   holds on ADDR (or on a wildcard address), or that a live claim of another
+#   launch holds on ADDR; empty when none.  _NET_BUSY_WILD is 1 when that
+#   listener is a wildcard one; _NET_BUSY_PID is the claiming launcher's pid
+#   when it is a claim.
 _NET_BUSY=""
 _NET_BUSY_WILD=0
+_NET_BUSY_PID=""
 _net_busy_port() {
     local _want="$1" _l _a _p _i
     _NET_BUSY=""
     _NET_BUSY_WILD=0
+    _NET_BUSY_PID=""
+    _net_claimed_port "${_want}"
+    [[ -z "${_NET_BUSY}" ]] || return 0
     for _l in ${_NET_LISTEN[@]+"${_NET_LISTEN[@]}"}; do
         _a="${_l% *}"
         _p="${_l##* }"
@@ -3159,14 +3273,30 @@ net_publish_prefix() {
 #   With --publish-addr, that address must have them all free.  Exit 1 when
 #   no address can be used.  --dry-run checks nothing and shows S=1.
 _net_derive_publish_addr() {
-    local _prefix _s _cand
-    if [[ "${DRY_RUN}" -eq 0 ]]; then
-        _net_listeners
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        _net_choose_publish_addr
+        return 0
     fi
+    _net_claims_begin
+    _net_listeners
+    _net_choose_publish_addr
+    _net_claims_write
+    _net_claims_end
+}
+
+# _net_choose_publish_addr
+#   The choice for _net_derive_publish_addr, against the listeners and (on a
+#   real run) the claims of the user's other launches.
+_net_choose_publish_addr() {
+    local _prefix _s _cand
     if [[ -n "${NET_PUBLISH_ADDR}" ]]; then
         _NET_PUBLISH_ADDR_EFFECTIVE="${NET_PUBLISH_ADDR}"
         [[ "${DRY_RUN}" -eq 0 ]] || return 0
         _net_busy_port "${NET_PUBLISH_ADDR}"
+        if [[ -n "${_NET_BUSY_PID}" ]]; then
+            echo "Error: --publish: port ${_NET_BUSY} on ${NET_PUBLISH_ADDR} is claimed by another of your sandboxes (launcher pid ${_NET_BUSY_PID})." >&2
+            exit 1
+        fi
         if [[ -n "${_NET_BUSY}" ]]; then
             echo "Error: --publish: port ${_NET_BUSY} is already in use on ${NET_PUBLISH_ADDR} (see: ss -ltnp)." >&2
             exit 1
