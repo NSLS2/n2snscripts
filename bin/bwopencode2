@@ -1385,6 +1385,7 @@ main() {
     build_pixi_mounts
     build_ccache_mounts
     build_npm_mounts
+    build_prek_mounts
     build_user_bin_mount
     build_nsls2_mount
     build_opencode2_install_mount

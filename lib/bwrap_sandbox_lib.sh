@@ -1937,9 +1937,13 @@ resolve_common_paths() {
     # npm paths
     NPM_CACHE_DIR="${NPM_CONFIG_CACHE:-${_HOME}/.npm}"
 
+    # prek (pre-commit) cache: hook environments and the toolchains it
+    # downloads to build them (Go, Node).
+    PREK_CACHE_DIR="${PREK_HOME:-${XDG_CACHE_HOME}/prek}"
+
     # ── Safety checks on all user-controllable path roots ────────
     # These variables are set from env vars (XDG_*, PIXI_HOME, CCACHE_DIR,
-    # NPM_CONFIG_CACHE) and control where entire directory trees are mounted
+    # NPM_CONFIG_CACHE, PREK_HOME) and control where entire directory trees are mounted
     # into the sandbox.  Validate each root once here so that every mount
     # derived from it is implicitly covered — no per-mount check needed for
     # sub-paths.  Paths that do not yet exist are checked against the blocked
@@ -1951,6 +1955,7 @@ resolve_common_paths() {
     _check_dir_safe "${CCACHE_CACHE_DIR}" "CCACHE_DIR (cache)"
     _check_dir_safe "${CCACHE_CONFIG_DIR}" "CCACHE_DIR (config)"
     _check_dir_safe "${NPM_CACHE_DIR}"    "NPM_CONFIG_CACHE"
+    _check_dir_safe "${PREK_CACHE_DIR}"   "PREK_HOME"
 }
 
 # ── Sandbox PATH construction ────────────────────────────────────
@@ -4340,6 +4345,16 @@ build_ccache_mounts() {
     fi
 }
 
+# ── prek cache (read-write) ─────────────────────────────────────
+# Shared with the host, so a sandbox does not set up every hook environment
+# (and download the Go and Node toolchains for them) again.  Like the npm
+# and pixi caches, the agent can change what is in it.
+build_prek_mounts() {
+    if [[ -d "${PREK_CACHE_DIR}" ]]; then
+        BWRAP_ARGS+=(--bind "${PREK_CACHE_DIR}" "${PREK_CACHE_DIR}")
+    fi
+}
+
 # ── npm config (read-only) + cache (read-write) ─────────────────
 build_npm_mounts() {
     if [[ -f "${_HOME}/.npmrc" ]]; then
@@ -4666,6 +4681,7 @@ build_env_vars() {
     pass_through_if_set CCACHE_DIR
     pass_through_if_set PIXI_HOME
     pass_through_if_set NPM_CONFIG_CACHE
+    pass_through_if_set PREK_HOME
 
     # Editor
     pass_through_if_set EDITOR

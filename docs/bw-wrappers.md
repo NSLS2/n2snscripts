@@ -141,7 +141,7 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   `--rw-path` refuse it and refuse a directory that contains it. The creds
   directory itself is allowed.
 - **Automatic mounts cannot expose it either.** Directories the launcher mounts
-  whole (the npm and pixi caches, ccache, the tool data and cache directories)
+  whole (the npm, pixi and prek caches, ccache, the tool data and cache directories)
   are only checked for being blocked themselves. So, after all mounts are built,
   the launch stops with an error if any bind mount's source (as written or with
   symlinks resolved) is, contains or lies inside the N2C session directory, for
