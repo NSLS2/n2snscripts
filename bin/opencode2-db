@@ -390,13 +390,22 @@ def cmd_status(data_dir: Path, args: argparse.Namespace) -> int:
 # ── replacing the database ───────────────────────────────────────────────
 
 
+def free_corrupt_suffix(data_dir: Path) -> str:
+    """corrupt-DATE, else corrupt-DATE-TIME, else corrupt-DATE-TIME-N: the first
+    suffix no kept file (database, -wal or -shm) uses, so a recovery never
+    overwrites the files an earlier one kept, even in the same second."""
+    base = "corrupt-" + now_utc().strftime("%Y%m%d")
+    timed = base + now_utc().strftime("-%H%M%S")
+    for suffix in [base, timed] + ["%s-%d" % (timed, n) for n in range(2, 1000)]:
+        if not any((data_dir / (DB_NAME + "." + suffix + ext)).exists() for ext in ("", "-wal", "-shm")):
+            return suffix
+    raise ToolError("too many kept opencode.db.corrupt-* files in %s; remove old ones first" % data_dir)
+
+
 def swap_in(data_dir: Path, new_db: Path, gdir: Path) -> List[str]:
     """Move the current database (and its -wal/-shm) aside, put new_db in its
     place, clear the flag.  Returns the names of the files kept."""
-    stamp = now_utc().strftime("%Y%m%d")
-    suffix = "corrupt-" + stamp
-    if (data_dir / (DB_NAME + "." + suffix)).exists():
-        suffix += now_utc().strftime("-%H%M%S")
+    suffix = free_corrupt_suffix(data_dir)
     kept: List[str] = []
     for ext in ("", "-wal", "-shm"):
         current = data_dir / (DB_NAME + ext)

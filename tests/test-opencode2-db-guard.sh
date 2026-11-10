@@ -135,6 +135,7 @@ hold_lock "$(locks_of "${D}")/session@elsewhere.example@2.2.5.lock" 4
 OUT="$(run_guard "${D}")"
 check "a live session on another host is refused" contains "${OUT}" 'rc=1'
 check "the refusal names the other host" contains "${OUT}" 'elsewhere.example'
+check "a session refusal tells the user to close that session" contains "${OUT}" 'Close that session'
 
 D="$(new_data otherversion)"
 hold_lock "$(locks_of "${D}")/session@${HOST}@2.2.4.lock" 4
@@ -177,6 +178,8 @@ check "the backup lock is held by the tool" test "$(cat "${T}/window-held")" = h
 OUT="$(run_guard "${D}" PATH="${T}/shim:${PATH}")"
 check "a launch on another host is refused while a backup holds its lock" contains "${OUT}" 'rc=1'
 check "the refusal says a backup is running" contains "${OUT}" 'backup is running'
+check "a backup refusal says to try again shortly" contains "${OUT}" 'Try again shortly'
+check "a backup refusal does not tell the user to close a session" bash -c '! grep -q "Close that session" <<< "$1"' _ "${OUT}"
 OUT="$(run_guard "${D}")"
 check "a launch on the same host is allowed while a backup holds its lock" contains "${OUT}" 'rc=0'
 
@@ -345,6 +348,42 @@ check "two backups in quick succession keep both files" bash -c '[[ "$(ls "$1"/b
 "${TOOL}" --data-dir "${T}/dup/opencode" rebuild > /dev/null 2>&1
 check "two rebuilds keep both rebuilt files" bash -c '[[ "$(ls "$1"/opencode.db.rebuilt-* | wc -l)" -eq 2 ]]' _ "${T}/dup/opencode"
 
+# Several recoveries in the same second must each keep the file they replace:
+# the kept names never collide, and a kept file is never overwritten.
+mkdir -p "${T}/swap/opencode"
+if python3 - "${T}/swap/opencode" "${TOOL}" << 'EOF'; then
+import importlib.machinery
+import importlib.util
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+data = Path(sys.argv[1])
+gdir = data.parent / "opencode-db-guard"
+gdir.mkdir()
+loader = importlib.machinery.SourceFileLoader("oc2db", sys.argv[2])
+mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("oc2db", loader))
+loader.exec_module(mod)
+mod.now_utc = lambda: datetime(2026, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+for i in range(4):
+    (data / "opencode.db").write_text("db%d" % i)
+    (data / "opencode.db-wal").write_text("wal%d" % i)
+    new = data / ("new%d" % i)
+    new.write_text("new%d" % i)
+    mod.swap_in(data, new, gdir)
+
+kept = sorted(p.read_text() for p in data.glob("opencode.db.corrupt-*"))
+want = sorted(["db%d" % i for i in range(4)] + ["wal%d" % i for i in range(4)])
+assert kept == want, (kept, want)
+assert (data / "opencode.db").read_text() == "new3"
+EOF
+    check "four recoveries in one second each keep the file they replace" true
+else
+    check "four recoveries in one second each keep the file they replace" false
+fi
+
+# A refusal because of a backup job says to try again shortly, not to close a session.
 PD="${T}/py/share/opencode"
 GD="${T}/py/share/opencode-db-guard"
 

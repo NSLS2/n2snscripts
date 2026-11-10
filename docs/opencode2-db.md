@@ -129,8 +129,9 @@ guard directory 0700); the launchers create the guard directory the same way.
 
 `restore`, `rebuild` and `clear` take `guard.lock` and refuse while any session
 lock or backup lock is held. The damaged files are never deleted: they are renamed to
-`opencode.db.corrupt-<date>` (with `-wal` and `-shm` alongside, and a time
-suffix if the name exists).
+`opencode.db.corrupt-<date>` (with `-wal` and `-shm` alongside; if a kept file already uses the
+name, a time and then a counter are added, so a recovery never overwrites the
+files an earlier one kept).
 
 ### Recovering from a damaged database
 

@@ -75,7 +75,7 @@ oc2db_refuse() {
         for _line in "$@"; do
             printf '  %s\n' "${_line}"
         done
-        printf '  Close that session (and anything it started), then try again.\n'
+        printf '  %s\n' "${OC2DB_REFUSE_HINT:-Close that session (and anything it started), then try again.}"
         printf '  Running anyway risks a corrupted database; to override once:\n'
         printf '    OPENCODE2_DB_GUARD=off %s ...\n' "${OC2DB_PROG:-opencode2}"
     } >&2
@@ -273,7 +273,7 @@ oc2db_needs_guard() {
 # reason that is not a hazard.
 oc2db_guard() {
     local _data="$1" _bin="${2:-}"
-    local _gdir _locks _host _ver _own _gfd _bin_id="" _h _line
+    local _gdir _locks _host _ver _own _gfd _bin_id="" _h _line _hint _only_backup
     local -a _details
 
     if [[ "${OPENCODE2_DB_GUARD:-}" == "off" ]]; then
@@ -335,8 +335,15 @@ oc2db_guard() {
         done
         _details+=("The database is on NFS; two hosts, or two OpenCode versions, must not use it together.")
         exec {_gfd}>&-
+        # Only backup jobs: they are short, so say to wait, not to close a session.
+        _hint=""
+        _only_backup=1
+        for _h in "${_OC2DB_HELD[@]}"; do
+            [[ "${_h#* }" == "backup" ]] || _only_backup=0
+        done
+        ((_only_backup)) && _hint="Try again shortly: a backup job reads the database for about a minute."
         # A session lock on this host with the same version is not in the list.
-        oc2db_refuse "the database is in use by another host or OpenCode version" "${_details[@]}"
+        OC2DB_REFUSE_HINT="${_hint}" oc2db_refuse "the database is in use by another host or OpenCode version" "${_details[@]}"
         return 1
     fi
 
