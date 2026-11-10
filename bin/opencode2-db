@@ -29,9 +29,9 @@
 #   rebuild   copy every readable table into a new database and rebuild the
 #             project table from sessions and worktrees; without --apply the
 #             new file is only built and checked; a table that could not be
-#             copied completely, or whose damaged project rows or kv storage
-#             had to be rebuilt or left empty, stops --apply unless
-#             --accept-loss is given
+#             copied completely, whose damaged project rows or kv storage
+#             had to be rebuilt or left empty, or whose write-ahead log could
+#             not be used, stops --apply unless --accept-loss is given
 #   clear     remove the CHECK-FAILED flag without changing anything
 #
 # restore, rebuild and clear refuse to run while any session lock is held.
@@ -396,10 +396,11 @@ def cmd_clear(data_dir: Path, args: argparse.Namespace) -> int:
 SQL_OBJECTS = "select type, name, tbl_name, sql from sqlite_master where sql is not null and name not like 'sqlite_%' order by rowid"
 
 
-def open_source_copy(data_dir: Path, work: str) -> sqlite3.Connection:
+def open_source_copy(data_dir: Path, work: str) -> Tuple[sqlite3.Connection, bool]:
     """Open a private copy of the database and its WAL, so the originals are
     never touched.  Falls back to the main file alone, read-only, when SQLite
-    cannot recover the WAL."""
+    cannot open it with the WAL.  Returns (connection, wal_dropped): the
+    fallback loses every transaction that is only in the WAL."""
     main = data_dir / DB_NAME
     copy = os.path.join(work, DB_NAME)
     shutil.copyfile(str(main), copy)
@@ -409,11 +410,12 @@ def open_source_copy(data_dir: Path, work: str) -> sqlite3.Connection:
     try:
         conn = sqlite3.connect(copy)
         conn.execute("select count(*) from sqlite_master").fetchone()
-        return conn
+        return conn, False
     except sqlite3.Error:
+        dropped = os.path.exists(copy + "-wal") and os.path.getsize(copy + "-wal") > 0
         with contextlib.suppress(FileNotFoundError):
             os.unlink(copy + "-wal")
-        return sqlite3.connect("file:%s?mode=ro&immutable=1" % copy, uri=True)
+        return sqlite3.connect("file:%s?mode=ro&immutable=1" % copy, uri=True), dropped
 
 
 def table_count(conn: sqlite3.Connection, name: str) -> Optional[int]:
@@ -506,10 +508,13 @@ def cmd_rebuild(data_dir: Path, args: argparse.Namespace) -> int:
 def build_rebuilt(data_dir: Path, work: str, result: Path) -> Tuple[bool, bool]:
     """Returns (valid, complete): valid when the new file passes integrity and
     foreign key checks, complete when every table was copied in full."""
-    src = open_source_copy(data_dir, work)
+    src, wal_dropped = open_source_copy(data_dir, work)
     dst = sqlite3.connect(str(result))
     valid = True
     complete = True
+    if wal_dropped:
+        say("opencode.db-wal could not be used: transactions that were only in it are lost")
+        complete = False
     try:
         objects = src.execute(SQL_OBJECTS).fetchall()
         tables = [o for o in objects if o[0] == "table"]

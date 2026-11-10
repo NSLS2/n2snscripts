@@ -141,7 +141,8 @@ database disk image is malformed`.
    `foreign_key_check` and compares row counts. Without `--apply` it only
    builds the file and reports; `--apply` puts it in place, and when data was
    lost (a table that could not be copied completely, `project` rebuilt, `kv`
-   left empty) it also needs `--accept-loss`.
+   left empty, or the write-ahead log `opencode.db-wal` unusable so that
+   transactions only in it are dropped) it also needs `--accept-loss`.
 5. Start OpenCode 2 and check the session list. The first start after a restore
    may re-run the OpenCode 1 import: look for duplicate sessions.
 

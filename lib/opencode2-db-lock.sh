@@ -153,7 +153,10 @@ oc2db_scan_processes() {
         fi
         _ns="$(readlink "${_d}/ns/pid" 2> /dev/null || true)"
         if [[ -n "${_ns}" && "${_ns}" == "${_my_ns}" ]]; then
-            if [[ -r "${_d}/environ" ]] && ! tr '\0' '\n' < "${_d}/environ" 2> /dev/null | grep -qx 'OC2DB_GUARDED=1'; then
+            # grep without -q reads all its input: with -q it exits at the first
+            # match and tr can die of SIGPIPE, which under the caller's pipefail
+            # would report a guarded process as unlocked.
+            if [[ -r "${_d}/environ" ]] && ! tr '\0' '\n' < "${_d}/environ" 2> /dev/null | grep -x 'OC2DB_GUARDED=1' > /dev/null; then
                 _OC2DB_UNLOCKED+=("${_desc}")
             fi
         fi

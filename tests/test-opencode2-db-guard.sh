@@ -191,6 +191,18 @@ fake_proc 90003 "${T}/inst/new/opencode.exe" 4001 marker
 OUT="$(run_guard "${D}" OC2DB_PROC="${T}/proc")"
 check "an unsandboxed process with the marker and the same build is allowed" contains "${OUT}" 'rc=0'
 
+# The marker is the first variable and the environment is far larger than a pipe
+# buffer: `grep -q` must not stop reading early and make `tr` die of SIGPIPE,
+# which under pipefail would report a guarded process as unlocked.
+rm -rf "${T}/proc"
+fake_proc 90006 "${T}/inst/new/opencode.exe" 4001 marker
+python3 -c "
+import sys
+with open(sys.argv[1], 'ab') as f:
+    f.write((b'X=' + b'y' * 100 + b'\\0') * 20000)" "${T}/proc/90006/environ"
+OUT="$(run_guard "${D}" OC2DB_PROC="${T}/proc")"
+check "a marked process with a very large environment is allowed (no SIGPIPE)" contains "${OUT}" 'rc=0'
+
 rm -rf "${T}/proc"
 fake_proc 90004 "${T}/inst/new/opencode.exe" 4002
 OUT="$(run_guard "${D}" OC2DB_PROC="${T}/proc")"
@@ -344,6 +356,70 @@ assert sqlite3.connect(sys.argv[1]).execute('select count(*) from project where 
 check "rebuild --apply --accept-loss applies it" python3 -c "
 import sqlite3, sys
 assert sqlite3.connect(sys.argv[1]).execute('select id from project').fetchall() == [('p1',)]" "${LD}/opencode.db"
+
+# A write-ahead log that SQLite cannot use is dropped by the rebuild, which loses
+# the transactions only in it: the tool must report that. SQLite rarely fails to
+# open a bad WAL, so the tool is loaded as a module and the first connect fails.
+mkdir -p "${T}/walloss/share/opencode"
+if python3 - "${T}/walloss/share/opencode" "${TOOL}" > /dev/null 2>&1 << 'EOF'; then
+import importlib.machinery
+import importlib.util
+import shutil
+import sqlite3
+import sys
+from pathlib import Path
+
+data = Path(sys.argv[1])
+live = sqlite3.connect(str(data / "opencode.db"))
+live.execute("pragma journal_mode=wal")
+live.execute("pragma wal_autocheckpoint=0")
+live.execute("create table t(x)")
+live.execute("insert into t values (1)")
+live.commit()
+# Copy while the writer is open, so that the -wal file still holds the data.
+shutil.copyfile(str(data / "opencode.db"), str(data / "main.copy"))
+shutil.copyfile(str(data / "opencode.db-wal"), str(data / "wal.copy"))
+live.close()
+for name in ("opencode.db", "opencode.db-wal", "opencode.db-shm"):
+    (data / name).unlink(missing_ok=True)
+(data / "main.copy").rename(data / "opencode.db")
+(data / "wal.copy").rename(data / "opencode.db-wal")
+
+loader = importlib.machinery.SourceFileLoader("oc2db", sys.argv[2])
+spec = importlib.util.spec_from_loader("oc2db", loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+work1 = data.parent / "work1"
+work2 = data.parent / "work2"
+work1.mkdir()
+work2.mkdir()
+
+conn, dropped = mod.open_source_copy(data, str(work1))
+assert dropped is False, "a usable WAL must not be reported as dropped"
+assert conn.execute("select count(*) from t").fetchone()[0] == 1, "the WAL data must be readable"
+conn.close()
+
+real_connect = mod.sqlite3.connect
+calls = []
+
+
+def failing_first(*args, **kwargs):
+    calls.append(args)
+    if len(calls) == 1:
+        raise mod.sqlite3.DatabaseError("database disk image is malformed")
+    return real_connect(*args, **kwargs)
+
+
+mod.sqlite3.connect = failing_first
+conn, dropped = mod.open_source_copy(data, str(work2))
+assert dropped is True, "an unusable, non-empty WAL must be reported as dropped"
+conn.close()
+EOF
+    check "a write-ahead log that cannot be used is reported as dropped" true
+else
+    check "a write-ahead log that cannot be used is reported as dropped" false
+fi
 
 printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
 [[ "${FAIL}" -eq 0 ]]
