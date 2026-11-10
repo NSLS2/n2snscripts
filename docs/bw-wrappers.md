@@ -433,7 +433,7 @@ change them, and they are the data needed for a later egress allowlist.
 | --- | --- |
 | start | `event=start session=ID launcher=... user=... uid=... pid=... backend=... flows=logged\|unavailable publish=ADDR:PORTS host_ports=... dir=...` |
 | pasta | `session=ID pasta version=... pid=...`, and pasta's warnings and errors (`pasta level=error msg=...`) |
-| dns | `session=ID dns name=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21` |
+| dns | `session=ID dns name=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21`, plus `cname=...` when the answer went through aliases |
 | open | `session=ID flow=7 open proto=tcp dir=out src=ADDR:PORT dst=140.82.112.21:443 name=github.com t=21.359` |
 | close | `session=ID flow=7 close proto=tcp dir=out dst=140.82.112.21:443 name=github.com t=33.770 secs=12.411` |
 | fail | `session=ID flow=9 fail ...`: a connection that never became active (refused, unreachable) |
@@ -500,7 +500,8 @@ field, for example the names an agent reached:
 - **DNS relay (pasta).** To name destinations, `lib/bwrap_netlog.py dns`
   listens on `127.53.0.1:53` (UDP and TCP) in the sandbox's network namespace,
   forwards each lookup to `169.254.1.1` (pasta's DNS forward) and writes one
-  `dns` line per lookup to the log. The condenser keeps a map from the answers'
+  `dns` line per lookup to the log, before it answers, so the name is known
+  when the connection that follows is logged. The condenser keeps a map from the answers'
   addresses to names. The sandbox's `/etc/resolv.conf` lists the relay first
   and `169.254.1.1` second, so lookups go on working, at once, if the relay is
   down (its port is then closed); pasta's own leg of a relayed lookup (UDP to

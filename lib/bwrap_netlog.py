@@ -24,6 +24,7 @@ Output lines are logfmt (key=value), so Loki's `| logfmt` can filter them:
     session=ID flow=7 close proto=tcp dir=out dst=140.82.113.22:443 name=github.com t=33.770 secs=12.411
     session=ID flow=9 fail proto=tcp dir=out dst=192.0.2.1:443 src=... t=40.120
     session=ID dns name=github.com type=A rcode=NOERROR answers=140.82.113.22
+    session=ID dns name=api.x.com type=A rcode=NOERROR answers=192.0.2.1 cname=lb.x.net
 """
 
 # Kept to what the DNS relay needs: it starts while the sandbox starts, and
@@ -327,12 +328,15 @@ class DnsRelay:
                 rcode, answers = parse_answers(response)
             except (ValueError, struct.error, IndexError):
                 rcode, answers = "UNPARSED", []
-        line = "bwrap-dns name=%s type=%s proto=%s rcode=%s answers=%s\n" % (
+        addrs = [a for a in answers if re.match(r"^[0-9.]+$", a) or ":" in a]
+        cnames = [a for a in answers if a not in addrs]
+        line = "bwrap-dns name=%s type=%s proto=%s rcode=%s answers=%s%s\n" % (
             _value(name),
             qtype,
             proto,
             rcode,
-            ",".join(answers) or "-",
+            ",".join(addrs) or "-",
+            " cname=%s" % ",".join(cnames) if cnames else "",
         )
         with self.lock:
             try:
@@ -350,10 +354,16 @@ class DnsRelay:
             s.send(query)
             response = s.recv(65535)
             s.close()
-            srv.sendto(response, client)
         except OSError:
             pass
+        # Log before answering: the client connects as soon as it has the
+        # answer, and the condenser must know the name by then.
         self.log(query, response, "udp")
+        if response is not None:
+            try:
+                srv.sendto(response, client)
+            except OSError:
+                pass
 
     def _recv_exact(self, s, n):
         data = b""
@@ -377,8 +387,8 @@ class DnsRelay:
                 up.sendall(hdr + query)
                 rhdr = self._recv_exact(up, 2)
                 response = self._recv_exact(up, struct.unpack("!H", rhdr)[0])
-                conn.sendall(rhdr + response)
                 self.log(query, response, "tcp")
+                conn.sendall(rhdr + response)
             up.close()
         except OSError:
             pass

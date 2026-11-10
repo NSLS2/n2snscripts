@@ -215,7 +215,7 @@ class DnsRelayTest(unittest.TestCase):
         self.assertEqual(netlog.parse_answers(c.recv(4096))[1], ["example.org", "192.0.2.10"])
         self.assertEqual(
             self.wait_lines(1),
-            ["bwrap-dns name=www.example.org type=A proto=udp rcode=NOERROR answers=example.org,192.0.2.10"],
+            ["bwrap-dns name=www.example.org type=A proto=udp rcode=NOERROR answers=192.0.2.10 cname=example.org"],
         )
 
     def test_tcp(self):
