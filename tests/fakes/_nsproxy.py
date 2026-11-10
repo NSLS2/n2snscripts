@@ -59,6 +59,9 @@ class NsProxy:
                     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                     s.bind((req["host"], req["port"]))
                     s.listen(16)
+                elif req["op"] == "udp":
+                    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s.bind((req["host"], req["port"]))
                 elif req["op"] == "run":
                     r = subprocess.run(req["cmd"], capture_output=True, text=True)
                     chan.send(json.dumps({"rc": r.returncode, "err": r.stderr}).encode())
@@ -87,6 +90,9 @@ class NsProxy:
     def listen(self, host, port):
         return self._request(op="listen", host=host, port=port)
 
+    def udp(self, host, port):
+        return self._request(op="udp", host=host, port=port)
+
     def run(self, cmd):
         return self._request(op="run", cmd=cmd)
 
@@ -106,7 +112,21 @@ def _pipe(src, dst):
         pass
 
 
-def forward(listener, connect, log=None, label=""):
+def forward(listener, connect, on_open=None, on_close=None):
+    """Splice each connection accepted on LISTENER to connect().  on_open(peer)
+    returns a token given to on_close(token) once both directions are done."""
+
+    def conn(c, t, token):
+        threads = [threading.Thread(target=_pipe, args=(a, b), daemon=True) for a, b in ((c, t), (t, c))]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        c.close()
+        t.close()
+        if on_close:
+            on_close(token)
+
     def loop():
         while True:
             try:
@@ -115,15 +135,11 @@ def forward(listener, connect, log=None, label=""):
                 return
             try:
                 t = connect()
-            except OSError as e:
-                if log:
-                    log("Flow %s: %s:%s refused: %s" % (label, peer[0], peer[1], e))
+            except OSError:
                 c.close()
                 continue
-            if log:
-                log("Flow %s: TAP_FWD %s:%s => %s" % (label, peer[0], peer[1], t.getpeername()))
-            for a, b in ((c, t), (t, c)):
-                threading.Thread(target=_pipe, args=(a, b), daemon=True).start()
+            token = on_open(peer) if on_open else None
+            threading.Thread(target=conn, args=(c, t, token), daemon=True).start()
 
     threading.Thread(target=loop, daemon=True).start()
 

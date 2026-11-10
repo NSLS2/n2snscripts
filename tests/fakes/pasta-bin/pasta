@@ -6,7 +6,11 @@ Like the real one it closes inherited descriptors above 2 before opening
 network namespace, starts the command in it and stays its parent, and
 forwards -t (host -> namespace interface address) and -T (namespace
 loopback -> host loopback) ports.  Like the real one (fwd_rule.c), -T and -U
-take no listening address: "-T ADDR/..." stops it with pasta's error.  The namespace gets a dummy interface with 192.168.77.2
+take no listening address: "-T ADDR/..." stops it with pasta's error.  With
+--dns-forward ADDR it answers DNS queries to ADDR:53 itself (every name is
+192.0.2.10).  Its debug lines (--debug --log-file) use pasta's format: a
+timestamp, then "Flow N (KIND): ..." state changes and endpoints, plus timer
+noise, so the launcher's condenser can be tested against them.  The namespace gets a dummy interface with 192.168.77.2
 instead of a tap with the host's address.  With --debug and --log-file it
 writes header, startup and "Flow" lines to the log file (blocking writes, as
 pasta's are).  The failure mode is read from $FAKE_NET_DIR/pasta.fail
@@ -14,8 +18,10 @@ pasta's are).  The failure mode is read from $FAKE_NET_DIR/pasta.fail
 """
 
 import os
+import struct
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 import _nsproxy  # noqa: E402
@@ -66,12 +72,49 @@ if "--log-file" in opts:
     log_fd = os.open(opts["--log-file"], os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_RDWR, 0o600)
     os.write(log_fd, ("pasta fake-2026_10_02: %s (%d)\n" % (os.path.realpath(__file__), os.getpid())).encode())
 log_lock = threading.Lock()
+T0 = time.monotonic()
+_flow_ids = []
 
 
-def log(msg):
+def log(msg, level="        "):
     if log_fd >= 0 and "--debug" in opts:
         with log_lock:
-            os.write(log_fd, ("0.0001: %s\n" % msg).encode())
+            os.write(log_fd, ("%.4f: %s  %s\n" % (time.monotonic() - T0, level, msg)).encode())
+
+
+def ep(a, p):
+    return "[%s]:%s" % (a, p)
+
+
+def flow_open(kind, ini, src, dst, tgt, tsrc, tdst):
+    with log_lock:
+        idx = next(i for i in range(len(_flow_ids) + 1) if i >= len(_flow_ids) or _flow_ids[i] is None)
+        if idx == len(_flow_ids):
+            _flow_ids.append(True)
+        _flow_ids[idx] = True
+    ends = "%s %s -> %s => %s %s -> %s" % (ini, ep(*src), ep(*dst), tgt, ep(*tsrc), ep(*tdst))
+    for line in (
+        "Flow %d (NEW): FREE -> NEW" % idx,
+        "Flow %d (INI): NEW -> INI" % idx,
+        "Flow %d (INI):     %s %s -> %s => ?" % (idx, ini, ep(*src), ep(*dst)),
+        "Flow %d (TGT): INI -> TGT" % idx,
+        "Flow %d (TGT):     %s" % (idx, ends),
+        "Flow %d (%s): TGT -> TYPED" % (idx, kind),
+        "Flow %d (%s):     %s" % (idx, kind, ends),
+        "Flow %d (%s): TYPED -> ACTIVE" % (idx, kind),
+        "Flow %d (%s): timer expires in 2.000s" % (idx, kind),
+    ):
+        log(line)
+    return (idx, kind, ends)
+
+
+def flow_close(token):
+    idx, kind, ends = token
+    log("Flow %d (%s): CLOSED" % (idx, kind))
+    log("Flow %d (FREE): ACTIVE -> FREE" % idx)
+    log("Flow %d (FREE):     %s" % (idx, ends))
+    with log_lock:
+        _flow_ids[idx] = None
 
 
 try:
@@ -96,12 +139,15 @@ if child == 0:
     import socket as _s
 
     _s.sethostname("pasta-" + os.uname().nodename)
-    for c in (
+    setup = [
         ["ip", "link", "set", "lo", "up"],
         ["ip", "link", "add", "eth0", "type", "dummy"],
         ["ip", "addr", "add", NS_ADDR + "/24", "dev", "eth0"],
         ["ip", "link", "set", "eth0", "up"],
-    ):
+    ]
+    if "--dns-forward" in opts:
+        setup.append(["ip", "addr", "add", opts["--dns-forward"] + "/32", "dev", "lo"])
+    for c in setup:
         if os.spawnvp(os.P_WAIT, c[0], c) != 0:
             os._exit(1)
     os.write(ready_w, b"1")
@@ -120,7 +166,7 @@ if os.read(ready_r, 1) != b"1":
     print("fake pasta: namespace setup failed", file=sys.stderr)
     sys.exit(1)
 proxy = _nsproxy.NsProxy(child)
-log("Template interface: eth0 (IPv4)")
+log("Template interface: eth0 (IPv4)", "info:  ")
 
 import socket  # noqa: E402
 
@@ -142,7 +188,14 @@ for spec in fwd_t:
             os.kill(child, 9)
             sys.exit(1)
         s.listen(16)
-        _nsproxy.forward(s, lambda gp=gp: proxy.connect(NS_ADDR, gp), log, "-t %d" % hp)
+        _nsproxy.forward(
+            s,
+            lambda gp=gp: proxy.connect(NS_ADDR, gp),
+            lambda peer, hp=hp, gp=gp, addr=addr: flow_open(
+                "TCP connection (spliced)", "HOST", peer, (addr, hp), "SPLICE", ("0.0.0.0", 0), (NS_ADDR, gp)
+            ),
+            flow_close,
+        )
 for spec in fwd_T:
     ports = spec
     pairs = []
@@ -151,7 +204,46 @@ for spec in fwd_T:
         pairs += zip(_nsproxy.port_range(sports), _nsproxy.port_range(hports or sports))
     for sp, hp in pairs:
         s = proxy.listen("127.0.0.1", sp)
-        _nsproxy.forward(s, lambda hp=hp: socket.create_connection(("127.0.0.1", hp)), log, "-T %d" % sp)
+        _nsproxy.forward(
+            s,
+            lambda hp=hp: socket.create_connection(("127.0.0.1", hp)),
+            lambda peer, sp=sp, hp=hp: flow_open(
+                "TCP connection (spliced)", "SPLICE", peer, ("127.0.0.1", sp), "HOST", ("0.0.0.0", 0), ("127.0.0.1", hp)
+            ),
+            flow_close,
+        )
+
+
+def dns_answer(query):
+    """Answer QUERY with A 192.0.2.10 (no records for other types)."""
+    tid, _, qd = struct.unpack("!HHH", query[:6])
+    off = 12
+    while query[off]:
+        off += 1 + query[off]
+    off += 5
+    qtype = struct.unpack("!H", query[off - 4 : off - 2])[0]
+    question = query[12:off]
+    if qtype == 1:
+        rr = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton("192.0.2.10")
+        return struct.pack("!HHHHHH", tid, 0x8180, 1, 1, 0, 0) + question + rr
+    return struct.pack("!HHHHHH", tid, 0x8180, 1, 0, 0, 0) + question
+
+
+def dns_loop(sock, addr):
+    while True:
+        query, peer = sock.recvfrom(4096)
+        token = flow_open("UDP flow", "TAP", peer, (addr, 53), "HOST", ("0.0.0.0", peer[1]), ("127.0.0.53", 53))
+        try:
+            sock.sendto(dns_answer(query), peer)
+        except (OSError, IndexError, struct.error):
+            pass
+        flow_close(token)
+
+
+if "--dns-forward" in opts:
+    threading.Thread(
+        target=dns_loop, args=(proxy.udp(opts["--dns-forward"], 53), opts["--dns-forward"]), daemon=True
+    ).start()
 
 os.write(go_w, b"1")
 os.close(go_w)

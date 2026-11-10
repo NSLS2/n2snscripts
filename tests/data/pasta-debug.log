@@ -1,0 +1,900 @@
+pasta 2026_10_02.cba3570: /usr/bin/passt (3962723)
+0.0071: info:    Template interface: enp7s0 (IPv4), enp7s0 (IPv6)
+Template interface: enp7s0 (IPv4), enp7s0 (IPv6)
+0.0071: info:    Namespace interface: enp7s0
+Namespace interface: enp7s0
+0.0071: info:    MAC:
+MAC:
+0.0071: info:        host: 02:00:00:00:00:01
+    host: 02:00:00:00:00:01
+0.0071: info:    DHCP:
+DHCP:
+0.0071: info:        assign: 198.51.100.7
+    assign: 198.51.100.7
+0.0071: info:        mask: 255.255.255.0
+    mask: 255.255.255.0
+0.0071: info:        router: 198.51.100.1
+    router: 198.51.100.1
+0.0071: info:    DNS:
+DNS:
+0.0072: info:        169.254.1.1
+    169.254.1.1
+0.0072: info:    NDP/DHCPv6:
+NDP/DHCPv6:
+0.0072: info:        assign: 2001:db8::7
+    assign: 2001:db8::7
+0.0072: info:        router: fe80::1
+    router: fe80::1
+0.0072: info:        our link-local: fe80::1
+    our link-local: fe80::1
+0.0072: info:    Inbound forwarding rules (HOST):
+Inbound forwarding rules (HOST):
+0.0072: info:    Outbound forwarding rules (SPLICE):
+Outbound forwarding rules (SPLICE):
+0.0161:          Sending initial ARP request for guest MAC address
+Sending initial ARP request for guest MAC address
+0.0162:          Sending initial NDP NS request for guest MAC address
+Sending initial NDP NS request for guest MAC address
+0.0188:          Using UDP timeout parameters, timeout: 30, stream_timeout: 120
+Using UDP timeout parameters, timeout: 30, stream_timeout: 120
+0.0188:          Using TCP RTO parameters, syn_retries: 6, syn_linear_timeouts: 4, rto_max: 120
+Using TCP RTO parameters, syn_retries: 6, syn_linear_timeouts: 4, rto_max: 120
+0.0203:          SO_PEEK_OFF supported
+SO_PEEK_OFF supported
+0.0203:          TCP_INFO tcpi_snd_wnd field supported
+TCP_INFO tcpi_snd_wnd field supported
+0.0203:          TCP_INFO tcpi_bytes_acked field supported
+TCP_INFO tcpi_bytes_acked field supported
+0.0203:          TCP_INFO tcpi_min_rtt field supported
+TCP_INFO tcpi_min_rtt field supported
+0.0206:          ARP announcement for 198.51.100.1 / 02:00:00:00:00:02
+ARP announcement for 198.51.100.1 / 02:00:00:00:00:02
+0.0227: info:    NDP: received NS, sending NA
+0.6782:          Flow 0 (NEW): FREE -> NEW
+0.6782:          Flow 0 (INI): NEW -> INI
+0.6782:          Flow 0 (INI):     TAP [198.51.100.7]:35358 -> [169.254.1.1]:53 => ?
+0.6782:          Flow 0 (TGT): INI -> TGT
+0.6782:          Flow 0 (TGT):     TAP [198.51.100.7]:35358 -> [169.254.1.1]:53 => HOST [0.0.0.0]:35358 -> [127.0.0.53]:53
+0.6782:          Flow 0 (UDP flow): TGT -> TYPED
+0.6782:          Flow 0 (UDP flow):     TAP [198.51.100.7]:35358 -> [169.254.1.1]:53 => HOST [0.0.0.0]:35358 -> [127.0.0.53]:53
+0.6783:          Flow 0 (UDP flow): Side 0 hash table insert: bucket: 260701
+0.6783:          Flow 0 (UDP flow): Side 1 hash table insert: bucket: 346642
+0.6783:          Flow 0 (UDP flow): TYPED -> ACTIVE
+0.6783:          Flow 0 (UDP flow):     TAP [198.51.100.7]:35358 -> [169.254.1.1]:53 => HOST [127.0.0.1]:35358 -> [127.0.0.53]:53
+0.6842:          Flow 1 (NEW): FREE -> NEW
+0.6842:          Flow 1 (INI): NEW -> INI
+0.6842:          Flow 1 (INI):     TAP [2001:db8::7]:49344 -> [2606:4700:10::ac42:ad95]:443 => ?
+0.6842:          Flow 1 (TGT): INI -> TGT
+0.6842:          Flow 1 (TGT):     TAP [2001:db8::7]:49344 -> [2606:4700:10::ac42:ad95]:443 => HOST [::]:0 -> [2606:4700:10::ac42:ad95]:443
+0.6842:          Flow 1 (TCP connection): TGT -> TYPED
+0.6842:          Flow 1 (TCP connection):     TAP [2001:db8::7]:49344 -> [2606:4700:10::ac42:ad95]:443 => HOST [::]:0 -> [2606:4700:10::ac42:ad95]:443
+0.6842:          Flow 1 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+0.6842:          Flow 1 (TCP connection): Side 0 hash table insert: bucket: 277245
+0.6842:          Flow 1 (TCP connection): TYPED -> ACTIVE
+0.6842:          Flow 1 (TCP connection):     TAP [2001:db8::7]:49344 -> [2606:4700:10::ac42:ad95]:443 => HOST [::]:0 -> [2606:4700:10::ac42:ad95]:443
+0.6842:          Flow 2 (NEW): FREE -> NEW
+0.6842:          Flow 2 (INI): NEW -> INI
+0.6842:          Flow 2 (INI):     TAP [198.51.100.7]:40178 -> [172.66.173.149]:443 => ?
+0.6842:          Flow 2 (TGT): INI -> TGT
+0.6842:          Flow 2 (TGT):     TAP [198.51.100.7]:40178 -> [172.66.173.149]:443 => HOST [0.0.0.0]:0 -> [172.66.173.149]:443
+0.6842:          Flow 2 (TCP connection): TGT -> TYPED
+0.6842:          Flow 2 (TCP connection):     TAP [198.51.100.7]:40178 -> [172.66.173.149]:443 => HOST [0.0.0.0]:0 -> [172.66.173.149]:443
+0.6842:          Flow 2 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+0.6842:          Flow 2 (TCP connection): Side 0 hash table insert: bucket: 124438
+0.6843:          Flow 2 (TCP connection): TYPED -> ACTIVE
+0.6843:          Flow 2 (TCP connection):     TAP [198.51.100.7]:40178 -> [172.66.173.149]:443 => HOST [0.0.0.0]:0 -> [172.66.173.149]:443
+0.6843:          Flow 3 (NEW): FREE -> NEW
+0.6843:          Flow 3 (INI): NEW -> INI
+0.6843:          Flow 3 (INI):     TAP [198.51.100.7]:33998 -> [104.20.32.17]:443 => ?
+0.6843:          Flow 3 (TGT): INI -> TGT
+0.6843:          Flow 3 (TGT):     TAP [198.51.100.7]:33998 -> [104.20.32.17]:443 => HOST [0.0.0.0]:0 -> [104.20.32.17]:443
+0.6843:          Flow 3 (TCP connection): TGT -> TYPED
+0.6843:          Flow 3 (TCP connection):     TAP [198.51.100.7]:33998 -> [104.20.32.17]:443 => HOST [0.0.0.0]:0 -> [104.20.32.17]:443
+0.6843:          Flow 3 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+0.6843:          Flow 3 (TCP connection): Side 0 hash table insert: bucket: 123425
+0.6843:          Flow 3 (TCP connection): TYPED -> ACTIVE
+0.6843:          Flow 3 (TCP connection):     TAP [198.51.100.7]:33998 -> [104.20.32.17]:443 => HOST [0.0.0.0]:0 -> [104.20.32.17]:443
+0.6843:          Flow 4 (NEW): FREE -> NEW
+0.6843:          Flow 4 (INI): NEW -> INI
+0.6843:          Flow 4 (INI):     TAP [2001:db8::7]:45592 -> [2606:4700:10::6814:2011]:443 => ?
+0.6843:          Flow 4 (TGT): INI -> TGT
+0.6843:          Flow 4 (TGT):     TAP [2001:db8::7]:45592 -> [2606:4700:10::6814:2011]:443 => HOST [::]:0 -> [2606:4700:10::6814:2011]:443
+0.6843:          Flow 4 (TCP connection): TGT -> TYPED
+0.6843:          Flow 4 (TCP connection):     TAP [2001:db8::7]:45592 -> [2606:4700:10::6814:2011]:443 => HOST [::]:0 -> [2606:4700:10::6814:2011]:443
+0.6843:          Flow 4 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+0.6843:          Flow 4 (TCP connection): Side 0 hash table insert: bucket: 256789
+0.6843:          Flow 4 (TCP connection): TYPED -> ACTIVE
+0.6843:          Flow 4 (TCP connection):     TAP [2001:db8::7]:45592 -> [2606:4700:10::6814:2011]:443 => HOST [::]:0 -> [2606:4700:10::6814:2011]:443
+0.6885:          Flow 3 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+0.6885:          Flow 3 (TCP connection): ACK_FROM_TAP_DUE
+0.6885:          Flow 3 (TCP connection): timer expires in 1.000s
+0.6886:          Flow 3 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.6886:          Flow 3 (TCP connection): ESTABLISHED: SYN_RCVD -> ESTABLISHED
+0.6886:          Flow 1 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+0.6886:          Flow 1 (TCP connection): ACK_FROM_TAP_DUE
+0.6886:          Flow 1 (TCP connection): timer expires in 1.000s
+0.6886:          Flow 1 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+0.6886:          Flow 1 (TCP connection): Side 0 hash table remove: bucket: 277245
+0.6887:          Flow 1 (FREE): ACTIVE -> FREE
+0.6887:          Flow 1 (FREE):     TAP [2001:db8::7]:49344 -> [2606:4700:10::ac42:ad95]:443 => HOST [::]:0 -> [2606:4700:10::ac42:ad95]:443
+0.6887:          Flow 3 (TCP connection): ACK_TO_TAP_DUE
+0.6887:          Flow 2 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+0.6887:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE
+0.6887:          Flow 2 (TCP connection): timer expires in 1.000s
+0.6887:          Flow 2 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+0.6887:          Flow 2 (TCP connection): Side 0 hash table remove: bucket: 124438
+0.6887:          Flow 2 (FREE): ACTIVE -> FREE
+0.6887:          Flow 2 (FREE):     TAP [198.51.100.7]:40178 -> [172.66.173.149]:443 => HOST [0.0.0.0]:0 -> [172.66.173.149]:443
+0.6895:          Flow 4 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+0.6895:          Flow 4 (TCP connection): ACK_FROM_TAP_DUE
+0.6895:          Flow 4 (TCP connection): timer expires in 1.000s
+0.6895:          Flow 4 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+0.6895:          Flow 4 (TCP connection): Side 0 hash table remove: bucket: 256789
+0.6895:          Flow 4 (FREE): ACTIVE -> FREE
+0.6895:          Flow 4 (FREE):     TAP [2001:db8::7]:45592 -> [2606:4700:10::6814:2011]:443 => HOST [::]:0 -> [2606:4700:10::6814:2011]:443
+0.6951:          Flow 3 (TCP connection): ACK_TO_TAP_DUE dropped
+0.6951:          Flow 3 (TCP connection): timer expires in 0.000s
+0.7048:          Flow 3 (TCP connection): ACK_FROM_TAP_DUE
+0.7048:          Flow 3 (TCP connection): timer expires in 1.000s
+0.7048:          Flow 3 (TCP connection): STALLED
+0.7048:          Flow 3 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.7048:          Flow 3 (TCP connection): STALLED dropped
+0.7054:          Flow 3 (TCP connection): ACK_TO_TAP_DUE
+0.7504:          Flow 3 (TCP connection): ACK_TO_TAP_DUE dropped
+0.7504:          Flow 3 (TCP connection): timer expires in 0.000s
+0.7625:          Flow 3 (TCP connection): ACK_FROM_TAP_DUE
+0.7625:          Flow 3 (TCP connection): timer expires in 1.000s
+0.7625:          Flow 3 (TCP connection): STALLED
+0.8030:          Flow 3 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.8030:          Flow 3 (TCP connection): STALLED dropped
+0.9127:          Flow 1 (NEW): FREE -> NEW
+0.9127:          Flow 1 (INI): NEW -> INI
+0.9127:          Flow 1 (INI):     TAP [198.51.100.7]:59425 -> [169.254.1.1]:53 => ?
+0.9127:          Flow 1 (TGT): INI -> TGT
+0.9127:          Flow 1 (TGT):     TAP [198.51.100.7]:59425 -> [169.254.1.1]:53 => HOST [0.0.0.0]:59425 -> [127.0.0.53]:53
+0.9127:          Flow 1 (UDP flow): TGT -> TYPED
+0.9127:          Flow 1 (UDP flow):     TAP [198.51.100.7]:59425 -> [169.254.1.1]:53 => HOST [0.0.0.0]:59425 -> [127.0.0.53]:53
+0.9128:          Flow 1 (UDP flow): Side 0 hash table insert: bucket: 263925
+0.9128:          Flow 1 (UDP flow): Side 1 hash table insert: bucket: 136662
+0.9128:          Flow 1 (UDP flow): TYPED -> ACTIVE
+0.9128:          Flow 1 (UDP flow):     TAP [198.51.100.7]:59425 -> [169.254.1.1]:53 => HOST [127.0.0.1]:59425 -> [127.0.0.53]:53
+0.9170:          Flow 2 (NEW): FREE -> NEW
+0.9170:          Flow 2 (INI): NEW -> INI
+0.9170:          Flow 2 (INI):     TAP [198.51.100.7]:59092 -> [140.82.112.21]:443 => ?
+0.9170:          Flow 2 (TGT): INI -> TGT
+0.9171:          Flow 2 (TGT):     TAP [198.51.100.7]:59092 -> [140.82.112.21]:443 => HOST [0.0.0.0]:0 -> [140.82.112.21]:443
+0.9171:          Flow 2 (TCP connection): TGT -> TYPED
+0.9171:          Flow 2 (TCP connection):     TAP [198.51.100.7]:59092 -> [140.82.112.21]:443 => HOST [0.0.0.0]:0 -> [140.82.112.21]:443
+0.9171:          Flow 2 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+0.9171:          Flow 2 (TCP connection): Side 0 hash table insert: bucket: 234639
+0.9171:          Flow 2 (TCP connection): TYPED -> ACTIVE
+0.9171:          Flow 2 (TCP connection):     TAP [198.51.100.7]:59092 -> [140.82.112.21]:443 => HOST [0.0.0.0]:0 -> [140.82.112.21]:443
+0.9270:          Flow 2 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+0.9270:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE
+0.9270:          Flow 2 (TCP connection): timer expires in 1.000s
+0.9270:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.9270:          Flow 2 (TCP connection): ESTABLISHED: SYN_RCVD -> ESTABLISHED
+0.9272:          Flow 2 (TCP connection): ACK_TO_TAP_DUE
+0.9401:          Flow 2 (TCP connection): ACK_TO_TAP_DUE dropped
+0.9401:          Flow 2 (TCP connection): timer expires in 0.000s
+0.9404:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE
+0.9404:          Flow 2 (TCP connection): timer expires in 1.000s
+0.9404:          Flow 2 (TCP connection): timer expires in 1.000s
+0.9404:          Flow 2 (TCP connection): timer expires in 1.000s
+0.9404:          Flow 2 (TCP connection): STALLED
+0.9404:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.9404:          Flow 2 (TCP connection): STALLED dropped
+0.9480:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE
+0.9480:          Flow 2 (TCP connection): timer expires in 1.000s
+0.9480:          Flow 2 (TCP connection): STALLED
+0.9480:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.9480:          Flow 2 (TCP connection): STALLED dropped
+0.9487:          Flow 2 (TCP connection): ACK_TO_TAP_DUE
+0.9584:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE
+0.9585:          Flow 2 (TCP connection): STALLED
+0.9617:          Flow 2 (TCP connection): ACK_TO_TAP_DUE dropped
+0.9617:          Flow 2 (TCP connection): timer expires in 1.000s
+0.9617:          Flow 2 (TCP connection): timer expires in 1.000s
+0.9989:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.9990:          Flow 2 (TCP connection): STALLED dropped
+1.0251:          TCP inactivity scan
+1.1039:          Flow 4 (NEW): FREE -> NEW
+1.1039:          Flow 4 (INI): NEW -> INI
+1.1039:          Flow 4 (INI):     TAP [198.51.100.7]:42639 -> [169.254.1.1]:53 => ?
+1.1039:          Flow 4 (TGT): INI -> TGT
+1.1039:          Flow 4 (TGT):     TAP [198.51.100.7]:42639 -> [169.254.1.1]:53 => HOST [0.0.0.0]:42639 -> [127.0.0.53]:53
+1.1039:          Flow 4 (UDP flow): TGT -> TYPED
+1.1039:          Flow 4 (UDP flow):     TAP [198.51.100.7]:42639 -> [169.254.1.1]:53 => HOST [0.0.0.0]:42639 -> [127.0.0.53]:53
+1.1039:          Flow 4 (UDP flow): Side 0 hash table insert: bucket: 104330
+1.1039:          Flow 4 (UDP flow): Side 1 hash table insert: bucket: 4393
+1.1039:          Flow 4 (UDP flow): TYPED -> ACTIVE
+1.1039:          Flow 4 (UDP flow):     TAP [198.51.100.7]:42639 -> [169.254.1.1]:53 => HOST [127.0.0.1]:42639 -> [127.0.0.53]:53
+1.1042:          Flow 5 (NEW): FREE -> NEW
+1.1042:          Flow 5 (INI): NEW -> INI
+1.1042:          Flow 5 (INI):     TAP [198.51.100.7]:49988 -> [140.82.112.3]:443 => ?
+1.1042:          Flow 5 (TGT): INI -> TGT
+1.1042:          Flow 5 (TGT):     TAP [198.51.100.7]:49988 -> [140.82.112.3]:443 => HOST [0.0.0.0]:0 -> [140.82.112.3]:443
+1.1042:          Flow 5 (TCP connection): TGT -> TYPED
+1.1042:          Flow 5 (TCP connection):     TAP [198.51.100.7]:49988 -> [140.82.112.3]:443 => HOST [0.0.0.0]:0 -> [140.82.112.3]:443
+1.1042:          Flow 5 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.1042:          Flow 5 (TCP connection): Side 0 hash table insert: bucket: 66400
+1.1043:          Flow 5 (TCP connection): TYPED -> ACTIVE
+1.1043:          Flow 5 (TCP connection):     TAP [198.51.100.7]:49988 -> [140.82.112.3]:443 => HOST [0.0.0.0]:0 -> [140.82.112.3]:443
+1.1152:          Flow 5 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.1152:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE
+1.1152:          Flow 5 (TCP connection): timer expires in 1.000s
+1.1152:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.1152:          Flow 5 (TCP connection): ESTABLISHED: SYN_RCVD -> ESTABLISHED
+1.1160:          Flow 5 (TCP connection): ACK_TO_TAP_DUE
+1.1261:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE
+1.1261:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1261:          Flow 2 (TCP connection): STALLED
+1.1262:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.1262:          Flow 2 (TCP connection): STALLED dropped
+1.1288:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE
+1.1288:          Flow 5 (TCP connection): STALLED
+1.1288:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.1288:          Flow 5 (TCP connection): ACK_TO_TAP_DUE dropped
+1.1288:          Flow 5 (TCP connection): STALLED dropped
+1.1290:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE
+1.1290:          Flow 5 (TCP connection): timer expires in 1.000s
+1.1290:          Flow 5 (TCP connection): STALLED
+1.1290:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.1290:          Flow 5 (TCP connection): STALLED dropped
+1.1299:          Flow 5 (TCP connection): ACK_TO_TAP_DUE
+1.1358:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE
+1.1358:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1358:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1359:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1359:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1359:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1359:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1359:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1359:          Flow 2 (TCP connection): STALLED
+1.1359:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.1359:          Flow 2 (TCP connection): STALLED dropped
+1.1416:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE
+1.1417:          Flow 5 (TCP connection): STALLED
+1.1448:          Flow 5 (TCP connection): ACK_TO_TAP_DUE dropped
+1.1449:          Flow 5 (TCP connection): timer expires in 1.000s
+1.1449:          Flow 5 (TCP connection): timer expires in 1.000s
+1.1504:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE
+1.1504:          Flow 2 (TCP connection): timer expires in 1.000s
+1.1505:          Flow 2 (TCP connection): STALLED
+1.1505:          Flow 2 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.1505:          Flow 2 (TCP connection): STALLED dropped
+1.1820:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.1820:          Flow 5 (TCP connection): STALLED dropped
+1.2174:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE
+1.2174:          Flow 5 (TCP connection): timer expires in 1.000s
+1.2175:          Flow 5 (TCP connection): STALLED
+1.2176:          Flow 5 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2176:          Flow 5 (TCP connection): STALLED dropped
+1.2179:          Flow 6 (NEW): FREE -> NEW
+1.2179:          Flow 6 (INI): NEW -> INI
+1.2179:          Flow 6 (INI):     TAP [198.51.100.7]:57247 -> [169.254.1.1]:53 => ?
+1.2179:          Flow 6 (TGT): INI -> TGT
+1.2179:          Flow 6 (TGT):     TAP [198.51.100.7]:57247 -> [169.254.1.1]:53 => HOST [0.0.0.0]:57247 -> [127.0.0.53]:53
+1.2179:          Flow 6 (UDP flow): TGT -> TYPED
+1.2179:          Flow 6 (UDP flow):     TAP [198.51.100.7]:57247 -> [169.254.1.1]:53 => HOST [0.0.0.0]:57247 -> [127.0.0.53]:53
+1.2180:          Flow 6 (UDP flow): Side 0 hash table insert: bucket: 56993
+1.2180:          Flow 6 (UDP flow): Side 1 hash table insert: bucket: 194914
+1.2180:          Flow 6 (UDP flow): TYPED -> ACTIVE
+1.2180:          Flow 6 (UDP flow):     TAP [198.51.100.7]:57247 -> [169.254.1.1]:53 => HOST [127.0.0.1]:57247 -> [127.0.0.53]:53
+1.2225:          Flow 7 (NEW): FREE -> NEW
+1.2225:          Flow 7 (INI): NEW -> INI
+1.2225:          Flow 7 (INI):     TAP [198.51.100.7]:40696 -> [185.199.109.133]:443 => ?
+1.2225:          Flow 7 (TGT): INI -> TGT
+1.2225:          Flow 7 (TGT):     TAP [198.51.100.7]:40696 -> [185.199.109.133]:443 => HOST [0.0.0.0]:0 -> [185.199.109.133]:443
+1.2226:          Flow 7 (TCP connection): TGT -> TYPED
+1.2226:          Flow 7 (TCP connection):     TAP [198.51.100.7]:40696 -> [185.199.109.133]:443 => HOST [0.0.0.0]:0 -> [185.199.109.133]:443
+1.2226:          Flow 7 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.2226:          Flow 7 (TCP connection): Side 0 hash table insert: bucket: 325936
+1.2226:          Flow 7 (TCP connection): TYPED -> ACTIVE
+1.2226:          Flow 7 (TCP connection):     TAP [198.51.100.7]:40696 -> [185.199.109.133]:443 => HOST [0.0.0.0]:0 -> [185.199.109.133]:443
+1.2226:          Flow 8 (NEW): FREE -> NEW
+1.2226:          Flow 8 (INI): NEW -> INI
+1.2226:          Flow 8 (INI):     TAP [198.51.100.7]:35412 -> [185.199.110.133]:443 => ?
+1.2226:          Flow 8 (TGT): INI -> TGT
+1.2226:          Flow 8 (TGT):     TAP [198.51.100.7]:35412 -> [185.199.110.133]:443 => HOST [0.0.0.0]:0 -> [185.199.110.133]:443
+1.2226:          Flow 8 (TCP connection): TGT -> TYPED
+1.2226:          Flow 8 (TCP connection):     TAP [198.51.100.7]:35412 -> [185.199.110.133]:443 => HOST [0.0.0.0]:0 -> [185.199.110.133]:443
+1.2227:          Flow 8 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.2227:          Flow 8 (TCP connection): Side 0 hash table insert: bucket: 296582
+1.2227:          Flow 8 (TCP connection): TYPED -> ACTIVE
+1.2227:          Flow 8 (TCP connection):     TAP [198.51.100.7]:35412 -> [185.199.110.133]:443 => HOST [0.0.0.0]:0 -> [185.199.110.133]:443
+1.2227:          Flow 9 (NEW): FREE -> NEW
+1.2227:          Flow 9 (INI): NEW -> INI
+1.2227:          Flow 9 (INI):     TAP [198.51.100.7]:55588 -> [185.199.111.133]:443 => ?
+1.2227:          Flow 9 (TGT): INI -> TGT
+1.2227:          Flow 9 (TGT):     TAP [198.51.100.7]:55588 -> [185.199.111.133]:443 => HOST [0.0.0.0]:0 -> [185.199.111.133]:443
+1.2227:          Flow 9 (TCP connection): TGT -> TYPED
+1.2227:          Flow 9 (TCP connection):     TAP [198.51.100.7]:55588 -> [185.199.111.133]:443 => HOST [0.0.0.0]:0 -> [185.199.111.133]:443
+1.2227:          Flow 9 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.2227:          Flow 9 (TCP connection): Side 0 hash table insert: bucket: 261510
+1.2227:          Flow 9 (TCP connection): TYPED -> ACTIVE
+1.2227:          Flow 9 (TCP connection):     TAP [198.51.100.7]:55588 -> [185.199.111.133]:443 => HOST [0.0.0.0]:0 -> [185.199.111.133]:443
+1.2227:          Flow 10 (NEW): FREE -> NEW
+1.2227:          Flow 10 (INI): NEW -> INI
+1.2227:          Flow 10 (INI):     TAP [198.51.100.7]:52618 -> [185.199.108.133]:443 => ?
+1.2227:          Flow 10 (TGT): INI -> TGT
+1.2227:          Flow 10 (TGT):     TAP [198.51.100.7]:52618 -> [185.199.108.133]:443 => HOST [0.0.0.0]:0 -> [185.199.108.133]:443
+1.2227:          Flow 10 (TCP connection): TGT -> TYPED
+1.2227:          Flow 10 (TCP connection):     TAP [198.51.100.7]:52618 -> [185.199.108.133]:443 => HOST [0.0.0.0]:0 -> [185.199.108.133]:443
+1.2227:          Flow 10 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.2227:          Flow 10 (TCP connection): Side 0 hash table insert: bucket: 325642
+1.2227:          Flow 10 (TCP connection): TYPED -> ACTIVE
+1.2227:          Flow 10 (TCP connection):     TAP [198.51.100.7]:52618 -> [185.199.108.133]:443 => HOST [0.0.0.0]:0 -> [185.199.108.133]:443
+1.2264:          Flow 10 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.2264:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2265:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2265:          Flow 7 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.2265:          Flow 7 (TCP connection): ACK_FROM_TAP_DUE
+1.2265:          Flow 7 (TCP connection): timer expires in 1.000s
+1.2266:          Flow 9 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.2266:          Flow 9 (TCP connection): ACK_FROM_TAP_DUE
+1.2266:          Flow 9 (TCP connection): timer expires in 1.000s
+1.2266:          Flow 8 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.2266:          Flow 8 (TCP connection): ACK_FROM_TAP_DUE
+1.2266:          Flow 8 (TCP connection): timer expires in 1.000s
+1.2266:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2266:          Flow 10 (TCP connection): ESTABLISHED: SYN_RCVD -> ESTABLISHED
+1.2267:          Flow 7 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+1.2267:          Flow 7 (TCP connection): Side 0 hash table remove: bucket: 325936
+1.2267:          Flow 9 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+1.2267:          Flow 9 (TCP connection): Side 0 hash table remove: bucket: 261510
+1.2267:          Flow 8 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+1.2267:          Flow 8 (TCP connection): Side 0 hash table remove: bucket: 296582
+1.2268:          Flow 7 (FREE): ACTIVE -> FREE
+1.2268:          Flow 7 (FREE):     TAP [198.51.100.7]:40696 -> [185.199.109.133]:443 => HOST [0.0.0.0]:0 -> [185.199.109.133]:443
+1.2268:          Flow 8 (FREE): ACTIVE -> FREE
+1.2268:          Flow 8 (FREE):     TAP [198.51.100.7]:35412 -> [185.199.110.133]:443 => HOST [0.0.0.0]:0 -> [185.199.110.133]:443
+1.2268:          Flow 9 (FREE): ACTIVE -> FREE
+1.2268:          Flow 9 (FREE):     TAP [198.51.100.7]:55588 -> [185.199.111.133]:443 => HOST [0.0.0.0]:0 -> [185.199.111.133]:443
+1.2270:          Flow 10 (TCP connection): ACK_TO_TAP_DUE
+1.2448:          Flow 10 (TCP connection): ACK_TO_TAP_DUE dropped
+1.2448:          Flow 10 (TCP connection): timer expires in 0.000s
+1.2592:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2593:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2593:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2594:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2594:          Flow 10 (TCP connection): STALLED
+1.2594:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2594:          Flow 10 (TCP connection): STALLED dropped
+1.2609:          Flow 10 (TCP connection): ACK_TO_TAP_DUE
+1.2642:          Flow 10 (TCP connection): ACK_TO_TAP_DUE dropped
+1.2642:          Flow 10 (TCP connection): timer expires in 0.000s
+1.2734:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2734:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2735:          Flow 10 (TCP connection): STALLED
+1.2741:          Flow 10 (TCP connection): STALLED dropped
+1.2741:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2742:          Flow 10 (TCP connection): STALLED
+1.2742:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2742:          Flow 10 (TCP connection): STALLED dropped
+1.2751:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2751:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2751:          Flow 10 (TCP connection): STALLED
+1.2761:          Flow 10 (TCP connection): STALLED dropped
+1.2761:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2761:          Flow 10 (TCP connection): STALLED
+1.2761:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2761:          Flow 10 (TCP connection): STALLED dropped
+1.2771:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2771:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2772:          Flow 10 (TCP connection): STALLED
+1.2780:          Flow 10 (TCP connection): STALLED dropped
+1.2780:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2781:          Flow 10 (TCP connection): STALLED
+1.2781:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2781:          Flow 10 (TCP connection): STALLED dropped
+1.2791:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2792:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2792:          Flow 10 (TCP connection): STALLED
+1.2798:          Flow 10 (TCP connection): STALLED dropped
+1.2798:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2799:          Flow 10 (TCP connection): STALLED
+1.2799:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2799:          Flow 10 (TCP connection): STALLED dropped
+1.2808:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2808:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2808:          Flow 10 (TCP connection): STALLED
+1.2820:          Flow 10 (TCP connection): STALLED dropped
+1.2821:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2821:          Flow 10 (TCP connection): STALLED
+1.2821:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2821:          Flow 10 (TCP connection): STALLED dropped
+1.2831:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2832:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2832:          Flow 10 (TCP connection): STALLED
+1.2832:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2832:          Flow 10 (TCP connection): STALLED dropped
+1.2841:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2841:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2841:          Flow 10 (TCP connection): STALLED
+1.2847:          Flow 10 (TCP connection): STALLED dropped
+1.2847:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2848:          Flow 10 (TCP connection): STALLED
+1.2849:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2849:          Flow 10 (TCP connection): STALLED dropped
+1.2853:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2853:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2853:          Flow 10 (TCP connection): STALLED
+1.2862:          Flow 10 (TCP connection): STALLED dropped
+1.2862:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2863:          Flow 10 (TCP connection): STALLED
+1.2863:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2863:          Flow 10 (TCP connection): STALLED dropped
+1.2871:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2871:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2872:          Flow 10 (TCP connection): STALLED
+1.2877:          Flow 10 (TCP connection): STALLED dropped
+1.2877:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2878:          Flow 10 (TCP connection): STALLED
+1.2878:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2878:          Flow 10 (TCP connection): STALLED dropped
+1.2886:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2886:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2886:          Flow 10 (TCP connection): STALLED
+1.2890:          Flow 10 (TCP connection): STALLED dropped
+1.2890:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2890:          Flow 10 (TCP connection): STALLED
+1.2890:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2890:          Flow 10 (TCP connection): STALLED dropped
+1.2893:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2893:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2893:          Flow 10 (TCP connection): STALLED
+1.2894:          Flow 10 (TCP connection): STALLED dropped
+1.2894:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2895:          Flow 10 (TCP connection): STALLED
+1.2895:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2895:          Flow 10 (TCP connection): STALLED dropped
+1.2899:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2899:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2899:          Flow 10 (TCP connection): STALLED
+1.2901:          Flow 10 (TCP connection): STALLED dropped
+1.2901:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2902:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2902:          Flow 10 (TCP connection): STALLED
+1.2902:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2902:          Flow 10 (TCP connection): STALLED dropped
+1.2902:          Flow 10 (TCP connection): STALLED
+1.2904:          Flow 10 (TCP connection): STALLED dropped
+1.2904:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2905:          Flow 10 (TCP connection): STALLED
+1.2905:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2905:          Flow 10 (TCP connection): STALLED dropped
+1.2907:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2907:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2907:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2907:          Flow 10 (TCP connection): STALLED
+1.2907:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2907:          Flow 10 (TCP connection): STALLED dropped
+1.2936:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2936:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2936:          Flow 10 (TCP connection): STALLED
+1.2938:          Flow 10 (TCP connection): STALLED dropped
+1.2938:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2939:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2939:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2939:          Flow 10 (TCP connection): STALLED
+1.2941:          Flow 10 (TCP connection): STALLED dropped
+1.2942:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2942:          Flow 10 (TCP connection): STALLED
+1.2942:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2942:          Flow 10 (TCP connection): STALLED dropped
+1.2944:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2944:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2944:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2944:          Flow 10 (TCP connection): STALLED
+1.2945:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2945:          Flow 10 (TCP connection): STALLED dropped
+1.2947:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2947:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2948:          Flow 10 (TCP connection): STALLED
+1.2949:          Flow 10 (TCP connection): STALLED dropped
+1.2949:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2950:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2950:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2950:          Flow 10 (TCP connection): STALLED
+1.2952:          Flow 10 (TCP connection): STALLED dropped
+1.2952:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2953:          Flow 10 (TCP connection): STALLED
+1.2953:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2953:          Flow 10 (TCP connection): STALLED dropped
+1.2955:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2955:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2955:          Flow 10 (TCP connection): STALLED
+1.2958:          Flow 10 (TCP connection): STALLED dropped
+1.2958:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2958:          Flow 10 (TCP connection): STALLED
+1.2958:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2958:          Flow 10 (TCP connection): STALLED dropped
+1.2961:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2961:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2961:          Flow 10 (TCP connection): STALLED
+1.2963:          Flow 10 (TCP connection): STALLED dropped
+1.2963:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2963:          Flow 10 (TCP connection): STALLED
+1.2964:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2964:          Flow 10 (TCP connection): STALLED dropped
+1.2966:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2966:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2967:          Flow 10 (TCP connection): STALLED
+1.2969:          Flow 10 (TCP connection): STALLED dropped
+1.2969:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2969:          Flow 10 (TCP connection): STALLED
+1.2969:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2969:          Flow 10 (TCP connection): STALLED dropped
+1.2971:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2971:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2972:          Flow 10 (TCP connection): STALLED
+1.2974:          Flow 10 (TCP connection): STALLED dropped
+1.2974:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2974:          Flow 10 (TCP connection): STALLED
+1.2974:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2974:          Flow 10 (TCP connection): STALLED dropped
+1.2977:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2977:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2977:          Flow 10 (TCP connection): STALLED
+1.2979:          Flow 10 (TCP connection): STALLED dropped
+1.2979:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2980:          Flow 10 (TCP connection): STALLED
+1.2980:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2980:          Flow 10 (TCP connection): STALLED dropped
+1.2983:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2983:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2983:          Flow 10 (TCP connection): STALLED
+1.2985:          Flow 10 (TCP connection): STALLED dropped
+1.2985:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2985:          Flow 10 (TCP connection): STALLED
+1.2985:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2985:          Flow 10 (TCP connection): STALLED dropped
+1.2988:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2988:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2988:          Flow 10 (TCP connection): STALLED
+1.2990:          Flow 10 (TCP connection): STALLED dropped
+1.2990:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2991:          Flow 10 (TCP connection): STALLED
+1.2991:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2991:          Flow 10 (TCP connection): STALLED dropped
+1.2994:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2994:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2994:          Flow 10 (TCP connection): STALLED
+1.2996:          Flow 10 (TCP connection): STALLED dropped
+1.2996:          Flow 10 (TCP connection): timer expires in 1.000s
+1.2996:          Flow 10 (TCP connection): STALLED
+1.2996:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.2996:          Flow 10 (TCP connection): STALLED dropped
+1.2999:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.2999:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3000:          Flow 10 (TCP connection): STALLED
+1.3002:          Flow 10 (TCP connection): STALLED dropped
+1.3002:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3004:          Flow 10 (TCP connection): STALLED
+1.3004:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.3004:          Flow 10 (TCP connection): STALLED dropped
+1.3005:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.3005:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3006:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3006:          Flow 10 (TCP connection): STALLED
+1.3007:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.3007:          Flow 10 (TCP connection): STALLED dropped
+1.3008:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.3008:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3008:          Flow 10 (TCP connection): STALLED
+1.3011:          Flow 10 (TCP connection): STALLED dropped
+1.3011:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3012:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3012:          Flow 10 (TCP connection): STALLED
+1.3012:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3012:          Flow 10 (TCP connection): STALLED dropped
+1.3012:          Flow 10 (TCP connection): STALLED
+1.3014:          Flow 10 (TCP connection): STALLED dropped
+1.3014:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3014:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3014:          Flow 10 (TCP connection): STALLED
+1.3014:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3014:          Flow 10 (TCP connection): STALLED dropped
+1.3014:          Flow 10 (TCP connection): STALLED
+1.3017:          Flow 10 (TCP connection): STALLED dropped
+1.3017:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3017:          Flow 10 (TCP connection): STALLED
+1.3017:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.3017:          Flow 10 (TCP connection): STALLED dropped
+1.3020:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE
+1.3020:          Flow 10 (TCP connection): timer expires in 1.000s
+1.3020:          Flow 10 (TCP connection): STALLED
+1.3219:          Flow 7 (NEW): FREE -> NEW
+1.3219:          Flow 7 (INI): NEW -> INI
+1.3219:          Flow 7 (INI):     TAP [198.51.100.7]:49856 -> [169.254.1.1]:53 => ?
+1.3219:          Flow 7 (TGT): INI -> TGT
+1.3219:          Flow 7 (TGT):     TAP [198.51.100.7]:49856 -> [169.254.1.1]:53 => HOST [0.0.0.0]:49856 -> [127.0.0.53]:53
+1.3219:          Flow 7 (UDP flow): TGT -> TYPED
+1.3219:          Flow 7 (UDP flow):     TAP [198.51.100.7]:49856 -> [169.254.1.1]:53 => HOST [0.0.0.0]:49856 -> [127.0.0.53]:53
+1.3219:          Flow 7 (UDP flow): Side 0 hash table insert: bucket: 277953
+1.3219:          Flow 7 (UDP flow): Side 1 hash table insert: bucket: 193400
+1.3219:          Flow 7 (UDP flow): TYPED -> ACTIVE
+1.3219:          Flow 7 (UDP flow):     TAP [198.51.100.7]:49856 -> [169.254.1.1]:53 => HOST [127.0.0.1]:49856 -> [127.0.0.53]:53
+1.3274:          Flow 8 (NEW): FREE -> NEW
+1.3274:          Flow 8 (INI): NEW -> INI
+1.3274:          Flow 8 (INI):     TAP [2001:db8::7]:38294 -> [2606:50c0:8003::154]:443 => ?
+1.3274:          Flow 8 (TGT): INI -> TGT
+1.3275:          Flow 8 (TGT):     TAP [2001:db8::7]:38294 -> [2606:50c0:8003::154]:443 => HOST [::]:0 -> [2606:50c0:8003::154]:443
+1.3275:          Flow 8 (TCP connection): TGT -> TYPED
+1.3275:          Flow 8 (TCP connection):     TAP [2001:db8::7]:38294 -> [2606:50c0:8003::154]:443 => HOST [::]:0 -> [2606:50c0:8003::154]:443
+1.3275:          Flow 8 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.3275:          Flow 8 (TCP connection): Side 0 hash table insert: bucket: 189691
+1.3275:          Flow 8 (TCP connection): TYPED -> ACTIVE
+1.3275:          Flow 8 (TCP connection):     TAP [2001:db8::7]:38294 -> [2606:50c0:8003::154]:443 => HOST [::]:0 -> [2606:50c0:8003::154]:443
+1.3275:          Flow 9 (NEW): FREE -> NEW
+1.3275:          Flow 9 (INI): NEW -> INI
+1.3275:          Flow 9 (INI):     TAP [198.51.100.7]:40716 -> [185.199.109.133]:443 => ?
+1.3276:          Flow 9 (TGT): INI -> TGT
+1.3276:          Flow 9 (TGT):     TAP [198.51.100.7]:40716 -> [185.199.109.133]:443 => HOST [0.0.0.0]:0 -> [185.199.109.133]:443
+1.3276:          Flow 9 (TCP connection): TGT -> TYPED
+1.3276:          Flow 9 (TCP connection):     TAP [198.51.100.7]:40716 -> [185.199.109.133]:443 => HOST [0.0.0.0]:0 -> [185.199.109.133]:443
+1.3276:          Flow 9 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.3276:          Flow 9 (TCP connection): Side 0 hash table insert: bucket: 13717
+1.3276:          Flow 9 (TCP connection): TYPED -> ACTIVE
+1.3276:          Flow 9 (TCP connection):     TAP [198.51.100.7]:40716 -> [185.199.109.133]:443 => HOST [0.0.0.0]:0 -> [185.199.109.133]:443
+1.3276:          Flow 11 (NEW): FREE -> NEW
+1.3276:          Flow 11 (INI): NEW -> INI
+1.3276:          Flow 11 (INI):     TAP [198.51.100.7]:55600 -> [185.199.111.133]:443 => ?
+1.3276:          Flow 11 (TGT): INI -> TGT
+1.3276:          Flow 11 (TGT):     TAP [198.51.100.7]:55600 -> [185.199.111.133]:443 => HOST [0.0.0.0]:0 -> [185.199.111.133]:443
+1.3276:          Flow 11 (TCP connection): TGT -> TYPED
+1.3276:          Flow 11 (TCP connection):     TAP [198.51.100.7]:55600 -> [185.199.111.133]:443 => HOST [0.0.0.0]:0 -> [185.199.111.133]:443
+1.3276:          Flow 11 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.3276:          Flow 11 (TCP connection): Side 0 hash table insert: bucket: 280556
+1.3276:          Flow 11 (TCP connection): TYPED -> ACTIVE
+1.3276:          Flow 11 (TCP connection):     TAP [198.51.100.7]:55600 -> [185.199.111.133]:443 => HOST [0.0.0.0]:0 -> [185.199.111.133]:443
+1.3276:          Flow 12 (NEW): FREE -> NEW
+1.3276:          Flow 12 (INI): NEW -> INI
+1.3276:          Flow 12 (INI):     TAP [2001:db8::7]:36704 -> [2606:50c0:8001::154]:443 => ?
+1.3276:          Flow 12 (TGT): INI -> TGT
+1.3276:          Flow 12 (TGT):     TAP [2001:db8::7]:36704 -> [2606:50c0:8001::154]:443 => HOST [::]:0 -> [2606:50c0:8001::154]:443
+1.3276:          Flow 12 (TCP connection): TGT -> TYPED
+1.3276:          Flow 12 (TCP connection):     TAP [2001:db8::7]:36704 -> [2606:50c0:8001::154]:443 => HOST [::]:0 -> [2606:50c0:8001::154]:443
+1.3276:          Flow 12 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+1.3276:          Flow 12 (TCP connection): Side 0 hash table insert: bucket: 206072
+1.3277:          Flow 12 (TCP connection): TYPED -> ACTIVE
+1.3277:          Flow 12 (TCP connection):     TAP [2001:db8::7]:36704 -> [2606:50c0:8001::154]:443 => HOST [::]:0 -> [2606:50c0:8001::154]:443
+1.3308:          Flow 9 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.3308:          Flow 9 (TCP connection): ACK_FROM_TAP_DUE
+1.3308:          Flow 9 (TCP connection): timer expires in 1.000s
+1.3308:          Flow 8 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.3308:          Flow 8 (TCP connection): ACK_FROM_TAP_DUE
+1.3309:          Flow 8 (TCP connection): timer expires in 1.000s
+1.3309:          Flow 9 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.3309:          Flow 9 (TCP connection): ESTABLISHED: SYN_RCVD -> ESTABLISHED
+1.3310:          Flow 8 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+1.3310:          Flow 8 (TCP connection): Side 0 hash table remove: bucket: 189691
+1.3310:          Flow 12 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.3310:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+1.3310:          Flow 12 (TCP connection): timer expires in 1.000s
+1.3311:          Flow 11 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+1.3311:          Flow 11 (TCP connection): ACK_FROM_TAP_DUE
+1.3311:          Flow 11 (TCP connection): timer expires in 1.000s
+1.3313:          Flow 8 (FREE): ACTIVE -> FREE
+1.3313:          Flow 8 (FREE):     TAP [2001:db8::7]:38294 -> [2606:50c0:8003::154]:443 => HOST [::]:0 -> [2606:50c0:8003::154]:443
+1.3313:          Flow 11 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+1.3313:          Flow 11 (TCP connection): Side 0 hash table remove: bucket: 280556
+1.3314:          Flow 9 (TCP connection): ACK_TO_TAP_DUE
+1.3314:          Flow 12 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+1.3314:          Flow 12 (TCP connection): Side 0 hash table remove: bucket: 206072
+1.3315:          Flow 11 (FREE): ACTIVE -> FREE
+1.3315:          Flow 11 (FREE):     TAP [198.51.100.7]:55600 -> [185.199.111.133]:443 => HOST [0.0.0.0]:0 -> [185.199.111.133]:443
+1.3315:          Flow 12 (FREE): ACTIVE -> FREE
+1.3315:          Flow 12 (FREE):     TAP [2001:db8::7]:36704 -> [2606:50c0:8001::154]:443 => HOST [::]:0 -> [2606:50c0:8001::154]:443
+1.3380:          Flow 9 (TCP connection): ACK_TO_TAP_DUE dropped
+1.3381:          Flow 9 (TCP connection): timer expires in 0.000s
+1.3398:          Flow 9 (TCP connection): ACK_FROM_TAP_DUE
+1.3399:          Flow 9 (TCP connection): timer expires in 1.000s
+1.3400:          Flow 9 (TCP connection): STALLED
+1.3400:          Flow 9 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.3400:          Flow 9 (TCP connection): STALLED dropped
+1.3418:          Flow 9 (TCP connection): ACK_TO_TAP_DUE
+1.3430:          Flow 10 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.3430:          Flow 10 (TCP connection): STALLED dropped
+1.3451:          Flow 9 (TCP connection): ACK_TO_TAP_DUE dropped
+1.3451:          Flow 9 (TCP connection): timer expires in 0.000s
+1.3670:          Flow 9 (TCP connection): ACK_FROM_TAP_DUE
+1.3670:          Flow 9 (TCP connection): timer expires in 1.000s
+1.3671:          Flow 9 (TCP connection): STALLED
+1.4080:          Flow 9 (TCP connection): ACK_FROM_TAP_DUE dropped
+1.4080:          Flow 9 (TCP connection): STALLED dropped
+740.9544:          Flow 0 (TCP connection (spliced)): FIN_RCVD_0
+740.9545:          Flow 0 (TCP connection (spliced)): FIN_SENT_1
+740.9545:          Flow 0 (TCP connection (spliced)): RCVLOWAT_ACT_1
+740.9545:          Flow 0 (TCP connection (spliced)): CLOSED
+740.9546:          Flow 0 (FREE): ACTIVE -> FREE
+740.9546:          Flow 0 (FREE):     HOST [127.0.0.1]:51982 -> [127.65.81.1]:24700 => SPLICE [0.0.0.0]:0 -> [198.51.100.7]:24700
+740.9546:          Flow 0 (NEW): FREE -> NEW
+740.9547:          Flow 0 (INI): NEW -> INI
+740.9547:          Flow 0 (INI):     HOST [127.0.0.1]:38982 -> [0.0.0.0]:24700 => ?
+740.9547:          Flow 0 (TGT): INI -> TGT
+740.9547:          Flow 0 (TGT):     HOST [127.0.0.1]:38982 -> [127.65.81.1]:24700 => SPLICE [0.0.0.0]:0 -> [198.51.100.7]:24700
+740.9547:          Flow 0 (TCP connection (spliced)): TGT -> TYPED
+740.9547:          Flow 0 (TCP connection (spliced)):     HOST [127.0.0.1]:38982 -> [127.65.81.1]:24700 => SPLICE [0.0.0.0]:0 -> [198.51.100.7]:24700
+740.9548:          Flow 0 (TCP connection (spliced)): SPLICE_CONNECT
+740.9548:          Flow 0 (TCP connection (spliced)): TYPED -> ACTIVE
+740.9549:          Flow 0 (TCP connection (spliced)):     HOST [127.0.0.1]:38982 -> [127.65.81.1]:24700 => SPLICE [0.0.0.0]:0 -> [198.51.100.7]:24700
+740.9549:          Flow 0 (TCP connection (spliced)): SPLICE_ESTABLISHED
+7.3984:          Flow 8 (NEW): FREE -> NEW
+7.3984:          Flow 8 (INI): NEW -> INI
+7.3984:          Flow 8 (INI):     TAP [198.51.100.7]:52061 -> [169.254.1.1]:53 => ?
+7.3984:          Flow 8 (TGT): INI -> TGT
+7.3984:          Flow 8 (TGT):     TAP [198.51.100.7]:52061 -> [169.254.1.1]:53 => HOST [0.0.0.0]:52061 -> [127.0.0.53]:53
+7.3984:          Flow 8 (UDP flow): TGT -> TYPED
+7.3984:          Flow 8 (UDP flow):     TAP [198.51.100.7]:52061 -> [169.254.1.1]:53 => HOST [0.0.0.0]:52061 -> [127.0.0.53]:53
+7.3984:          Flow 8 (UDP flow): Side 0 hash table insert: bucket: 191745
+7.3984:          Flow 8 (UDP flow): Side 1 hash table insert: bucket: 265803
+7.3984:          Flow 8 (UDP flow): TYPED -> ACTIVE
+7.3984:          Flow 8 (UDP flow):     TAP [198.51.100.7]:52061 -> [169.254.1.1]:53 => HOST [127.0.0.1]:52061 -> [127.0.0.53]:53
+7.4192:          Flow 11 (NEW): FREE -> NEW
+7.4192:          Flow 11 (INI): NEW -> INI
+7.4192:          Flow 11 (INI):     TAP [198.51.100.7]:55606 -> [44.193.164.157]:443 => ?
+7.4192:          Flow 11 (TGT): INI -> TGT
+7.4192:          Flow 11 (TGT):     TAP [198.51.100.7]:55606 -> [44.193.164.157]:443 => HOST [0.0.0.0]:0 -> [44.193.164.157]:443
+7.4192:          Flow 11 (TCP connection): TGT -> TYPED
+7.4192:          Flow 11 (TCP connection):     TAP [198.51.100.7]:55606 -> [44.193.164.157]:443 => HOST [0.0.0.0]:0 -> [44.193.164.157]:443
+7.4192:          Flow 11 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+7.4193:          Flow 11 (TCP connection): Side 0 hash table insert: bucket: 371710
+7.4193:          Flow 11 (TCP connection): TYPED -> ACTIVE
+7.4193:          Flow 11 (TCP connection):     TAP [198.51.100.7]:55606 -> [44.193.164.157]:443 => HOST [0.0.0.0]:0 -> [44.193.164.157]:443
+7.4193:          Flow 12 (NEW): FREE -> NEW
+7.4193:          Flow 12 (INI): NEW -> INI
+7.4193:          Flow 12 (INI):     TAP [198.51.100.7]:44110 -> [100.50.38.106]:443 => ?
+7.4193:          Flow 12 (TGT): INI -> TGT
+7.4193:          Flow 12 (TGT):     TAP [198.51.100.7]:44110 -> [100.50.38.106]:443 => HOST [0.0.0.0]:0 -> [100.50.38.106]:443
+7.4193:          Flow 12 (TCP connection): TGT -> TYPED
+7.4193:          Flow 12 (TCP connection):     TAP [198.51.100.7]:44110 -> [100.50.38.106]:443 => HOST [0.0.0.0]:0 -> [100.50.38.106]:443
+7.4193:          Flow 12 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+7.4193:          Flow 12 (TCP connection): Side 0 hash table insert: bucket: 134729
+7.4193:          Flow 12 (TCP connection): TYPED -> ACTIVE
+7.4193:          Flow 12 (TCP connection):     TAP [198.51.100.7]:44110 -> [100.50.38.106]:443 => HOST [0.0.0.0]:0 -> [100.50.38.106]:443
+7.4193:          Flow 13 (NEW): FREE -> NEW
+7.4193:          Flow 13 (INI): NEW -> INI
+7.4193:          Flow 13 (INI):     TAP [198.51.100.7]:39966 -> [23.22.18.51]:443 => ?
+7.4193:          Flow 13 (TGT): INI -> TGT
+7.4193:          Flow 13 (TGT):     TAP [198.51.100.7]:39966 -> [23.22.18.51]:443 => HOST [0.0.0.0]:0 -> [23.22.18.51]:443
+7.4193:          Flow 13 (TCP connection): TGT -> TYPED
+7.4193:          Flow 13 (TCP connection):     TAP [198.51.100.7]:39966 -> [23.22.18.51]:443 => HOST [0.0.0.0]:0 -> [23.22.18.51]:443
+7.4193:          Flow 13 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+7.4193:          Flow 13 (TCP connection): Side 0 hash table insert: bucket: 145688
+7.4193:          Flow 13 (TCP connection): TYPED -> ACTIVE
+7.4193:          Flow 13 (TCP connection):     TAP [198.51.100.7]:39966 -> [23.22.18.51]:443 => HOST [0.0.0.0]:0 -> [23.22.18.51]:443
+7.4193:          Flow 14 (NEW): FREE -> NEW
+7.4193:          Flow 14 (INI): NEW -> INI
+7.4193:          Flow 14 (INI):     TAP [198.51.100.7]:46830 -> [100.31.23.131]:443 => ?
+7.4193:          Flow 14 (TGT): INI -> TGT
+7.4193:          Flow 14 (TGT):     TAP [198.51.100.7]:46830 -> [100.31.23.131]:443 => HOST [0.0.0.0]:0 -> [100.31.23.131]:443
+7.4193:          Flow 14 (TCP connection): TGT -> TYPED
+7.4193:          Flow 14 (TCP connection):     TAP [198.51.100.7]:46830 -> [100.31.23.131]:443 => HOST [0.0.0.0]:0 -> [100.31.23.131]:443
+7.4193:          Flow 14 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+7.4193:          Flow 14 (TCP connection): Side 0 hash table insert: bucket: 20416
+7.4193:          Flow 14 (TCP connection): TYPED -> ACTIVE
+7.4193:          Flow 14 (TCP connection):     TAP [198.51.100.7]:46830 -> [100.31.23.131]:443 => HOST [0.0.0.0]:0 -> [100.31.23.131]:443
+7.4292:          Flow 12 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+7.4292:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+7.4292:          Flow 12 (TCP connection): timer expires in 1.000s
+7.4292:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+7.4292:          Flow 12 (TCP connection): ESTABLISHED: SYN_RCVD -> ESTABLISHED
+7.4293:          Flow 11 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+7.4293:          Flow 11 (TCP connection): ACK_FROM_TAP_DUE
+7.4293:          Flow 11 (TCP connection): timer expires in 1.000s
+7.4294:          Flow 11 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+7.4294:          Flow 11 (TCP connection): Side 0 hash table remove: bucket: 371710
+7.4294:          Flow 11 (FREE): ACTIVE -> FREE
+7.4294:          Flow 11 (FREE):     TAP [198.51.100.7]:55606 -> [44.193.164.157]:443 => HOST [0.0.0.0]:0 -> [44.193.164.157]:443
+7.4294:          Flow 12 (TCP connection): ACK_TO_TAP_DUE
+7.4294:          Flow 14 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+7.4294:          Flow 14 (TCP connection): ACK_FROM_TAP_DUE
+7.4295:          Flow 14 (TCP connection): timer expires in 1.000s
+7.4295:          Flow 14 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+7.4295:          Flow 14 (TCP connection): Side 0 hash table remove: bucket: 20416
+7.4295:          Flow 14 (FREE): ACTIVE -> FREE
+7.4295:          Flow 14 (FREE):     TAP [198.51.100.7]:46830 -> [100.31.23.131]:443 => HOST [0.0.0.0]:0 -> [100.31.23.131]:443
+7.4296:          Flow 13 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+7.4296:          Flow 13 (TCP connection): ACK_FROM_TAP_DUE
+7.4296:          Flow 13 (TCP connection): timer expires in 1.000s
+7.4296:          Flow 13 (TCP connection): CLOSED: SYN_RCVD -> CLOSED
+7.4296:          Flow 13 (TCP connection): Side 0 hash table remove: bucket: 145688
+7.4297:          Flow 13 (FREE): ACTIVE -> FREE
+7.4297:          Flow 13 (FREE):     TAP [198.51.100.7]:39966 -> [23.22.18.51]:443 => HOST [0.0.0.0]:0 -> [23.22.18.51]:443
+7.4423:          Flow 12 (TCP connection): ACK_TO_TAP_DUE dropped
+7.4423:          Flow 12 (TCP connection): timer expires in 0.000s
+7.4460:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+7.4460:          Flow 12 (TCP connection): timer expires in 1.000s
+7.4461:          Flow 12 (TCP connection): STALLED
+7.4461:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+7.4461:          Flow 12 (TCP connection): STALLED dropped
+7.4472:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+7.4472:          Flow 12 (TCP connection): timer expires in 1.000s
+7.4473:          Flow 12 (TCP connection): STALLED
+7.4473:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+7.4473:          Flow 12 (TCP connection): STALLED dropped
+7.4477:          Flow 12 (TCP connection): ACK_TO_TAP_DUE
+7.4573:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+7.4573:          Flow 12 (TCP connection): STALLED
+7.4605:          Flow 12 (TCP connection): ACK_TO_TAP_DUE dropped
+7.4605:          Flow 12 (TCP connection): timer expires in 1.000s
+7.4605:          Flow 12 (TCP connection): timer expires in 1.000s
+7.4980:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+7.4980:          Flow 12 (TCP connection): STALLED dropped
+7.6732:          Flow 12 (TCP connection): ACK_TO_TAP_DUE
+7.6925:          Flow 12 (TCP connection): ACK_TO_TAP_DUE dropped
+7.6926:          Flow 12 (TCP connection): timer expires in 0.000s
+7.6928:          Flow 12 (TCP connection): ACK_TO_TAP_DUE
+7.6960:          Flow 12 (TCP connection): ACK_TO_TAP_DUE dropped
+7.6960:          Flow 12 (TCP connection): timer expires in 0.000s
+7.6962:          Flow 12 (TCP connection): ACK_TO_TAP_DUE
+7.7059:          Flow 12 (TCP connection): ACK_TO_TAP_DUE dropped
+7.7059:          Flow 12 (TCP connection): timer expires in 0.000s
+7.7063:          Flow 12 (TCP connection): ACK_TO_TAP_DUE
+7.7127:          Flow 12 (TCP connection): ACK_TO_TAP_DUE dropped
+7.7128:          Flow 12 (TCP connection): timer expires in 0.000s
+7.7130:          Flow 12 (TCP connection): ACK_TO_TAP_DUE
+7.7163:          Flow 12 (TCP connection): ACK_TO_TAP_DUE dropped
+7.7163:          Flow 12 (TCP connection): timer expires in 0.000s
+7.7170:          Flow 12 (TCP connection): ACK_TO_TAP_DUE
+7.7234:          Flow 12 (TCP connection): ACK_TO_TAP_DUE dropped
+7.7235:          Flow 12 (TCP connection): timer expires in 0.000s
+746.9581:          Flow 0 (TCP connection (spliced)): FIN_RCVD_1
+746.9582:          Flow 0 (TCP connection (spliced)): FIN_SENT_0
+9.9313:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+9.9313:          Flow 12 (TCP connection): timer expires in 1.000s
+9.9314:          Flow 12 (TCP connection): STALLED
+9.9314:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+9.9314:          Flow 12 (TCP connection): STALLED dropped
+10.1216:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+10.1216:          Flow 12 (TCP connection): timer expires in 1.000s
+10.1217:          Flow 12 (TCP connection): STALLED
+10.1217:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+10.1217:          Flow 12 (TCP connection): STALLED dropped
+11.2100:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+11.2100:          Flow 12 (TCP connection): timer expires in 1.000s
+11.2101:          Flow 12 (TCP connection): STALLED
+11.2101:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+11.2101:          Flow 12 (TCP connection): STALLED dropped
+11.2139:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+11.2139:          Flow 12 (TCP connection): timer expires in 1.000s
+11.2139:          Flow 12 (TCP connection): STALLED
+11.2140:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+11.2140:          Flow 12 (TCP connection): STALLED dropped
+11.2181:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+11.2181:          Flow 12 (TCP connection): timer expires in 1.000s
+11.2182:          Flow 12 (TCP connection): STALLED
+11.2182:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+11.2182:          Flow 12 (TCP connection): STALLED dropped
+11.2184:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE
+11.2184:          Flow 12 (TCP connection): timer expires in 1.000s
+11.2184:          Flow 12 (TCP connection): STALLED
+11.2184:          Flow 12 (TCP connection): ACK_FROM_TAP_DUE dropped
+11.2184:          Flow 12 (TCP connection): STALLED dropped
+11.2484:          Flow 11 (NEW): FREE -> NEW
+11.2484:          Flow 11 (INI): NEW -> INI
+11.2484:          Flow 11 (INI):     TAP [198.51.100.7]:56854 -> [169.254.1.1]:53 => ?
+11.2484:          Flow 11 (TGT): INI -> TGT
+11.2484:          Flow 11 (TGT):     TAP [198.51.100.7]:56854 -> [169.254.1.1]:53 => HOST [0.0.0.0]:56854 -> [127.0.0.53]:53
+11.2484:          Flow 11 (UDP flow): TGT -> TYPED
+11.2484:          Flow 11 (UDP flow):     TAP [198.51.100.7]:56854 -> [169.254.1.1]:53 => HOST [0.0.0.0]:56854 -> [127.0.0.53]:53
+11.2484:          Flow 11 (UDP flow): Side 0 hash table insert: bucket: 348561
+11.2484:          Flow 11 (UDP flow): Side 1 hash table insert: bucket: 21593
+11.2484:          Flow 11 (UDP flow): TYPED -> ACTIVE
+11.2484:          Flow 11 (UDP flow):     TAP [198.51.100.7]:56854 -> [169.254.1.1]:53 => HOST [127.0.0.1]:56854 -> [127.0.0.53]:53
+11.2485:          Flow 13 (NEW): FREE -> NEW
+11.2485:          Flow 13 (INI): NEW -> INI
+11.2485:          Flow 13 (INI):     TAP [198.51.100.7]:49064 -> [169.254.1.1]:53 => ?
+11.2485:          Flow 13 (TGT): INI -> TGT
+11.2485:          Flow 13 (TGT):     TAP [198.51.100.7]:49064 -> [169.254.1.1]:53 => HOST [0.0.0.0]:49064 -> [127.0.0.53]:53
+11.2485:          Flow 13 (UDP flow): TGT -> TYPED
+11.2485:          Flow 13 (UDP flow):     TAP [198.51.100.7]:49064 -> [169.254.1.1]:53 => HOST [0.0.0.0]:49064 -> [127.0.0.53]:53
+11.2485:          Flow 13 (UDP flow): Side 0 hash table insert: bucket: 125764
+11.2485:          Flow 13 (UDP flow): Side 1 hash table insert: bucket: 213015
+11.2485:          Flow 13 (UDP flow): TYPED -> ACTIVE
+11.2485:          Flow 13 (UDP flow):     TAP [198.51.100.7]:49064 -> [169.254.1.1]:53 => HOST [127.0.0.1]:49064 -> [127.0.0.53]:53
+11.2487:          Flow 14 (NEW): FREE -> NEW
+11.2487:          Flow 14 (INI): NEW -> INI
+0.0012: ERROR:   Listening address not allowed for -T 127.0.42.1/3000
