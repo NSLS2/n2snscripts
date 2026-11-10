@@ -944,9 +944,11 @@ bwopencode2 --serve-ssh-config
   fixed one it reaches every session that shares it, and any sandboxed agent on
   the host could drive them all. Prefer the random default.
 - **Port claims.** A file `~/.local/state/bwopencode2/serve/<port>.session` (host
-  side, not mounted in the sandbox; the port, launcher pid, host, directory and
-  start time, no secret) stops two launchers picking the same port; the port
-  must also be free on the address checked (`127.H1.H2.1`, or `--publish-addr`).
+  side, not mounted in the sandbox; the port, launcher pid and its process
+  start time, host, directory and start date, no secret) stops two launchers
+  picking the same port; the port must also be free on the address checked
+  (`127.H1.H2.1`, or `--publish-addr`), and the address is claimed as for any
+  `--publish`.
   A claim
   whose process is gone is stale and is removed on the next `--serve`. The
   launcher ends in `exec`, so it cannot retry or clean up afterwards; the

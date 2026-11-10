@@ -34,9 +34,10 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   Binary masking is verified on RHEL 8.10 (bubblewrap-0.4.0-3.el8_10) and EL9 (0.6.3).
-# Optional: pasta (package passt), with /dev/net/tun and unprivileged user
-#   namespaces on the host, for the private network namespace.  Without it
-#   (RHEL 8) the sandbox shares the host network, with a warning.
+# Network: a private network namespace from pasta (package passt, RHEL 9+),
+#   else slirp4netns (RHEL 8) with util-linux unshare; both need /dev/net/tun
+#   and unprivileged user namespaces.  Without either the launch stops
+#   (exit 3) unless --share-net is given (see "Network isolation").
 
 # Guard against double-sourcing.
 [[ -n "${_BWRAP_SANDBOX_LIB_SOURCED:-}" ]] && return 0
