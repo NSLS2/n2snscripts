@@ -1090,6 +1090,9 @@ _bwrap_load_blocked_prefixes() {
         "/etc/sudoers"
         "/etc/sudoers.d"
     )
+    # The launcher's network runtime directories (slirp4netns API sockets,
+    # publish claims, network log pipes of every sandbox of this user).
+    mapfile -t -O "${#_literal[@]}" _literal < <(_net_runtime_candidates)
     local _e _r
     _BWRAP_BLOCKED_LIST=()
     for _e in "${_literal[@]}"; do
@@ -2482,6 +2485,84 @@ _net_try_pasta() {
     return 0
 }
 
+# ── Per-user runtime directory ───────────────────────────────────
+# The launcher keeps its network files (slirp4netns pipes and API socket, the
+# claims of publish addresses, the network log pipe) in one directory per
+# user, outside every sandbox:
+#
+#   $XDG_RUNTIME_DIR/bwrap-net/   (else /tmp/bwrap-net-UID)    0700
+#   ├── session.XXXXXXXX/          one per launch (mktemp -d)
+#   └── ...
+#
+# Each launch works in its own session directory, so concurrent launches of
+# one user do not meet there.  Only the launcher (outside the sandbox) uses
+# the directory, and it is in _BWRAP_BLOCKED_LIST, so no sandbox can mount it
+# (by working directory, --ro-path or --rw-path) and reach another sandbox's
+# files.  TMPDIR is never used: its parent may be writable by other users, who
+# could then swap the directory during the launch.
+
+_NET_RUNTIME_BASE=""
+_NET_SESSION_DIR=""
+
+# _net_runtime_candidates
+#   Print the base directory candidates, best first, one per line:
+#   $XDG_RUNTIME_DIR/bwrap-net (when XDG_RUNTIME_DIR is set) and
+#   /tmp/bwrap-net-UID.  Used by _net_runtime_base and the blocked list.
+_net_runtime_candidates() {
+    [[ -z "${XDG_RUNTIME_DIR:-}" ]] || printf '%s/bwrap-net\n' "${XDG_RUNTIME_DIR%/}"
+    printf '/tmp/bwrap-net-%s\n' "$(id -u)"
+}
+
+# _net_dir_is_trusted_parent DIR
+#   True when no other user can rename or replace entries of DIR: a real
+#   directory (not a symlink) owned by this user or root, and either not
+#   writable by group or others, or sticky (as /tmp is).
+_net_dir_is_trusted_parent() {
+    local _d="$1" _st _owner _mode
+    [[ -d "${_d}" && ! -L "${_d}" ]] || return 1
+    _st="$(stat -c '%u %a' -- "${_d}" 2> /dev/null)" || return 1
+    _owner="${_st% *}"
+    _mode=$((8#${_st#* }))
+    [[ "${_owner}" == "$(id -u)" || "${_owner}" == 0 ]] || return 1
+    ((!(_mode & 8#022) || (_mode & 8#1000)))
+}
+
+# _net_runtime_base
+#   Set _NET_RUNTIME_BASE to this user's runtime directory, creating it
+#   (mode 0700).  The first candidate whose parent is trusted is used, and
+#   it must then be a real directory owned by this user with mode 0700.
+#   Exit 3 when there is none.
+_net_runtime_base() {
+    [[ -z "${_NET_RUNTIME_BASE}" ]] || return 0
+    local _c _st _why=""
+    while IFS= read -r _c; do
+        if ! _net_dir_is_trusted_parent "${_c%/*}"; then
+            _why+="${_why:+; }${_c%/*} is not a private or sticky directory of this user or root"
+            continue
+        fi
+        mkdir -m 0700 -- "${_c}" 2> /dev/null || true
+        _st="$(stat -c '%u %a' -- "${_c}" 2> /dev/null || true)"
+        if [[ -d "${_c}" && ! -L "${_c}" && "${_st}" == "$(id -u) 700" ]]; then
+            _NET_RUNTIME_BASE="${_c}"
+            return 0
+        fi
+        _why+="${_why:+; }${_c} exists but is not a directory of this user with mode 0700"
+    done < <(_net_runtime_candidates)
+    echo "Error: no private runtime directory for the network setup: ${_why}." >&2
+    exit 3
+}
+
+# _net_session_dir
+#   Set _NET_SESSION_DIR to a new private directory for this launch.
+_net_session_dir() {
+    [[ -z "${_NET_SESSION_DIR}" ]] || return 0
+    _net_runtime_base
+    if ! _NET_SESSION_DIR="$(mktemp -d "${_NET_RUNTIME_BASE}/session.XXXXXXXX")"; then
+        echo "Error: cannot create a session directory in ${_NET_RUNTIME_BASE}." >&2
+        exit 3
+    fi
+}
+
 # ── slirp4netns backend ──────────────────────────────────────────
 # Used when pasta is not usable (RHEL 8 has slirp4netns but no passt).
 # slirp4netns cannot start the command itself; it attaches to an existing
@@ -2676,17 +2757,13 @@ _net_slirp_publish_fwds() {
 
 # _net_slirp_start
 #   Called by launch_sandbox just before it execs bwrap: create the pipes
-#   (FIFOs in a private directory, removed once open), start the helper in
-#   the background and close the helper's descriptors in the launcher.
+#   (FIFOs in a private session directory, removed once open), start the
+#   helper in the background and close the helper's descriptors in the
+#   launcher.
 _net_slirp_start() {
-    local _rt="${XDG_RUNTIME_DIR:-}" _f
-    if [[ -z "${_rt}" || ! -d "${_rt}" || ! -w "${_rt}" || ! -O "${_rt}" ]]; then
-        _rt="${TMPDIR:-/tmp}"
-    fi
-    if ! _NET_SLIRP_DIR="$(mktemp -d "${_rt}/bwrap-net.XXXXXXXX")"; then
-        echo "Error: cannot create a private directory in ${_rt} for slirp4netns." >&2
-        exit 3
-    fi
+    local _f
+    _net_session_dir
+    _NET_SLIRP_DIR="${_NET_SESSION_DIR}"
     for _f in info block sync ready; do
         mkfifo -m 0600 "${_NET_SLIRP_DIR}/${_f}"
     done
@@ -2700,7 +2777,10 @@ _net_slirp_start() {
     exec 95< "${_NET_SLIRP_DIR}/sync"
     exec 96<> "${_NET_SLIRP_DIR}/ready"
     exec 97< "${_NET_SLIRP_DIR}/ready"
+    # noclobber: the log is a new file, never an existing one.
+    set -o noclobber
     exec 98> "${_NET_SLIRP_DIR}/log"
+    set +o noclobber
     exec 99< "${_NET_SLIRP_DIR}/log"
     rm -f "${_NET_SLIRP_DIR}/info" "${_NET_SLIRP_DIR}/block" "${_NET_SLIRP_DIR}/sync" \
         "${_NET_SLIRP_DIR}/ready" "${_NET_SLIRP_DIR}/log"

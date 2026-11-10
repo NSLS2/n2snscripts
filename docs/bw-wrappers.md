@@ -465,13 +465,34 @@ launcher ─┬─ helper (background): waits for the namespace, starts slirp4ne
   scrubbed environment (no API keys). It exits when bwrap does: its
   `--exit-fd` is the other end of bwrap's `--sync-fd`.
 - `--publish` uses slirp4netns's API socket (`add_hostfwd`, one request per
-  port). The socket is in a private `mktemp -d` directory under
-  `$XDG_RUNTIME_DIR`, removed once the forwards are added, so nothing else can
-  add forwards later.
+  port). The socket is in the launch's session directory (see
+  [Runtime directory](#runtime-directory)), removed once the forwards are
+  added, so nothing else can add forwards later.
 - **On a setup failure** (slirp4netns does not start, a port cannot be
   published) the helper prints the reason and slirp4netns's last messages,
   kills the still-waiting sandbox (its pid comes from bwrap's `--info-fd`), so
   the tool never runs, and then bwrap. The exit status is then 137, not 3.
+
+### Runtime directory
+
+The launcher keeps its network files (the slirp4netns pipes and API socket,
+and the claims and logs described elsewhere in this section) in a directory of
+its own, outside every sandbox:
+
+- `$XDG_RUNTIME_DIR/bwrap-net`, else `/tmp/bwrap-net-<uid>`, mode 0700. A
+  candidate is used only if its parent cannot be changed by other users (owned
+  by you or root, and not writable by group or others, or sticky like `/tmp`)
+  and it is then a real directory of yours with mode 0700; otherwise the next
+  one is tried, and with none the launch stops (exit status 3). `TMPDIR` is
+  never used: in a directory other users can write, they could swap the
+  directory during the launch.
+- Each launch works in its own `session.XXXXXXXX` subdirectory (`mktemp -d`), so
+  several sandboxes of one user never share files there, and removes it when
+  it no longer needs it.
+- Both candidates are blocked paths: no sandbox can mount them, or a directory
+  that contains them, as its working directory or with `--ro-path` /
+  `--rw-path`. One sandbox therefore cannot reach the files of another, such as
+  the slirp4netns API socket during its setup.
 
 ### Descriptor relay
 
