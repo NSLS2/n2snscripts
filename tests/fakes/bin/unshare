@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""Fake util-linux `unshare --user --map-root-user --net -- CMD...`.
+
+Like util-linux it does not fork: it unshares, writes the maps and execs CMD
+in the same process.  The failure mode is read from $FAKE_NET_DIR/unshare.fail
+(fail: exit 1 before execing).
+"""
+
+import os
+import sys
+
+FAKE_DIR = os.environ.get("FAKE_NET_DIR", "/tmp/opencode/fakenet")
+args = sys.argv[1:]
+if args[:1] in (["--help"], ["-h"]):
+    print(" -U, --user[=<file>]       unshare user namespace")
+    print(" -n, --net[=<file>]        unshare network namespace")
+    print(" -r, --map-root-user       map current user to root (implies --user)")
+    sys.exit(0)
+try:
+    if open(os.path.join(FAKE_DIR, "unshare.fail")).read().strip() == "fail":
+        sys.exit("unshare: unshare failed: Operation not permitted (fake)")
+except OSError:
+    pass
+i = args.index("--")
+opts, cmd = args[:i], args[i + 1 :]
+assert set(opts) == {"--user", "--map-root-user", "--net"}, opts
+uid, gid = os.getuid(), os.getgid()
+os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNET)
+with open("/proc/self/setgroups", "w") as f:
+    f.write("deny")
+with open("/proc/self/uid_map", "w") as f:
+    f.write("0 %d 1" % uid)
+with open("/proc/self/gid_map", "w") as f:
+    f.write("0 %d 1" % gid)
+os.execvp(cmd[0], cmd)

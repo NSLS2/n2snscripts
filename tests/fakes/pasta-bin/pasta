@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Fake pasta for testing the bw* launchers without /dev/net/tun.
+
+Like the real one it closes inherited descriptors above 2 before opening
+--log-file, creates a user namespace (mapping the caller to uid 0) and a
+network namespace, starts the command in it and stays its parent, and
+forwards -t (host -> namespace interface address) and -T (namespace -> host
+loopback) ports.  The namespace gets a dummy interface with 192.168.77.2
+instead of a tap with the host's address.  With --debug and --log-file it
+writes header, startup and "Flow" lines to the log file (blocking writes, as
+pasta's are).  The failure mode is read from $FAKE_NET_DIR/pasta.fail
+(bind: refuse every -t port).
+"""
+
+import os
+import sys
+import threading
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+import _nsproxy  # noqa: E402
+
+NS_ADDR = "192.168.77.2"
+FAKE_DIR = os.environ.get("FAKE_NET_DIR", "/tmp/opencode/fakenet")
+
+args = sys.argv[1:]
+if args[:1] in (["--help"], ["-h"]):
+    print("Usage: pasta [OPTION]... [COMMAND [ARG]...]")
+    print("  --no-pidns		Don't spawn command in a new PID namespace")
+    sys.exit(0)
+if args[:1] == ["--version"]:
+    print("pasta fake-2026_10_02")
+    sys.exit(0)
+
+VALUE_OPTS = {"-t", "-u", "-T", "-U", "--dns-forward", "--search", "--log-file", "--log-size"}
+opts, fwd_t, fwd_T, cmd = {}, [], [], []
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "--":
+        cmd = args[i + 1 :]
+        break
+    if a in VALUE_OPTS:
+        v = args[i + 1]
+        if a == "-t" and v != "none":
+            fwd_t.append(v)
+        elif a == "-T" and v != "none":
+            fwd_T.append(v)
+        else:
+            opts[a] = v
+        i += 2
+        continue
+    opts[a] = True
+    i += 1
+if not cmd:
+    sys.exit("fake pasta: no command")
+
+os.closerange(3, 4096)
+
+log_fd = -1
+if "--log-file" in opts:
+    log_fd = os.open(opts["--log-file"], os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_RDWR, 0o600)
+    os.write(log_fd, ("pasta fake-2026_10_02: %s (%d)\n" % (os.path.realpath(__file__), os.getpid())).encode())
+log_lock = threading.Lock()
+
+
+def log(msg):
+    if log_fd >= 0 and "--debug" in opts:
+        with log_lock:
+            os.write(log_fd, ("0.0001: %s\n" % msg).encode())
+
+
+try:
+    FAIL = open(os.path.join(FAKE_DIR, "pasta.fail")).read().strip()
+except OSError:
+    FAIL = ""
+
+uid, gid = os.getuid(), os.getgid()
+ready_r, ready_w = os.pipe()
+go_r, go_w = os.pipe()
+child = os.fork()
+if child == 0:
+    os.close(ready_r)
+    os.close(go_w)
+    os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNET | os.CLONE_NEWUTS)
+    with open("/proc/self/setgroups", "w") as f:
+        f.write("deny")
+    with open("/proc/self/uid_map", "w") as f:
+        f.write("0 %d 1" % uid)
+    with open("/proc/self/gid_map", "w") as f:
+        f.write("0 %d 1" % gid)
+    import socket as _s
+
+    _s.sethostname("pasta-" + os.uname().nodename)
+    for c in (
+        ["ip", "link", "set", "lo", "up"],
+        ["ip", "link", "add", "eth0", "type", "dummy"],
+        ["ip", "addr", "add", NS_ADDR + "/24", "dev", "eth0"],
+        ["ip", "link", "set", "eth0", "up"],
+    ):
+        if os.spawnvp(os.P_WAIT, c[0], c) != 0:
+            os._exit(1)
+    os.write(ready_w, b"1")
+    os.close(ready_w)
+    os.read(go_r, 1)
+    os.close(go_r)
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        print("fake pasta: %s: %s" % (cmd[0], e), file=sys.stderr)
+        os._exit(127)
+os.close(ready_w)
+os.close(go_r)
+if os.read(ready_r, 1) != b"1":
+    print("fake pasta: namespace setup failed", file=sys.stderr)
+    sys.exit(1)
+proxy = _nsproxy.NsProxy(child)
+log("Template interface: eth0 (IPv4)")
+
+import socket  # noqa: E402
+
+for spec in fwd_t:
+    addr, _, ports = spec.rpartition("/")
+    hports, _, gports = ports.partition(":")
+    hr = list(_nsproxy.port_range(hports))
+    gr = list(_nsproxy.port_range(gports or hports))
+    for hp, gp in zip(hr, gr):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            if FAIL == "bind":
+                raise OSError("fake: bind refused")
+            s.bind((addr or "0.0.0.0", hp))
+        except OSError as e:
+            print("Failed to bind port %d (%s) for option '-t %s', exiting" % (hp, e, spec), file=sys.stderr)
+            os.kill(child, 9)
+            sys.exit(1)
+        s.listen(16)
+        _nsproxy.forward(s, lambda gp=gp: proxy.connect(NS_ADDR, gp), log, "-t %d" % hp)
+for spec in fwd_T:
+    addr, _, ports = spec.rpartition("/")
+    sports, _, hports = ports.partition(":")
+    for sp, hp in zip(_nsproxy.port_range(sports), _nsproxy.port_range(hports or sports)):
+        s = proxy.listen(addr or "127.0.0.1", sp)
+        _nsproxy.forward(s, lambda hp=hp: socket.create_connection(("127.0.0.1", hp)), log, "-T %d" % sp)
+
+os.write(go_w, b"1")
+os.close(go_w)
+_, status = os.waitpid(child, 0)
+log("pasta: child exited")
+sys.exit(os.waitstatus_to_exitcode(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
