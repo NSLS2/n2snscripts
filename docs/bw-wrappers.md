@@ -1253,15 +1253,28 @@ library is a follow-up.
   like `--publish`, always on your first publish address `127.H1.H2.1`, and the
   launcher prints the `ssh -L` command and the URL.
 - **Private network.** The server listens on `0.0.0.0` inside the sandbox's
-  private network, where only the published port reaches it. Other users of the
-  host cannot reach it, and neither can OpenCode's own port (a random one on
-  `127.0.0.1` inside the sandbox). With `--share-net` it binds your publish
-  address on the host network instead, which other users of the host can reach
-  (the password still applies); use it only where neither backend works.
+  private network, where only the published port reaches it. **The published
+  address is not access control**: any local user can connect to any `127/8`
+  address (see [Opening ports](#opening-ports)), so another user of the host can
+  reach this port, and the UI password is what keeps them out. OpenCode's own
+  port (a random one on `127.0.0.1` inside the sandbox) is not published and the
+  host cannot connect to it (checked). With `--share-net` the server binds your
+  publish address on the host network instead, and OpenCode's port is then on the
+  host's loopback too, behind its own random password; use it only where neither
+  backend works.
 - **Password.** Random for each session, printed once; `BWOPENCODE2_SERVE_PASSWORD`
   (12 characters or more) sets a fixed one for every session that uses it. It
   reaches the server as `OPENCHAMBER_UI_PASSWORD` in the sandbox environment,
   never on a command line.
+- **Sign-in key.** The browser sign-in cookies are signed with a key that is
+  random for each session (`OPENCODE_JWT_SECRET`), so a sign-in ends with the
+  session that issued it. Without it OpenChamber 2.7.0 writes a key to
+  `jwt-secret` in its data directory and reuses it: a browser that signed in once
+  stayed signed in across restarts and after the password changed (12 hours, or 7
+  days on a trusted device), and the agent could read the file. Checked: with a
+  new key a cookie is refused after a restart (401), signing in again works, and
+  no `jwt-secret` file is written. Reload the page after a restart and it asks
+  for the password.
 - **Preview.** A dev server started by the agent is not reachable from your
   browser by itself. Publish its port with `--publish PORT` (also on your
   `127.H1.H2.1`) and add a forward for it.
@@ -1306,6 +1319,8 @@ library is a follow-up.
 - **`run/` is an empty tmpfs.** OpenChamber writes its pid file and an instance
   file there, and the instance file contains the UI password in plain text (checked
   with 2.7.0), so it must not reach the persistent directory.
+- **No sign-in key is kept.** `jwt-secret` is not written (see Sign-in key). A
+  file left by an earlier run stays in the data directory but is not used.
 - **Projects.** Only the directory you start in (its git root) is mounted
   read-write, so a project that OpenChamber opens elsewhere needs `--rw-path`.
   Starting in a parent directory that is not itself a git repository, such as
@@ -1322,37 +1337,69 @@ Forward the port (`ssh -L`, or the alias from `--ssh-config`) and open
 password. Keep the same port number at both ends, since the login cookie is
 named by it.
 
-The OpenChamber **desktop app's "Remote Instances" over SSH is not expected to
-work**, and has not been tried: it forwards the remote machine's own
-`127.0.0.1`, while this server is published on `127.H1.H2.1`. Its "managed"
-mode would also install and start an OpenChamber on the remote host outside any
-sandbox. Use the browser or PWA through the tunnel.
+### Known limit: the agent can read its own controls
+
+OpenChamber puts its credentials into the environment of the OpenCode it starts,
+and so of the agent's shell and the browser terminal (its own code records them
+in `OPENCHAMBER_INJECTED_ENV`). Checked with 2.7.0: an agent session's shell has
+`OPENCHAMBER_UI_PASSWORD`, `OPENCODE_SERVER_PASSWORD` and `OPENCODE_PASSWORD` set.
+With them the agent can sign in to OpenChamber, or call its own OpenCode server's
+API, and so change settings, start sessions or scheduled tasks and answer its own
+permission prompts. Nothing leaves the sandbox: everything it could drive runs
+inside it, and the sandbox boundary is what was checked below.
+
+- **The launcher cannot remove them.** OpenChamber writes them into its own
+  environment. Hiding them from the agent's shell only would not help either: a
+  process of the same user in the sandbox can read the server's environment from
+  `/proc/<pid>/environ` (checked in a `bwopencode2` sandbox).
+- **The agent is told in the sandbox context** not to read, print or use them.
+  That is an instruction, not a control.
+- **`bwopencode2 --serve` has the same property** with `OPENCODE_PASSWORD`, which
+  its section lists as unchecked.
+- Where the agent's permission rules ask before risky actions, the agent holding
+  these credentials can answer its own prompts through the API, so those prompts
+  are not a barrier against a misbehaving agent here.
 
 ### What was checked
 
-Checked with `tests/test-bwopenchamber.sh` (61 checks through `--dry-run`:
-argument refusals, the environment and mounts built, hostile host variables
-dropped, password handling, Node and install checks) and by running OpenChamber
-2.7.0 with the launcher's environment in a private network namespace on
-OpenCode 2.2.7: the server answers on `0.0.0.0`, the API gives 401 without the
-password and with a wrong one and 200 with the right one, the managed OpenCode
-starts from `OPENCODE_BINARY` and receives `OPENCODE_CONFIG_CONTENT` (the
-sandbox context), and Ctrl-C stops both. The database guard refused to start
-next to an older OpenCode build, as designed.
+**A real launch on a workstation** (`bwopenchamber --port 24700`, pasta, OpenCode
+2.2.7, OpenChamber 2.7.0):
 
-**Not checked**, because the development sandbox cannot start a nested `bwrap`
-launch: a real launch with the sandbox and `pasta` publishing the port, the
-browser terminal inside the sandbox (`node-pty`), git and worktrees, the
-published port from an ssh tunnel, and a browser sign-in. Check these on a host
-first (output to a file, as the repository's other manual checks):
+- The host has one new listener, `127.52.255.1:24700`, and nothing on 3000 or on
+  OpenCode's port. Without a password the API gives 401, the same port on
+  `127.0.0.1` is refused, and OpenCode's own port is refused from the host.
+- A browser signed in through an `ssh -L` tunnel, and an agent session worked
+  through the model gateway.
+- OpenChamber's browser terminal runs inside the sandbox: `BWRAP_SANDBOX` is
+  `bwopenchamber`, `~/.ssh` does not exist, `ssh` is masked and
+  `BWRAP_NET_BACKEND` is `pasta`.
+- After Ctrl-C the OpenCode that OpenChamber started is gone.
+- The database guard refused to start next to an older OpenCode build, as
+  designed.
+
+**In a private network namespace without the launcher**, OpenChamber 2.7.0 with
+the launcher's environment: the server answers on `0.0.0.0`, 401 and 200 as
+above, the managed OpenCode starts from `OPENCODE_BINARY` and receives
+`OPENCODE_CONFIG_CONTENT` (the sandbox context), `run/` holds the UI password in
+plain text, and the sign-in key behaves as described under Reaching it.
+
+**Tests:** `tests/test-bwopenchamber.sh` (70 checks through `--dry-run`: argument
+refusals, the environment and mounts built, hostile host variables dropped,
+password and sign-in key handling, Node and install checks).
+
+**Not checked:** git and worktrees from OpenChamber, whether the host listener
+belongs to pasta or to the network log's Python helper (`ss` names
+`platform-python`), and the shared-library move that is left for after #37.
+
+To repeat the host checks (do not capture the banner, it prints the password):
 
 ```text
-bwopenchamber                       # in a project directory
-ss -ltn                             # on the host: nothing on 3000 or a random port
-curl -s -o /dev/null -w '%{http_code}\n' http://127.H1.H2.1:PORT/auth/session   # 401
+bwopenchamber --port 24700          # in a project directory
+ss -ltnp                            # on the host: only 127.H1.H2.1:24700
+curl -s -o /dev/null -w '%{http_code}\n' http://127.H1.H2.1:24700/auth/session   # 401
 # in the browser through the tunnel: sign in, open the terminal and run
 #   echo $BWRAP_SANDBOX; ls ~/.ssh; ssh -V     # bwopenchamber; fails; fails
-# start a session, then Ctrl-C and confirm no opencode process is left
+# Ctrl-C, then: pgrep -af 'opencode.exe serve'  # none of this session's
 ```
 
 ## `bwclaude`
