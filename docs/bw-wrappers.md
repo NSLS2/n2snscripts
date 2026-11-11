@@ -1033,8 +1033,8 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
   host, is using the same data directory, or after the last daily check found
   damage;
 - it holds a shared lock for the life of the sandbox (a file descriptor that
-  the final `exec` passes on to `bwrap`), so sessions on this host and version
-  can run together;
+  the final `exec` passes on to `bwrap`; with a private network see "Where the
+  lock lives" below), so sessions on this host and version can run together;
 - it starts a daily background backup (`opencode2-db backup --if-due`) and keeps
   the newest 3 compressed copies.
 
@@ -1043,6 +1043,30 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
 files are in `~/.local/share/opencode2/opencode-db-guard`, which is not mounted
 in the sandbox. The rules, the recovery steps (`opencode2-db restore` and
 `rebuild`) and the limits are in [opencode2-db.md](opencode2-db.md).
+
+#### Where the lock lives with a private network
+
+The text above describes `--share-net`, where the launcher `exec`s into `bwrap`
+and the descriptor goes with it. With a private network the launcher `exec`s into
+pasta instead, and pasta closes every descriptor above 2 that it inherits (see
+"File descriptor relay"), so neither pasta, `bwrap` nor OpenCode holds the lock.
+Checked on a real launch (`fuser` on the lock file while a `bwopencode2` session
+ran on pasta): the only holders were the network log's helper processes, a forked
+copy of the launcher shell and its `bwrap_netlog.py condense` child. The lock
+was held for the whole session and was gone after it ended (`opencode2-db
+status`: `none held`), so the guard works, but **by inheritance, not by design**:
+the helper was started before the `exec`, so it received the descriptor.
+
+By reading the code (not tested), the lock would not be held when:
+
+- no log tool can write (neither `systemd-cat` nor `logger`), because the launcher
+  then starts no helper ("this network session is not logged"), or
+- the helper is stopped while OpenCode keeps running.
+
+In those cases a second host or OpenCode build could pass the guard while the
+session runs. The same applies to `bwopenchamber`, which goes through the same
+launch. Passing the lock on deliberately is a change to the launch code of
+NSLS2/n2snscripts#37.
 
 ### What is kept out of the sandbox
 
