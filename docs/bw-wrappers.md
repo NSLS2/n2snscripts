@@ -1274,7 +1274,10 @@ library is a follow-up.
   days on a trusted device), and the agent could read the file. Checked: with a
   new key a cookie is refused after a restart (401), signing in again works, and
   no `jwt-secret` file is written. Reload the page after a restart and it asks
-  for the password.
+  for the password. The key is still in the environment of the agent's shell
+  (checked: `printenv | grep -c OPENCODE_JWT_SECRET` prints 1), so an agent can
+  still sign a cookie for the current session; the change limits that to the
+  session instead of leaving a reusable key on disk (see the known limit below).
 - **Preview.** A dev server started by the agent is not reachable from your
   browser by itself. Publish its port with `--publish PORT` (also on your
   `127.H1.H2.1`) and add a forward for it.
@@ -1342,10 +1345,11 @@ named by it.
 OpenChamber puts its credentials into the environment of the OpenCode it starts,
 and so of the agent's shell and the browser terminal (its own code records them
 in `OPENCHAMBER_INJECTED_ENV`). Checked with 2.7.0: an agent session's shell has
-`OPENCHAMBER_UI_PASSWORD`, `OPENCODE_SERVER_PASSWORD` and `OPENCODE_PASSWORD` set.
-With them the agent can sign in to OpenChamber, or call its own OpenCode server's
-API, and so change settings, start sessions or scheduled tasks and answer its own
-permission prompts. Nothing leaves the sandbox: everything it could drive runs
+`OPENCHAMBER_UI_PASSWORD`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_PASSWORD` and
+`OPENCODE_JWT_SECRET` set. With them the agent can sign in to OpenChamber (or
+sign a cookie itself), or call its own OpenCode server's API, and so change
+settings, start sessions or scheduled tasks and answer its own permission
+prompts. Nothing leaves the sandbox: everything it could drive runs
 inside it, and the sandbox boundary is what was checked below.
 
 - **The launcher cannot remove them.** OpenChamber writes them into its own
