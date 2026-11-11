@@ -38,6 +38,9 @@ contains() { grep -qF -- "$2" <<< "$1"; }
 lacks() { ! grep -qF -- "$2" <<< "$1"; }
 rc_is() { [[ "${RC}" -eq "$1" ]]; }
 matches() { [[ "$1" =~ $2 ]]; }
+# Number of lines of --dry-run output that set environment variable $2 (a value is
+# printed REDACTED when the name holds PASSWORD or SECRET, so count the names).
+env_lines() { grep -c "^  $2=" <<< "$1"; }
 
 # ── fixtures ────────────────────────────────────────────────────────────
 
@@ -89,7 +92,7 @@ check 'runs the node that was found on PATH' contains "${OUT}" "-- ${NODE}/node 
 check 'runs the stub install, not a host path' contains "${OUT}" "${T}/app/node_modules/@openchamber/web/bin/cli.js"
 check 'mounts the install read-only' contains "${OUT}" "--ro-bind ${T}/app ${T}/app"
 check 'enterprise mode is on' contains "${OUT}" 'OPENCHAMBER_ENTERPRISE_MODE=1'
-check 'network access is allowed for the private network' contains "${OUT}" 'OPENCHAMBER_ALLOW_NETWORK_ACCESS=1'
+check 'network access is not granted through the environment (the policy file does it)' [ "$(env_lines "${OUT}" OPENCHAMBER_ALLOW_NETWORK_ACCESS)" -eq 0 ]
 check 'the push relay is off' contains "${OUT}" 'OPENCHAMBER_PUSH_RELAY_DISABLED=true'
 check 'OpenCode is the installed binary' contains "${OUT}" "OPENCODE_BINARY=${T}/oc2/opencode.exe"
 check 'the UI password is set and hidden' contains "${OUT}" "OPENCHAMBER_UI_PASSWORD='REDACTED'"
@@ -98,10 +101,42 @@ check 'the agent is told not to use the credentials it inherits' contains "${OUT
 check 'a tmpfs covers the run directory (UI password file)' contains "${OUT}" "${T}/home/.local/share/openchamber/run"
 check 'the data directory is the launcher own, not an OpenChamber outside a sandbox' \
     contains "${OUT}" "--bind ${T}/home/.local/share/bwopenchamber ${T}/home/.local/share/openchamber"
-check 'no policy file is mounted' lacks "${OUT}" '/etc/openchamber'
+check 'the policy file is mounted read-only from a descriptor' contains "${OUT}" '--ro-bind-data'
+check '... at the path OpenChamber reads' contains "${OUT}" '/etc/openchamber/policy.json'
+check 'no host policy file is bound' lacks "${OUT}" '--ro-bind /etc/openchamber'
+# The generated file is printed after the command as '# ' lines (--dry-run).
+policy_text="$(sed -n '/filled by the relay with the OpenChamber policy file/,/^$/p' <<< "${OUT}" | sed -n 's/^# //p' | grep -E '^ *[{}"]')"
+check 'the policy file is valid JSON' python3 -c 'import json,sys; json.loads(sys.argv[1])' "${policy_text}"
+check 'the policy turns enterprise mode on' contains "${policy_text}" '"enterpriseMode": true'
+check 'the policy allows the private network address (a file, so it governs)' contains "${policy_text}" '"allowNetworkAccess": true'
+check 'the policy pins the installed OpenCode, which a saved setting then cannot override' contains "${policy_text}" "\"opencodeBinary\": \"${T}/oc2/opencode.exe\""
+check 'the policy allows no extension' contains "${policy_text}" '"allowedExtensions": []'
+check 'the policy hides the built-in skills catalogues' contains "${policy_text}" '"hideBuiltinSkillCatalogs": true'
+check 'the policy holds no secret' lacks "${policy_text}" 'PASSWORD'
 check 'the printed info names the ssh tunnel' contains "${ERR}" 'ssh -L 24700:127.'
 check 'the sandbox is named' contains "${OUT}" 'BWRAP_SANDBOX=bwopenchamber'
 check 'the agent is told what it runs under' contains "${OUT}" 'This session runs under OpenChamber'
+
+# ── the port pool does not depend on running sessions ────────────────────
+
+# Hold the first port on this user's publish address, as a real bwopenchamber or
+# bwopencode2 --serve session would, then dry-run again: the stubbed probe means
+# the answer does not change (without it the dry run would pick the next port).
+run -- --ssh-config
+busy_addr="$(sed -n 's/.*LocalForward 24700 \(127\.[0-9.]*\):24700.*/\1/p' <<< "${OUT}")"
+python3 -c 'import socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], 24700))
+s.listen()
+time.sleep(40)' "${busy_addr}" &
+busy_pid=$!
+sleep 1
+check 'the test holds the first port on the publish address' matches "${busy_addr}" '^127\.[0-9]+\.[0-9]+\.1$'
+run --
+check 'a port held by another session does not change the port the tests expect' contains "${OUT}" '--port 24700'
+kill "${busy_pid}" 2> /dev/null
+wait "${busy_pid}" 2> /dev/null
 
 # ── arguments ────────────────────────────────────────────────────────────
 
@@ -137,7 +172,6 @@ check 'OPENCODE_PORT is not passed' lacks "${OUT}" 'OPENCODE_PORT='
 check 'OPENCODE_SKIP_START is not passed' lacks "${OUT}" 'OPENCODE_SKIP_START'
 # --dry-run prints a variable whose name holds PASSWORD or SECRET as REDACTED, so
 # the values cannot show: check the names, and that ours is the only one of each.
-env_lines() { grep -c "^  $2=" <<< "$1"; }
 check 'no host OPENCODE_SERVER_PASSWORD is passed' lacks "${OUT}" 'OPENCODE_SERVER_PASSWORD='
 check 'no host OPENCODE_PASSWORD is passed' lacks "${OUT}" 'OPENCODE_PASSWORD='
 check 'the UI password is ours alone, not the host one' [ "$(env_lines "${OUT}" OPENCHAMBER_UI_PASSWORD)" -eq 1 ]

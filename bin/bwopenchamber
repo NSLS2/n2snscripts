@@ -21,17 +21,19 @@
 # bwopencode2 needs.
 #
 # What differs from bwopencode2 --serve:
-#   - The server is OpenChamber.  OpenChamber starts and owns its OpenCode, with
-#     OPENCODE_BINARY fixed to the installed OpenCode 2 binary; OPENCODE_HOST,
-#     OPENCODE_PORT, OPENCODE_SKIP_START and every other host OPENCODE_* or
-#     OPENCHAMBER_* variable never reach it.
+#   - The server is OpenChamber.  OpenChamber starts and owns its OpenCode;
+#     OPENCODE_HOST, OPENCODE_PORT, OPENCODE_SKIP_START and every other host
+#     OPENCODE_* or OPENCHAMBER_* variable never reach it.
 #   - The port comes from the same pool as `bwopencode2 --serve`, claimed in the
 #     same state directory, so one ssh_config alias (--ssh-config) covers both.
-#   - Enterprise mode is forced on through the environment (no tunnels, no
-#     public relay, no classification service, no adding model providers in the
-#     app).  /etc/openchamber/policy.json is NOT mounted: a policy file would
-#     override the environment, and the environment is where this launcher
-#     says that the server may listen on the private network's interface.
+#   - The policy is a read-only /etc/openchamber/policy.json that this launcher
+#     generates inside the sandbox (the host's file is not visible there):
+#     enterprise mode (no tunnels, no public relay, no classification service, no
+#     adding model providers in the app), the installed OpenCode 2 pinned, and
+#     allowNetworkAccess true because the server listens on the private
+#     network's interface.  It is a file, not environment variables, because
+#     without one a saved setting (settings.json, which the agent can write)
+#     overrides OPENCODE_BINARY, and only a policy file outranks the settings.
 #   - OpenChamber's data directory (settings, projects, chats, worktrees) is
 #     kept on the host in ~/.local/share/bwopenchamber, apart from any
 #     OpenChamber run outside a sandbox.  Its run/ directory, where OpenChamber
@@ -415,13 +417,43 @@ och_print_info() {
 # data directory's run/ holds OpenChamber's pid files and instance files, and
 # the instance file contains the UI password in plain text, so it is an empty
 # tmpfs: nothing there persists and the password never reaches the host.
-# /etc/openchamber/policy.json is deliberately not mounted (see the header).
 build_openchamber_mounts() {
     BWRAP_ARGS+=(--ro-bind "${OCH_DIR}" "${OCH_DIR}")
     _MOUNTED_PREFIXES["${OCH_DIR}"]=1
     BWRAP_ARGS+=(
         --bind "${OCH_DATA_SRC}" "${OCH_DATA_DIR}"
         --tmpfs "${OCH_DATA_DIR}/run"
+    )
+}
+
+# The policy file OpenChamber reads from its fixed path (see the header).  It is
+# generated here and mounted read-only from a descriptor, so the agent cannot
+# change it and the host's /etc/openchamber/policy.json plays no part.  It holds
+# no secret.  Must run after build_etc_mounts (which sets up /etc).
+och_policy_json() {
+    local _bin
+    _bin="$(_bwrap_json_quote "${OC2_INSTALL_BIN}")" || return 1
+    printf '{\n'
+    printf '    "enterpriseMode": true,\n'
+    printf '    "organization": "NSLS-II (bwopenchamber)",\n'
+    printf '    "allowNetworkAccess": true,\n'
+    printf '    "allowedExtensions": [],\n'
+    printf '    "allowLocalExtensions": false,\n'
+    printf '    "opencodeBinary": %s,\n' "${_bin}"
+    printf '    "hideBuiltinSkillCatalogs": true\n'
+    printf '}'
+}
+
+build_openchamber_policy() {
+    local _text
+    if ! _text="$(och_policy_json)"; then
+        echo "Error: bwopenchamber: cannot write the OpenChamber policy (unusual characters in ${OC2_INSTALL_BIN})." >&2
+        exit 1
+    fi
+    bwrap_fd_from_data "OpenChamber policy file, mounted at /etc/openchamber/policy.json" "${_text}"
+    BWRAP_ARGS+=(
+        --dir /etc/openchamber
+        --ro-bind-data "${_BWRAP_FD}" /etc/openchamber/policy.json
     )
 }
 
@@ -432,7 +464,6 @@ build_openchamber_env() {
     SANDBOX_ENV+=(
         "OPENCHAMBER_DATA_DIR=${OCH_DATA_DIR}"
         "OPENCHAMBER_ENTERPRISE_MODE=1"
-        "OPENCHAMBER_ALLOW_NETWORK_ACCESS=1"
         "OPENCHAMBER_PUSH_RELAY_DISABLED=true"
         "OPENCODE_BINARY=${OC2_INSTALL_BIN}"
     )
@@ -528,6 +559,7 @@ main() {
     build_opencode2_cache_mount
     build_opencode2_state_dir
     build_openchamber_mounts
+    build_openchamber_policy
     build_git_mounts
     build_pixi_mounts
     build_ccache_mounts
