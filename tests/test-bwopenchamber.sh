@@ -269,6 +269,15 @@ check '... listing what was found with versions' contains "${ERR}" "${T}/node/22
 check '... and a binary that is not node' contains "${ERR}" "${T}/nodebin22/node-99  (no version)"
 check '... and what to do on RHEL 10' contains "${ERR}" 'install nodejs24'
 check '... and the override' contains "${ERR}" 'BWOPENCHAMBER_NODE=/path/to/node'
+# With no node on PATH at all, the first versioned binary must not win just for being
+# first: the newest one that is new enough does.
+mkdir -p "${T}/nonode-bin"
+for _f in /usr/bin/*; do
+    case "${_f##*/}" in node | node-* | nodejs*) ;; *) ln -sf "${_f}" "${T}/nonode-bin/${_f##*/}" ;; esac
+done
+NODE="${T}/no-nodes" run PATH="${T}/nonode-bin" BWOPENCHAMBER_NODE_DIRS="${T}/nodebin" --
+check 'no node on PATH: launches with a versioned node' rc_is 0
+check '... the newest of them, not the first found' contains "${OUT}" "-- ${T}/nodebin/node-25 "
 NODE="${T}/node/24.14.0" run -- --exec 'bash -c true'
 check '--exec also finds a node' rc_is 0
 NODE="${T}/node/24.14.0"
