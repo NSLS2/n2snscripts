@@ -6,8 +6,9 @@ masked privileged binaries, ephemeral auth on shared accounts, and
 filesystem isolation from the rest of the host. See the NSLS-II
 coding-agents documentation for the policy these wrappers implement.
 
-All five wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
-for sandbox construction. Each wrapper's `--help` is the authoritative
+All six wrappers use the shared library `lib/bwrap_sandbox_lib.sh`
+for sandbox construction (`bwopenchamber` through `bwopencode2`, which it
+sources). Each wrapper's `--help` is the authoritative
 option list; the tables below summarise the common surface.
 
 [bwrap]: https://github.com/containers/bubblewrap
@@ -1201,6 +1202,158 @@ because it needs a browser or the real launcher: signing in with the link in a
 browser, entering the password, a Ctrl-C from the terminal, and two sessions
 open in one browser. Whether the agent can read `OPENCODE_PASSWORD` in tool
 output (`printenv`) is also unchecked.
+
+## `bwopenchamber`
+
+Launches [OpenChamber](https://openchamber.dev) (npm `@openchamber/web`), a web
+UI for OpenCode, inside a bubblewrap sandbox. OpenChamber is a Node.js server
+that starts its own `opencode serve` and adds a browser terminal, git and
+worktree handling, scheduled tasks and session goals on top of it.
+
+```text
+bwopenchamber [bwopenchamber-options]
+bwopenchamber --ssh-config
+```
+
+**Everything runs in the one sandbox.** The OpenChamber server, its OpenCode,
+the browser terminal's shells, git, worktree commands, project start commands,
+scheduled tasks and every tool call the agent makes are processes of this
+sandbox. Only the browser is outside, on another machine, reached through an
+ssh tunnel. This is deliberate: OpenChamber is not only a screen. An
+OpenChamber that runs outside a sandbox in front of a sandboxed OpenCode
+(`OPENCODE_HOST`, or a Windows or desktop install) would run the terminal, git
+and worktree commands unsandboxed, and gives the agent tools that call back into
+it. Do not connect one to `bwopencode2 --serve`.
+
+It is a launcher of its own, not a mode of `bwopencode2`: it sources
+`bin/bwopencode2` for the OpenCode 2 mounts, environment, [database
+guard](#database-guard) and the [`--serve`](#--serve-the-web-ui-from-a-browser)
+port pool, so a fix made there applies here. Moving that shared code into the
+library is a follow-up.
+
+### What it needs
+
+- **Node.js 24.14 or newer** on `PATH` (OpenChamber's own requirement); the
+  launcher checks the version.
+- **OpenChamber** in `/opt/nsls2/openchamber` (`node_modules/@openchamber/web`),
+  mounted read-only. `BWOPENCHAMBER_DIR` names another install. The ansible base
+  role does not install it yet.
+- **OpenCode 2** in `/opt/nsls2/opencode2` and an OpenCode config, as for
+  `bwopencode2`.
+- A private network backend (`pasta` or `slirp4netns`), or `--share-net`: see
+  [Network](#network).
+
+### Reaching it
+
+- **Port and address.** The port comes from the same pool as `bwopencode2
+  --serve` (24700-24709, `BWOPENCODE2_SERVE_PORTS=LO-HI`), claimed in the same
+  state directory, so a port is never given to both and **one ssh_config block
+  covers both**: `bwopenchamber --ssh-config` prints the same block as
+  `bwopencode2 --serve-ssh-config`. `--port N` asks for one port. It is published
+  like `--publish`, always on your first publish address `127.H1.H2.1`, and the
+  launcher prints the `ssh -L` command and the URL.
+- **Private network.** The server listens on `0.0.0.0` inside the sandbox's
+  private network, where only the published port reaches it. Other users of the
+  host cannot reach it, and neither can OpenCode's own port (a random one on
+  `127.0.0.1` inside the sandbox). With `--share-net` it binds your publish
+  address on the host network instead, which other users of the host can reach
+  (the password still applies); use it only where neither backend works.
+- **Password.** Random for each session, printed once; `BWOPENCODE2_SERVE_PASSWORD`
+  (12 characters or more) sets a fixed one for every session that uses it. It
+  reaches the server as `OPENCHAMBER_UI_PASSWORD` in the sandbox environment,
+  never on a command line.
+- **Preview.** A dev server started by the agent is not reachable from your
+  browser by itself. Publish its port with `--publish PORT` (also on your
+  `127.H1.H2.1`) and add a forward for it.
+- **No arguments.** The server is always `serve --foreground`, on the published
+  address. `--host`, `--lan`, `tunnel`, `startup`, `connect-url` and every other
+  OpenChamber argument are refused. `--exec CMD` runs `CMD` in the same sandbox
+  (a shell for diagnostics) without a server, password or port.
+
+### Policy: what is turned off
+
+- **Enterprise mode is forced on through the environment**
+  (`OPENCHAMBER_ENTERPRISE_MODE=1`): no tunnels (Cloudflare, ngrok, Tailscale),
+  no public relay, no classification service (Jev), no adding model providers
+  in the app, no outside integrations catalogue, no extensions that send data
+  off the machine, generic push-notification titles. The push relay is also
+  switched off (`OPENCHAMBER_PUSH_RELAY_DISABLED=true`).
+- **`OPENCHAMBER_ALLOW_NETWORK_ACCESS=1`** lets the server listen on the private
+  network's interface; enterprise mode refuses that by default.
+- **`/etc/openchamber/policy.json` is not mounted.** When that file turns
+  enterprise mode on, only the file decides, and it would override the variable
+  above. Hosts can still deploy it for an OpenChamber run outside a sandbox,
+  with `allowNetworkAccess` left `false` there.
+- **OpenCode is pinned** with `OPENCODE_BINARY` to the installed OpenCode 2
+  binary. The launcher never passes `OPENCODE_HOST`, `OPENCODE_PORT`,
+  `OPENCODE_SKIP_START`, a server password or any other host `OPENCODE_*` or
+  `OPENCHAMBER_*` variable: the sandbox environment starts clean, and
+  `AIFAPIM_*`, the allowlisted `OPENCODE_*` switches and, with
+  `--github-tokens`, the `GH_TOKEN_*` variables are added as for `bwopencode2`.
+- **Which model providers may be used** is decided by OpenCode, not
+  OpenChamber (the managed `/etc/opencode` config is mounted as for
+  `bwopencode2`).
+
+### Data and mounts
+
+- Everything `bwopencode2` mounts (config read-only, OpenCode data and cache,
+  authoring directories, git, pixi, npm, N2C tokens with `--n2c-token`), plus the
+  OpenChamber install read-only and OpenChamber's own data directory.
+- **OpenChamber's data** (settings, projects, chats, worktrees, logs) is
+  `~/.local/share/bwopenchamber` on the host, mounted at
+  `~/.local/share/openchamber` in the sandbox: apart from any OpenChamber run
+  outside a sandbox, which is never mounted.
+- **`run/` is an empty tmpfs.** OpenChamber writes its pid file and an instance
+  file there, and the instance file contains the UI password in plain text (checked
+  with 2.7.0), so it must not reach the persistent directory.
+- **Projects.** Only the directory you start in (its git root) is mounted
+  read-write, so a project that OpenChamber opens elsewhere needs `--rw-path`.
+  Starting in a parent directory that is not itself a git repository, such as
+  `~/Projects`, gives it all the repositories below.
+- **Do not sign in to GitHub or add SSH keys in OpenChamber.** Whatever it
+  stores is readable by the agent, and it can merge pull requests and push.
+  Use `--github-tokens` for read-only access. The agent is told this in the
+  sandbox context.
+
+### Connecting from another machine
+
+Forward the port (`ssh -L`, or the alias from `--ssh-config`) and open
+`http://127.0.0.1:PORT/` in a browser or the installed PWA; sign in with the
+password. Keep the same port number at both ends, since the login cookie is
+named by it.
+
+The OpenChamber **desktop app's "Remote Instances" over SSH is not expected to
+work**, and has not been tried: it forwards the remote machine's own
+`127.0.0.1`, while this server is published on `127.H1.H2.1`. Its "managed"
+mode would also install and start an OpenChamber on the remote host outside any
+sandbox. Use the browser or PWA through the tunnel.
+
+### What was checked
+
+Checked with `tests/test-bwopenchamber.sh` (61 checks through `--dry-run`:
+argument refusals, the environment and mounts built, hostile host variables
+dropped, password handling, Node and install checks) and by running OpenChamber
+2.7.0 with the launcher's environment in a private network namespace on
+OpenCode 2.2.7: the server answers on `0.0.0.0`, the API gives 401 without the
+password and with a wrong one and 200 with the right one, the managed OpenCode
+starts from `OPENCODE_BINARY` and receives `OPENCODE_CONFIG_CONTENT` (the
+sandbox context), and Ctrl-C stops both. The database guard refused to start
+next to an older OpenCode build, as designed.
+
+**Not checked**, because the development sandbox cannot start a nested `bwrap`
+launch: a real launch with the sandbox and `pasta` publishing the port, the
+browser terminal inside the sandbox (`node-pty`), git and worktrees, the
+published port from an ssh tunnel, and a browser sign-in. Check these on a host
+first (output to a file, as the repository's other manual checks):
+
+```text
+bwopenchamber                       # in a project directory
+ss -ltn                             # on the host: nothing on 3000 or a random port
+curl -s -o /dev/null -w '%{http_code}\n' http://127.H1.H2.1:PORT/auth/session   # 401
+# in the browser through the tunnel: sign in, open the terminal and run
+#   echo $BWRAP_SANDBOX; ls ~/.ssh; ssh -V     # bwopenchamber; fails; fails
+# start a session, then Ctrl-C and confirm no opencode process is left
+```
 
 ## `bwclaude`
 

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Run bwopenchamber's main() with one change for tests: resolve_bwrap_bin accepts
+# the bwrap of the development sandbox, which is not owned by root there.  The
+# check itself is the library's and is not weakened for real runs.
+#
+#   tests/bwopenchamber-harness [bwopenchamber options]
+set -euo pipefail
+here="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=../bin/bwopenchamber
+source "${here}/../bin/bwopenchamber"
+resolve_bwrap_bin() {
+	echo /usr/bin/bwrap
+}
+# A stub OpenCode 2 binary, so the tests need no installation.
+# shellcheck disable=SC2034  # read by bwopencode2's functions
+[[ -z "${HARNESS_OC2_BIN:-}" ]] || OC2_INSTALL_BIN="${HARNESS_OC2_BIN}"
+main "$@"
