@@ -170,8 +170,9 @@
 
 set -euo pipefail
 
-# Source the shared sandbox library.
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+# Source the shared sandbox library.  The directory comes from this file, not
+# from $0, so it is right when bwopenchamber or a test sources this file.
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck source=../lib/bwrap_sandbox_lib.sh
 source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 
