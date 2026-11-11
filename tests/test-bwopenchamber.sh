@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Tests for bin/bwopenchamber (argument handling, the environment and mounts it
+# builds), through --dry-run.
+#
+# Needs bash and bwrap.  Uses a temporary HOME, a stub node, a stub OpenCode 2
+# binary and a stub OpenChamber install, so it touches no real data and needs
+# none of them installed.  --share-net keeps it independent of pasta and
+# slirp4netns.  tests/bwopenchamber-harness accepts the development machine's
+# bwrap; the library's owner check is not weakened for real runs.
+# Run on any host:  tests/test-bwopenchamber.sh
+#
+# What it cannot show: a real launch (the sandbox, the private network, the
+# server answering), which needs a host where bwrap is root-owned.  See
+# docs/bw-wrappers.md ("bwopenchamber", manual check).
+
+# shellcheck disable=SC2016  # patterns are single quoted on purpose
+set -uo pipefail
+
+ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+HARNESS="${ROOT}/tests/bwopenchamber-harness"
+T="$(mktemp -d "${TMPDIR:-/tmp}/bwopenchamber-test.XXXXXX")"
+trap 'rm -rf "${T}"' EXIT
+
+PASS=0
+FAIL=0
+check() { # check DESCRIPTION CONDITION-COMMAND...
+    local _desc="$1"
+    shift
+    if "$@"; then
+        PASS=$((PASS + 1))
+        printf 'ok    %s\n' "${_desc}"
+    else
+        FAIL=$((FAIL + 1))
+        printf 'FAIL  %s\n' "${_desc}"
+    fi
+}
+contains() { grep -qF -- "$2" <<< "$1"; }
+lacks() { ! grep -qF -- "$2" <<< "$1"; }
+rc_is() { [[ "${RC}" -eq "$1" ]]; }
+
+# ── fixtures ────────────────────────────────────────────────────────────
+
+mkdir -p "${T}/home/.config/opencode2/opencode" "${T}/work" "${T}/oc2"
+echo '{}' > "${T}/home/.config/opencode2/opencode/opencode.json"
+mkdir -p "${T}/app/node_modules/@openchamber/web/bin"
+echo '// stub' > "${T}/app/node_modules/@openchamber/web/bin/cli.js"
+printf '#!/bin/sh\necho "opencode v2.2.7"\n' > "${T}/oc2/opencode.exe"
+chmod +x "${T}/oc2/opencode.exe"
+make_node() { # make_node DIR VERSION
+    mkdir -p "$1"
+    printf '#!/bin/sh\necho "v%s"\n' "$2" > "$1/node"
+    chmod +x "$1/node"
+}
+make_node "${T}/node/24.14.0" 24.14.0
+make_node "${T}/node/24.13.9" 24.13.9
+make_node "${T}/node/22.23.2" 22.23.2
+make_node "${T}/node/25.1.0" 25.1.0
+NODE="${T}/node/24.14.0"
+
+# run [env VAR=VALUE ...] -- ARGS...: dry-run the launcher; sets OUT, ERR, RC.
+# Host variables of the kinds the launcher must not pass on are cleared first.
+run() {
+    local -a _env=()
+    while [[ $# -gt 0 && "$1" != -- ]]; do
+        _env+=("$1")
+        shift
+    done
+    shift
+    OUT="$(cd "${T}/work" && env -u OPENCODE_HOST -u OPENCODE_PORT -u OPENCODE_SKIP_START \
+        -u OPENCODE_SERVER_PASSWORD -u OPENCODE_PASSWORD -u OPENCHAMBER_HOST \
+        -u OPENCHAMBER_UI_PASSWORD -u OPENCHAMBER_RELAY_URL -u OPENCODE2_DB_GUARD \
+        -u BWOPENCODE2_SERVE_PASSWORD -u BWOPENCODE2_SERVE_PORTS \
+        -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME \
+        HOME="${T}/home" PATH="${NODE}:${PATH}" BWOPENCHAMBER_DIR="${T}/app" \
+        HARNESS_OC2_BIN="${T}/oc2/opencode.exe" ${_env[@]+"${_env[@]}"} \
+        "${HARNESS}" --dry-run --share-net "$@" 2> "${T}/err")"
+    RC=$?
+    ERR="$(cat "${T}/err")"
+}
+
+# ── the normal launch ────────────────────────────────────────────────────
+
+run --
+check 'a plain launch succeeds' rc_is 0
+check 'runs the server in the foreground' contains "${OUT}" 'cli.js serve --foreground --host '
+check 'takes the first port of the shared pool' contains "${OUT}" '--port 24700'
+check 'runs the node that was found on PATH' contains "${OUT}" "-- ${NODE}/node "
+check 'runs the stub install, not a host path' contains "${OUT}" "${T}/app/node_modules/@openchamber/web/bin/cli.js"
+check 'mounts the install read-only' contains "${OUT}" "--ro-bind ${T}/app ${T}/app"
+check 'enterprise mode is on' contains "${OUT}" 'OPENCHAMBER_ENTERPRISE_MODE=1'
+check 'network access is allowed for the private network' contains "${OUT}" 'OPENCHAMBER_ALLOW_NETWORK_ACCESS=1'
+check 'the push relay is off' contains "${OUT}" 'OPENCHAMBER_PUSH_RELAY_DISABLED=true'
+check 'OpenCode is the installed binary' contains "${OUT}" "OPENCODE_BINARY=${T}/oc2/opencode.exe"
+check 'the UI password is set and hidden' contains "${OUT}" "OPENCHAMBER_UI_PASSWORD='REDACTED'"
+check 'a tmpfs covers the run directory (UI password file)' contains "${OUT}" "${T}/home/.local/share/openchamber/run"
+check 'the data directory is the launcher own, not an OpenChamber outside a sandbox' \
+    contains "${OUT}" "--bind ${T}/home/.local/share/bwopenchamber ${T}/home/.local/share/openchamber"
+check 'no policy file is mounted' lacks "${OUT}" '/etc/openchamber'
+check 'the printed info names the ssh tunnel' contains "${ERR}" 'ssh -L 24700:127.'
+check 'the sandbox is named' contains "${OUT}" 'BWRAP_SANDBOX=bwopenchamber'
+check 'the agent is told what it runs under' contains "${OUT}" 'This session runs under OpenChamber'
+
+# ── arguments ────────────────────────────────────────────────────────────
+
+for _args in '--host 0.0.0.0' '--lan' 'tunnel start' 'startup enable' 'connect-url --relay' '--ui-password x'; do
+    # shellcheck disable=SC2086  # word splitting of the argument list is the point
+    run -- ${_args}
+    check "refuses the OpenChamber argument '${_args}'" rc_is 1
+    check "  ... and says why ('${_args}')" contains "${ERR}" 'takes no OpenChamber arguments'
+done
+
+run -- --port 24705
+check '--port inside the range is used' contains "${OUT}" '--port 24705'
+run -- --port 3000
+check '--port outside the range is refused' rc_is 1
+run -- --port abc
+check '--port that is not a number is refused' rc_is 1
+run -- --port
+check '--port without a value is refused' rc_is 1
+
+run BWOPENCODE2_SERVE_PORTS=24800-24802 --
+check 'the port range can be changed' contains "${OUT}" '--port 24800'
+run BWOPENCODE2_SERVE_PORTS=49370-49380 --
+check 'a range that holds the shared OpenCode service port is refused' rc_is 1
+
+# ── what the host cannot inject ──────────────────────────────────────────
+
+run OPENCODE_HOST=http://127.0.0.1:49374 OPENCODE_PORT=49374 OPENCODE_SKIP_START=true \
+    OPENCODE_SERVER_PASSWORD=hostsecret1 OPENCODE_PASSWORD=hostsecret2 \
+    OPENCHAMBER_HOST=0.0.0.0 OPENCHAMBER_UI_PASSWORD=hostsecret3 OPENCHAMBER_RELAY_URL=wss://x.example/ws --
+check 'launch with hostile host variables succeeds' rc_is 0
+check 'OPENCODE_HOST is not passed' lacks "${OUT}" 'OPENCODE_HOST='
+check 'OPENCODE_PORT is not passed' lacks "${OUT}" 'OPENCODE_PORT='
+check 'OPENCODE_SKIP_START is not passed' lacks "${OUT}" 'OPENCODE_SKIP_START'
+check 'no host server password is passed' lacks "${OUT}" 'hostsecret'
+check 'OPENCHAMBER_HOST is not passed' lacks "${OUT}" 'OPENCHAMBER_HOST='
+check 'no relay URL is passed' lacks "${OUT}" 'OPENCHAMBER_RELAY_URL'
+check 'the dropped OPENCODE_* names are reported, not their values' contains "${ERR}" 'OPENCODE_HOST'
+
+# ── password ─────────────────────────────────────────────────────────────
+
+run BWOPENCODE2_SERVE_PASSWORD=short --
+check 'a fixed password under 12 characters is refused' rc_is 1
+run BWOPENCODE2_SERVE_PASSWORD=a-fixed-password-123 --
+check 'a fixed password is accepted' rc_is 0
+check '... and passed to the server as the UI password' contains "${OUT}" "OPENCHAMBER_UI_PASSWORD='REDACTED'"
+check '... and never printed' lacks "${OUT}${ERR}" 'a-fixed-password-123'
+
+# ── --exec ───────────────────────────────────────────────────────────────
+
+run -- --exec 'bash -c true'
+check '--exec runs the command, not the server' contains "${OUT}" '-- bash -c true'
+check '--exec sets up no UI password' lacks "${OUT}" 'OPENCHAMBER_UI_PASSWORD'
+check '--exec starts no server' lacks "${OUT}" 'serve --foreground'
+run -- --exec 'bash -c true' --port 24701
+check '--exec with --port is refused' rc_is 1
+
+# ── Node and installs ────────────────────────────────────────────────────
+
+NODE="${T}/node/24.13.9" run --
+check 'Node 24.13 is refused' rc_is 1
+check '... and the version is named' contains "${ERR}" '24.13.9'
+NODE="${T}/node/22.23.2" run --
+check 'Node 22 is refused' rc_is 1
+NODE="${T}/node/25.1.0" run --
+check 'Node 25 is accepted' rc_is 0
+NODE="${T}/node/24.14.0"
+
+run BWOPENCHAMBER_DIR="${T}/missing" --
+check 'a missing install is refused' rc_is 1
+check '... with a message' contains "${ERR}" 'OpenChamber is not installed'
+
+# ── --ssh-config and --help ──────────────────────────────────────────────
+
+run -- --ssh-config
+check '--ssh-config prints the forwards' contains "${OUT}" 'LocalForward 24700 127.'
+check '--ssh-config prints every port of the pool' contains "${OUT}" 'LocalForward 24709 127.'
+run -- --help
+check '--help succeeds' rc_is 0
+check '--help says no argument is passed through' contains "${OUT}" 'No OpenChamber argument is passed through'
+
+printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
+[[ "${FAIL}" -eq 0 ]]

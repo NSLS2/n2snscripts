@@ -1,0 +1,540 @@
+#!/usr/bin/env bash
+# bwopenchamber — Run OpenChamber (the web UI for OpenCode) inside a bubblewrap
+# (bwrap) sandbox.
+#
+# OpenChamber (npm @openchamber/web, https://openchamber.dev) is a Node.js web
+# server that starts its own `opencode serve` and adds a terminal, git and
+# worktree handling, scheduled tasks and so on.  All of that does work, so all
+# of it runs INSIDE this one sandbox: the server, its OpenCode, the browser
+# terminal's shells, git, and every tool call the agent makes.  Only the browser
+# is outside, on another machine, reached through an ssh tunnel.  Do not point
+# an OpenChamber that runs outside a sandbox at a sandboxed OpenCode: its
+# terminal, git and worktree commands, and the tools it gives the agent, would
+# run unsandboxed.
+#
+# It sources bwopencode2 for the OpenCode 2 mounts, environment, database guard
+# and the --serve port pool, so a sandbox fix made there applies here too.
+#
+# Requires: Node.js >= 24.14 on PATH, OpenChamber installed in
+# /opt/nsls2/openchamber (BWOPENCHAMBER_DIR overrides; mounted read-only) and
+# OpenCode 2 in /opt/nsls2/opencode2, and the same OpenCode config
+# bwopencode2 needs.
+#
+# What differs from bwopencode2 --serve:
+#   - The server is OpenChamber.  OpenChamber starts and owns its OpenCode, with
+#     OPENCODE_BINARY fixed to the installed OpenCode 2 binary; OPENCODE_HOST,
+#     OPENCODE_PORT, OPENCODE_SKIP_START and every other host OPENCODE_* or
+#     OPENCHAMBER_* variable never reach it.
+#   - The port comes from the same pool as `bwopencode2 --serve`, claimed in the
+#     same state directory, so one ssh_config alias (--ssh-config) covers both.
+#   - Enterprise mode is forced on through the environment (no tunnels, no
+#     public relay, no classification service, no adding model providers in the
+#     app).  /etc/openchamber/policy.json is NOT mounted: a policy file would
+#     override the environment, and the environment is where this launcher
+#     says that the server may listen on the private network's interface.
+#   - OpenChamber's data directory (settings, projects, chats, worktrees) is
+#     kept on the host in ~/.local/share/bwopenchamber, apart from any
+#     OpenChamber run outside a sandbox.  Its run/ directory, where OpenChamber
+#     writes the UI password in plain text, is an empty tmpfs.
+#   - No OpenChamber command-line argument is passed through: the server is
+#     always `serve --foreground` on the published address.
+#
+# Usage:
+#   bwopenchamber [bwopenchamber-options]
+#   bwopenchamber --help
+#
+# Options: see --help.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+# shellcheck source=bwopencode2
+source "${SCRIPT_DIR}/bwopencode2"
+# bwopencode2 set SCRIPT_DIR from $0; this launcher's directory is the same
+# unless a test harness sources this file.
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+# ═══════════════════════════════════════════════════════════════════
+# Tool-specific state
+# ═══════════════════════════════════════════════════════════════════
+
+OCH_DIR="${BWOPENCHAMBER_DIR:-/opt/nsls2/openchamber}"
+OCH_CLI_REL="node_modules/@openchamber/web/bin/cli.js"
+OCH_MIN_NODE_MAJOR=24
+OCH_MIN_NODE_MINOR=14
+OCH_CLI=""
+OCH_SERVE=1
+OCH_SSH_CONFIG=0
+OCH_DATA_SRC=""
+OCH_DATA_DIR=""
+
+# ═══════════════════════════════════════════════════════════════════
+# Replacements for functions of bwopencode2
+# ═══════════════════════════════════════════════════════════════════
+
+# The TUI tweaks of build_opencode2_env do not apply to a web server.
+build_opentui_zellij_env() { :; }
+
+parse_wrapper_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help | -h)
+                SHOW_HELP=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --exec)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --exec requires a command argument." >&2
+                    exit 1
+                fi
+                TEST_CMD="$2"
+                shift 2
+                ;;
+            --github-tokens)
+                # shellcheck disable=SC2034  # read by build_opencode2_env in bwopencode2
+                FORWARD_GH_TOKENS=1
+                shift
+                ;;
+            --new-session)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+                FORCE_NEW_SESSION=1
+                shift
+                ;;
+            --n2c-token)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --n2c-token requires a token name or 'all'." >&2
+                    exit 1
+                fi
+                add_n2c_token "$2"
+                shift 2
+                ;;
+            --no-sandbox-context)
+                # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+                SANDBOX_CONTEXT_ENABLED=0
+                shift
+                ;;
+            --port)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --port requires a port number." >&2
+                    exit 1
+                fi
+                SERVE_PORT_REQUEST="$2"
+                shift 2
+                ;;
+            --ssh-config)
+                OCH_SSH_CONFIG=1
+                shift
+                ;;
+            --publish)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_publish "$2"
+                shift 2
+                ;;
+            --host-port)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --host-port requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_host_port "$2"
+                shift 2
+                ;;
+            --share-net)
+                net_set_share
+                shift
+                ;;
+            --net-backend)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --net-backend requires pasta or slirp4netns." >&2
+                    exit 1
+                fi
+                net_set_backend "$2"
+                shift 2
+                ;;
+            --ro-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --ro-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RO_PATHS+=("$2")
+                shift 2
+                ;;
+            --rw-path)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --rw-path requires a path argument." >&2
+                    exit 1
+                fi
+                EXTRA_RW_PATHS+=("$2")
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    # shellcheck disable=SC2034  # consumed by library's print_dry_run/launch_sandbox
+    TOOL_ARGS=("$@")
+}
+
+show_help() {
+    cat << 'HELP_EOF'
+bwopenchamber — OpenChamber (web UI for OpenCode) inside a bubblewrap sandbox
+
+OpenChamber, its OpenCode, the browser terminal, git and every tool call run
+inside this one sandbox.  Open the UI from a browser on another machine through
+an ssh tunnel; the command, the URL and a password (new for each session) are
+printed at start.  The server listens on the sandbox's private network and is
+published only on your own loopback address 127.H1.H2.1.
+
+Wrapper options:
+  -h, --help      Show this message.
+  --dry-run       Print the bwrap command that would be run, then exit.
+  --port N        Use port N (inside the range) instead of the first free one of
+                  the range 24700-24709 (BWOPENCODE2_SERVE_PORTS=LO-HI changes
+                  it; the pool is shared with `bwopencode2 --serve`).  Fails if
+                  it is taken.
+  --ssh-config    Print the ssh_config block (one alias, one LocalForward per
+                  port of the range, to your address 127.H1.H2.1) for the
+                  machine your browser runs on, then exit.  The same block
+                  serves `bwopencode2 --serve`.
+  --exec CMD      Run CMD inside the sandbox instead of the server (a shell for
+                  diagnostics).  CMD is split on whitespace; no port, password
+                  or server is set up.
+  --publish PORT[:SANDBOXPORT]
+                  Also publish a server of the sandbox (for example a project's
+                  dev server, for OpenChamber's Preview) on your address
+                  127.H1.H2.1.  May be repeated.
+  --host-port PORT[:SANDBOXPORT]
+                  Make the host's 127.0.0.1:PORT reachable in the sandbox
+                  (pasta only).  May be repeated.
+  --share-net     Share the host network instead of a private one (the server
+                  then binds your address 127.H1.H2.1 itself).  Only for a host
+                  without pasta or slirp4netns; other users of the host can then
+                  reach the port.
+  --net-backend pasta|slirp4netns
+                  Use only this backend for the private network.
+  --n2c-token NAME
+                  Mount the N2C access token NAME (read-only) so skills inside
+                  the sandbox can call NSLS-II APIs.  May be repeated; `all`
+                  mounts every token present.  Off by default.
+  --ro-path PATH  Mount PATH read-only into the sandbox.  May be repeated.
+  --rw-path PATH  Mount PATH read-write into the sandbox.  May be repeated.
+                  Only the directory you start in is mounted read-write, so a
+                  project OpenChamber opens elsewhere needs --rw-path; start
+                  in a parent directory that is not a git repository to give it
+                  several projects.
+  --github-tokens Forward any GH_TOKEN_* environment variables into the sandbox
+                  (read-only tokens for the gh CLI).  Off by default.
+  --new-session   Force bwrap --new-session (breaks terminal resize).
+  --no-sandbox-context
+                  Do not generate the sandbox context file.
+
+The password is random for each session unless BWOPENCODE2_SERVE_PASSWORD is set
+(at least 12 characters; a fixed one is shared by every session that uses it).
+
+No OpenChamber argument is passed through, and nothing else in OpenChamber's
+own configuration is read from the host: tunnels, the public relay, the
+classification service and adding model providers in the app are off (enterprise
+mode), and OpenChamber's data is kept in ~/.local/share/bwopenchamber.  Do not
+sign in to GitHub or add SSH keys inside OpenChamber: the agent can read
+anything it stores.  Use --github-tokens for read-only access.
+
+Database guard: as for bwopencode2, the OpenCode 2 database is on NFS; set
+OPENCODE2_DB_GUARD=off to skip the checks once.  Not applied to --exec or
+--dry-run.
+
+HELP_EOF
+    net_print_help
+    exit 0
+}
+
+# Same shape as bwopencode2's, with an OpenChamber note.  The server's own
+# OpenCode is not run by this launcher, so the database guard identifies OpenCode
+# processes by the installed binary.
+guard_opencode2_db() {
+    [[ "${DRY_RUN}" -eq 0 && -z "${TEST_CMD}" ]] || return 0
+
+    local _lib="${SCRIPT_DIR}/../lib/opencode2-db-lock.sh"
+    [[ -r "${_lib}" ]] || return 0
+    # shellcheck source=../lib/opencode2-db-lock.sh
+    source "${_lib}"
+    oc2db_needs_guard serve || return 0
+
+    # shellcheck disable=SC2034  # read by oc2db_* in opencode2-db-lock.sh
+    OC2DB_PROG=bwopenchamber
+    # shellcheck disable=SC2153  # OC2_DATA_SRC is set by resolve_opencode2_paths
+    oc2db_guard "${OC2_DATA_SRC}" "${OC2_INSTALL_BIN}" || exit 1
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# OpenChamber-specific functions
+# ═══════════════════════════════════════════════════════════════════
+
+# Refuse what this launcher does not do; validate --port.
+och_check_args() {
+    if [[ -n "${TEST_CMD}" ]]; then
+        OCH_SERVE=0
+        if [[ -n "${SERVE_PORT_REQUEST}" ]]; then
+            echo "Error: --port does not apply to --exec." >&2
+            exit 1
+        fi
+    elif [[ ${#TOOL_ARGS[@]} -gt 0 ]]; then
+        echo "Error: bwopenchamber takes no OpenChamber arguments (got '${TOOL_ARGS[*]}'); the server is always started the same way." >&2
+        exit 1
+    fi
+    if [[ -n "${SERVE_PORT_REQUEST}" ]]; then
+        if [[ ! "${SERVE_PORT_REQUEST}" =~ ^[0-9]+$ ]] ||
+            ((10#${SERVE_PORT_REQUEST} < SERVE_PORT_LO || 10#${SERVE_PORT_REQUEST} > SERVE_PORT_HI)); then
+            echo "Error: --port must be a port in ${SERVE_PORT_LO}-${SERVE_PORT_HI} (the ssh_config range), got '${SERVE_PORT_REQUEST}'." >&2
+            exit 1
+        fi
+        SERVE_PORT_REQUEST=$((10#${SERVE_PORT_REQUEST}))
+    fi
+}
+
+# Node.js >= 24.14 (OpenChamber's own requirement), OpenChamber installed, and
+# the OpenCode 2 binary that OPENCODE_BINARY will name.
+och_check_install() {
+    local _v _major _minor
+    _v="$("${_TOOL_BIN}" --version 2> /dev/null || true)"
+    _v="${_v#v}"
+    if [[ ! "${_v}" =~ ^([0-9]+)\.([0-9]+) ]]; then
+        echo "Error: could not read the version of ${_TOOL_BIN} (got '${_v}')." >&2
+        exit 1
+    fi
+    _major="${BASH_REMATCH[1]}"
+    _minor="${BASH_REMATCH[2]}"
+    if ((_major < OCH_MIN_NODE_MAJOR || (_major == OCH_MIN_NODE_MAJOR && _minor < OCH_MIN_NODE_MINOR))); then
+        echo "Error: OpenChamber needs Node.js ${OCH_MIN_NODE_MAJOR}.${OCH_MIN_NODE_MINOR} or newer; ${_TOOL_BIN} is ${_v}." >&2
+        exit 1
+    fi
+
+    _bwrap_canonicalize_safe "${OCH_DIR}" "OpenChamber install dir"
+    OCH_DIR="${_BWRAP_CANON}"
+    OCH_CLI="${OCH_DIR}/${OCH_CLI_REL}"
+    if [[ ! -f "${OCH_CLI}" ]]; then
+        echo "Error: OpenChamber is not installed (no ${OCH_CLI})." >&2
+        echo "       It is installed by the ansible base role; BWOPENCHAMBER_DIR names another install." >&2
+        exit 1
+    fi
+    if [[ ! -x "${OC2_INSTALL_BIN}" ]]; then
+        echo "Error: OpenCode 2 is not installed (no ${OC2_INSTALL_BIN}); OpenChamber is told to use only that binary." >&2
+        exit 1
+    fi
+}
+
+och_resolve_paths() {
+    OCH_DATA_SRC="${_HOME}/.local/share/bwopenchamber"
+    OCH_DATA_DIR="${XDG_DATA_HOME}/openchamber"
+    _check_dir_safe "${OCH_DATA_SRC}" "OpenChamber data dir"
+}
+
+# Choose port and password and publish the port; give the sandbox its command.
+# Same publish rules as `bwopencode2 --serve`: always your first address
+# 127.H1.H2.1, which the ssh_config alias forwards to.
+och_prepare() {
+    SERVE_ADDR="$(net_publish_prefix).1"
+    serve_choose_port
+    serve_make_password
+    if [[ "${NET_SHARE}" -eq 1 ]]; then
+        SERVE_BIND="${SERVE_ADDR}"
+    else
+        # Forwarded connections arrive at the namespace's interface, not its
+        # loopback, so the server binds every address of the private namespace;
+        # only the published port reaches it.
+        SERVE_BIND="0.0.0.0"
+        net_add_publish "${SERVE_PORT}"
+        # shellcheck disable=SC2034  # read by bwrap_sandbox_lib.sh
+        NET_PUBLISH_ADDR="${SERVE_ADDR}"
+        # shellcheck disable=SC2034  # read by bwrap_sandbox_lib.sh
+        NET_PUBLISH_ADDR_FIXED_BY="bwopenchamber"
+    fi
+    _TOOL_CMD=("${_TOOL_BIN}" "${OCH_CLI}" serve --foreground --host "${SERVE_BIND}" --port "${SERVE_PORT}")
+    TOOL_ARGS=()
+}
+
+# Tell the user how to reach the server (stderr, before the exec).
+och_print_info() {
+    local _p="${SERVE_PORT}" _host _alias _addr="${SERVE_ADDR}"
+    if [[ "${NET_SHARE}" -eq 0 && "${_NET_PUBLISH_ADDR_EFFECTIVE}" != "${_addr}" ]]; then
+        echo "Error: the port was published on ${_NET_PUBLISH_ADDR_EFFECTIVE}, not ${_addr}." >&2
+        exit 1
+    fi
+    _host="$(serve_host_name)"
+    _alias="$(serve_ssh_alias)"
+    {
+        printf '\nbwopenchamber: sandboxed OpenChamber on %s:%s (this host only)\n' "${_addr}" "${_p}"
+        printf '  1. On the machine with your browser, forward the port:\n'
+        printf '       ssh -L %s:%s:%s %s\n' "${_p}" "${_addr}" "${_p}" "${_host}"
+        printf '     or use the ssh_config alias (bwopenchamber --ssh-config):  ssh %s\n' "${_alias}"
+        printf '  2. Open http://127.0.0.1:%s/ there (on this host itself: http://%s:%s/)\n' "${_p}" "${_addr}" "${_p}"
+        printf '     and sign in with the password.\n'
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            printf '     Password: (not shown on --dry-run)\n'
+        elif [[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]]; then
+            printf '     Password (new for this session): %s\n' "${SERVE_PASSWORD}"
+        else
+            printf '     Password: the value of BWOPENCODE2_SERVE_PASSWORD (shared by every session that uses it)\n'
+        fi
+        printf '  Do not sign in to GitHub or add SSH keys in OpenChamber: the agent can read them.\n'
+        printf '  Keep the same port number at both ends of the tunnel: the browser cookie is named by it.\n\n'
+    } >&2
+}
+
+# ── Mounts ───────────────────────────────────────────────────────
+# OpenChamber's install (read-only) and its data directory (read-write).  The
+# data directory's run/ holds OpenChamber's pid files and instance files, and
+# the instance file contains the UI password in plain text, so it is an empty
+# tmpfs: nothing there persists and the password never reaches the host.
+# /etc/openchamber/policy.json is deliberately not mounted (see the header).
+build_openchamber_mounts() {
+    BWRAP_ARGS+=(--ro-bind "${OCH_DIR}" "${OCH_DIR}")
+    _MOUNTED_PREFIXES["${OCH_DIR}"]=1
+    BWRAP_ARGS+=(
+        --bind "${OCH_DATA_SRC}" "${OCH_DATA_DIR}"
+        --tmpfs "${OCH_DATA_DIR}/run"
+    )
+}
+
+# Must run AFTER build_opencode2_env, which passes AIFAPIM_* and the allowed
+# OPENCODE_* switches; every other host variable was already dropped.
+build_openchamber_env() {
+    # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+    SANDBOX_ENV+=(
+        "OPENCHAMBER_DATA_DIR=${OCH_DATA_DIR}"
+        "OPENCHAMBER_ENTERPRISE_MODE=1"
+        "OPENCHAMBER_ALLOW_NETWORK_ACCESS=1"
+        "OPENCHAMBER_PUSH_RELAY_DISABLED=true"
+        "OPENCODE_BINARY=${OC2_INSTALL_BIN}"
+    )
+    if [[ "${OCH_SERVE}" -eq 1 ]]; then
+        SANDBOX_ENV+=("OPENCHAMBER_UI_PASSWORD=${SERVE_PASSWORD}")
+    fi
+}
+
+# Sandbox context for the agent: what it is running under.
+build_opencode2_context() {
+    # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
+    SANDBOX_CONTEXT_NOTES=(
+        "This session runs under OpenChamber, a web UI started by \`bwopenchamber\`, which runs its own \`opencode serve\` inside this sandbox. Do not start or connect to any other OpenCode server."
+        "Do not sign in to GitHub, add SSH keys or tokens in OpenChamber: they would be stored where this agent can read them. Read-only \`GH_TOKEN_*\` variables are passed in with \`--github-tokens\`."
+        "Plan mode writes plan files to \`~/.opencode/plan/\`, which is not mounted: they are lost at exit unless the plan-mirror plugin keeps them."
+    )
+    build_sandbox_context bwopenchamber
+    [[ -n "${SANDBOX_CONTEXT_PATH}" && -z "${TEST_CMD}" ]] || return 0
+
+    local _path_json
+    if ! _path_json="$(_bwrap_json_quote "${SANDBOX_CONTEXT_PATH}")"; then
+        echo "Warning: bwopenchamber: cannot pass the sandbox context file to OpenCode (unusual characters in the path)." >&2
+        return 0
+    fi
+    SANDBOX_ENV+=("OPENCODE_CONFIG_CONTENT={\"instructions\":[${_path_json}]}")
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════
+
+main() {
+    bwrap_check_account
+    parse_wrapper_args "$@"
+
+    if [[ "${SHOW_HELP}" -eq 1 ]]; then
+        show_help
+        # show_help never returns
+    fi
+
+    serve_parse_range
+    if [[ "${OCH_SSH_CONFIG}" -eq 1 ]]; then
+        serve_print_ssh_config
+        exit 0
+    fi
+    och_check_args
+
+    bwrap_resolve_tool node "Node.js ${OCH_MIN_NODE_MAJOR}.${OCH_MIN_NODE_MINOR} or newer is needed for OpenChamber."
+
+    detect_kernel_capabilities
+    resolve_common_paths
+    och_check_install
+    resolve_opencode2_paths
+    och_resolve_paths
+    # The port is added to --publish, so it comes before the network backend
+    # is chosen.
+    if [[ "${OCH_SERVE}" -eq 1 ]]; then
+        och_prepare
+    fi
+    detect_net_capabilities
+    # Fail before any host-state change (ensure_host_dirs) if nothing is configured.
+    require_opencode_config bwopenchamber "${OC2_CONFIG_SRC}"
+    detect_shell
+    # Skip host-state mutations on dry-run so --dry-run remains side-effect-free.
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        ensure_host_dirs
+        mkdir -p "${OCH_DATA_SRC}"
+    fi
+    guard_opencode2_db
+    parse_all_git_includes
+    resolve_config_symlinks
+    init_sandbox_path
+
+    # Build bwrap argument list
+    build_base_sandbox
+    build_proc_dev_tmp
+    build_sys_mounts
+    build_etc_mounts
+    build_net_isolation
+    build_managed_config
+    build_managed_skills
+    build_managed_extras
+    build_home_tmpfs
+    build_workdir_mount
+    build_persistent_dotdir
+    build_opencode2_config_mount
+    build_opencode2_authoring_mounts
+    build_opencode2_data_mount
+    build_opencode2_cache_mount
+    build_opencode2_state_dir
+    build_openchamber_mounts
+    build_git_mounts
+    build_pixi_mounts
+    build_ccache_mounts
+    build_npm_mounts
+    build_prek_mounts
+    build_user_bin_mount
+    build_nsls2_mount
+    build_opencode2_install_mount
+    build_dynamic_tool_mounts
+    build_n2c_token_mounts
+    build_extra_path_mounts
+
+    # Environment variables
+    build_env_vars
+    build_opencode2_env
+    build_openchamber_env
+    build_opencode2_context
+
+    # Mask dangerous binaries as the very last step: a mask is hidden by any
+    # later bind that covers it (e.g. --ro-path /usr or /usr/bin).
+    build_binary_masks
+
+    # Launch
+    if [[ "${OCH_SERVE}" -eq 1 ]]; then
+        och_print_info
+    fi
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        print_dry_run
+    else
+        launch_sandbox
+    fi
+}
+
+# Run only when executed, so tests can source this file.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
