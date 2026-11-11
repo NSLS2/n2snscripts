@@ -15,7 +15,9 @@
 # It sources bwopencode2 for the OpenCode 2 mounts, environment, database guard
 # and the --serve port pool, so a sandbox fix made there applies here too.
 #
-# Requires: Node.js >= 24.14 on PATH, OpenChamber installed in
+# Requires: Node.js >= 24.14 (see och_resolve_node for where it is looked for:
+# the `node` on PATH if it is new enough, else a side-by-side node-24 such as the
+# RHEL 10 nodejs24 package; BWOPENCHAMBER_NODE names one), OpenChamber installed in
 # /opt/nsls2/openchamber (BWOPENCHAMBER_DIR overrides; mounted read-only) and
 # OpenCode 2 in /opt/nsls2/opencode2, and the same OpenCode config
 # bwopencode2 needs.
@@ -61,6 +63,8 @@ OCH_DIR="${BWOPENCHAMBER_DIR:-/opt/nsls2/openchamber}"
 OCH_CLI_REL="node_modules/@openchamber/web/bin/cli.js"
 OCH_MIN_NODE_MAJOR=24
 OCH_MIN_NODE_MINOR=14
+# Where versioned Node binaries (node-24, nodejs24) are looked for, besides PATH.
+OCH_NODE_DIRS="${BWOPENCHAMBER_NODE_DIRS:-/usr/bin:/usr/local/bin}"
 OCH_CLI=""
 OCH_SERVE=1
 OCH_SSH_CONFIG=0
@@ -237,6 +241,11 @@ Wrapper options:
   --no-sandbox-context
                   Do not generate the sandbox context file.
 
+Node.js 24.14 or newer is needed.  The launcher uses BWOPENCHAMBER_NODE if set, else
+the node on PATH if it is new enough, else the newest node-24 / nodejs24 in /usr/bin
+or /usr/local/bin that is (the RHEL 10 nodejs24 package installs node-24 next to the
+default node).  BWOPENCHAMBER_DIR names another OpenChamber install.
+
 The password is random for each session unless BWOPENCODE2_SERVE_PASSWORD is set
 (at least 12 characters; a fixed one is shared by every session that uses it).
 Browser sign-ins end with the session: their signing key is new for each session.
@@ -305,23 +314,105 @@ och_check_args() {
     fi
 }
 
-# Node.js >= 24.14 (OpenChamber's own requirement), OpenChamber installed, and
-# the OpenCode 2 binary that OPENCODE_BINARY will name.
-och_check_install() {
-    local _v _major _minor
-    _v="$("${_TOOL_BIN}" --version 2> /dev/null || true)"
+# och_node_version BIN: print BIN's Node.js version (MAJOR.MINOR.PATCH), or fail.
+och_node_version() {
+    local _v
+    _v="$("$1" --version 2> /dev/null)" || return 1
+    _v="${_v%%$'\n'*}"
     _v="${_v#v}"
-    if [[ ! "${_v}" =~ ^([0-9]+)\.([0-9]+) ]]; then
-        echo "Error: could not read the version of ${_TOOL_BIN} (got '${_v}')." >&2
-        exit 1
+    [[ "${_v}" =~ ^[0-9]+\.[0-9]+ ]] || return 1
+    printf '%s' "${_v}"
+}
+
+# och_node_ok VERSION: true when VERSION is at least the minimum OpenChamber needs.
+och_node_ok() {
+    [[ "$1" =~ ^([0-9]+)\.([0-9]+) ]] || return 1
+    local _major="${BASH_REMATCH[1]}" _minor="${BASH_REMATCH[2]}"
+    ((_major > OCH_MIN_NODE_MAJOR || (_major == OCH_MIN_NODE_MAJOR && _minor >= OCH_MIN_NODE_MINOR)))
+}
+
+# och_version_newer A B: true when version A is newer than version B.
+och_version_newer() {
+    [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+}
+
+# Find a Node.js that OpenChamber can run on (24.14 or newer) and set _TOOL_BIN and
+# _TOOL_CMD the way bwrap_resolve_tool does.  The system `node` can be older than
+# that while a newer one is installed next to it (RHEL 10 keeps nodejs 22 as the
+# default and installs nodejs24 as node-24), so the order is:
+#   1. BWOPENCHAMBER_NODE, when set: only that one, and an error if it is too old;
+#   2. `node` on PATH (the user's own choice), when it is new enough;
+#   3. the newest of the versioned binaries (node-24, nodejs24, ...) in
+#      OCH_NODE_DIRS that is new enough.
+# When none is, the error lists what was found with versions and says what to do.
+och_resolve_node() {
+    local _c _v _dir _best="" _best_v="" _f
+    local -a _cands=() _tried=()
+
+    if [[ -n "${BWOPENCHAMBER_NODE:-}" ]]; then
+        _cands=("${BWOPENCHAMBER_NODE}")
+    else
+        _c="$(bwrap_find_tool node 2> /dev/null || true)"
+        [[ -z "${_c}" ]] || _cands+=("${_c}")
+        local -a _dirs
+        IFS=: read -ra _dirs <<< "${OCH_NODE_DIRS}"
+        for _dir in "${_dirs[@]}"; do
+            [[ -d "${_dir}" ]] || continue
+            for _f in "${_dir}"/node-[0-9]* "${_dir}"/nodejs[0-9]* "${_dir}"/node[0-9]*; do
+                [[ -f "${_f}" && -x "${_f}" ]] && _cands+=("${_f}")
+            done
+        done
     fi
-    _major="${BASH_REMATCH[1]}"
-    _minor="${BASH_REMATCH[2]}"
-    if ((_major < OCH_MIN_NODE_MAJOR || (_major == OCH_MIN_NODE_MAJOR && _minor < OCH_MIN_NODE_MINOR))); then
-        echo "Error: OpenChamber needs Node.js ${OCH_MIN_NODE_MAJOR}.${OCH_MIN_NODE_MINOR} or newer; ${_TOOL_BIN} is ${_v}." >&2
+
+    local _i=0 _first_ok=""
+    for _c in ${_cands[@]+"${_cands[@]}"}; do
+        _i=$((_i + 1))
+        if [[ ! -x "${_c}" ]]; then
+            _tried+=("${_c}  (not executable)")
+            continue
+        fi
+        if ! _v="$(och_node_version "${_c}")"; then
+            _tried+=("${_c}  (no version)")
+            continue
+        fi
+        _tried+=("${_c}  ${_v}")
+        och_node_ok "${_v}" || continue
+        # PATH's node (the first candidate) wins when it is new enough.
+        if [[ -z "${BWOPENCHAMBER_NODE:-}" && "${_i}" -eq 1 ]]; then
+            _first_ok="${_c}"
+            break
+        fi
+        if [[ -z "${_best}" ]] || och_version_newer "${_v}" "${_best_v}"; then
+            _best="${_c}"
+            _best_v="${_v}"
+        fi
+    done
+    [[ -z "${_first_ok}" ]] || _best="${_first_ok}"
+
+    if [[ -z "${_best}" ]]; then
+        echo "Error: OpenChamber needs Node.js ${OCH_MIN_NODE_MAJOR}.${OCH_MIN_NODE_MINOR} or newer, and none was found." >&2
+        if [[ "${#_tried[@]}" -gt 0 ]]; then
+            echo "       Looked at:" >&2
+            printf '         %s\n' "${_tried[@]}" >&2
+        else
+            echo "       No node was found on PATH or in ${OCH_NODE_DIRS}." >&2
+        fi
+        echo "       RHEL 10: install nodejs${OCH_MIN_NODE_MAJOR} (it installs node-${OCH_MIN_NODE_MAJOR} next to the default node)." >&2
+        echo "       RHEL 8 and 9: dnf module enable nodejs:${OCH_MIN_NODE_MAJOR} and install nodejs." >&2
+        echo "       Or set BWOPENCHAMBER_NODE=/path/to/node (for example from pixi: pixi exec -s nodejs=${OCH_MIN_NODE_MAJOR})." >&2
         exit 1
     fi
 
+    _TOOL_BIN="${_best}"
+    if [[ -n "${TEST_CMD}" ]]; then
+        read -ra _TOOL_CMD <<< "${TEST_CMD}"
+    else
+        _TOOL_CMD=("${_TOOL_BIN}")
+    fi
+}
+
+# OpenChamber installed, and the OpenCode 2 binary that the policy file will name.
+och_check_install() {
     _bwrap_canonicalize_safe "${OCH_DIR}" "OpenChamber install dir"
     OCH_DIR="${_BWRAP_CANON}"
     OCH_CLI="${OCH_DIR}/${OCH_CLI_REL}"
@@ -515,7 +606,7 @@ main() {
     fi
     och_check_args
 
-    bwrap_resolve_tool node "Node.js ${OCH_MIN_NODE_MAJOR}.${OCH_MIN_NODE_MINOR} or newer is needed for OpenChamber."
+    och_resolve_node
 
     detect_kernel_capabilities
     resolve_common_paths
