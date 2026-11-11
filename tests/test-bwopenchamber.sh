@@ -60,6 +60,24 @@ make_node "${T}/node/24.13.9" 24.13.9
 make_node "${T}/node/22.23.2" 22.23.2
 make_node "${T}/node/25.1.0" 25.1.0
 NODE="${T}/node/24.14.0"
+make_node_as() { # make_node_as DIR NAME VERSION: a stub Node under another name, as nodejs24 installs node-24
+    mkdir -p "$1"
+    printf '#!/bin/sh\necho "v%s"\n' "$3" > "$1/$2"
+    chmod +x "$1/$2"
+}
+mkdir -p "${T}/no-nodes"
+make_node_as "${T}/nodebin24" node-24 24.14.0
+make_node_as "${T}/nodebin" node-24 24.14.0
+make_node_as "${T}/nodebin" node-25 25.1.0
+make_node_as "${T}/nodebin" nodejs22 22.23.2
+mkdir -p "${T}/nodebin"
+printf '#!/bin/sh\necho hello\n' > "${T}/nodebin/node-99"
+printf '#!/bin/sh\necho "v26.0.0"\n' > "${T}/nodebin/node-26"
+chmod +x "${T}/nodebin/node-99"
+chmod -x "${T}/nodebin/node-26"
+make_node_as "${T}/nodebin22" nodejs22 22.23.2
+printf '#!/bin/sh\necho hello\n' > "${T}/nodebin22/node-99"
+chmod +x "${T}/nodebin22/node-99"
 
 # run [env VAR=VALUE ...] -- ARGS...: dry-run the launcher; sets OUT, ERR, RC.
 # Host variables of the kinds the launcher must not pass on are cleared first.
@@ -74,8 +92,9 @@ run() {
         -u OPENCODE_SERVER_PASSWORD -u OPENCODE_PASSWORD -u OPENCHAMBER_HOST \
         -u OPENCHAMBER_UI_PASSWORD -u OPENCHAMBER_RELAY_URL -u OPENCODE2_DB_GUARD \
         -u BWOPENCODE2_SERVE_PASSWORD -u BWOPENCODE2_SERVE_PORTS \
-        -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME \
+        -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u BWOPENCHAMBER_NODE \
         HOME="${T}/home" PATH="${NODE}:${PATH}" BWOPENCHAMBER_DIR="${T}/app" \
+        BWOPENCHAMBER_NODE_DIRS="${T}/no-nodes" \
         HARNESS_OC2_BIN="${T}/oc2/opencode.exe" ${_env[@]+"${_env[@]}"} \
         "${HARNESS}" --dry-run --share-net "$@" 2> "${T}/err")"
     RC=$?
@@ -225,6 +244,33 @@ NODE="${T}/node/22.23.2" run --
 check 'Node 22 is refused' rc_is 1
 NODE="${T}/node/25.1.0" run --
 check 'Node 25 is accepted' rc_is 0
+NODE="${T}/node/24.14.0"
+
+# ── which Node is used ───────────────────────────────────────────────────
+
+# A side-by-side node-24 is found when PATH's node is too old (RHEL 10: nodejs 22 is
+# the default, nodejs24 installs node-24).
+NODE="${T}/node/22.23.2" run BWOPENCHAMBER_NODE_DIRS="${T}/nodebin24" --
+check 'node 22 on PATH and a node-24 beside it: launches' rc_is 0
+check '... with the node-24' contains "${OUT}" "-- ${T}/nodebin24/node-24 "
+NODE="${T}/node/22.23.2" run BWOPENCHAMBER_NODE_DIRS="${T}/nodebin" --
+check 'several versioned nodes: the newest that is new enough is used' contains "${OUT}" "-- ${T}/nodebin/node-25 "
+check '... not one that is not executable' lacks "${OUT}" "${T}/nodebin/node-26"
+NODE="${T}/node/24.14.0" run BWOPENCHAMBER_NODE_DIRS="${T}/nodebin" --
+check 'a new enough node on PATH wins over versioned ones' contains "${OUT}" "-- ${T}/node/24.14.0/node "
+NODE="${T}/node/22.23.2" run BWOPENCHAMBER_NODE="${T}/node/25.1.0/node" --
+check 'BWOPENCHAMBER_NODE is used' contains "${OUT}" "-- ${T}/node/25.1.0/node "
+NODE="${T}/node/24.14.0" run BWOPENCHAMBER_NODE="${T}/node/22.23.2/node" --
+check 'BWOPENCHAMBER_NODE that is too old is an error, even with a good node on PATH' rc_is 1
+check '... naming it and its version' contains "${ERR}" "${T}/node/22.23.2/node  22.23.2"
+NODE="${T}/node/22.23.2" run BWOPENCHAMBER_NODE_DIRS="${T}/nodebin22" --
+check 'no node that is new enough: refused' rc_is 1
+check '... listing what was found with versions' contains "${ERR}" "${T}/node/22.23.2/node  22.23.2"
+check '... and a binary that is not node' contains "${ERR}" "${T}/nodebin22/node-99  (no version)"
+check '... and what to do on RHEL 10' contains "${ERR}" 'install nodejs24'
+check '... and the override' contains "${ERR}" 'BWOPENCHAMBER_NODE=/path/to/node'
+NODE="${T}/node/24.14.0" run -- --exec 'bash -c true'
+check '--exec also finds a node' rc_is 0
 NODE="${T}/node/24.14.0"
 
 run BWOPENCHAMBER_DIR="${T}/missing" --

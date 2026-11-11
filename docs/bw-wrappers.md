@@ -1257,8 +1257,16 @@ library is a follow-up.
 
 ### What it needs
 
-- **Node.js 24.14 or newer** on `PATH` (OpenChamber's own requirement); the
-  launcher checks the version.
+- **Node.js 24.14 or newer** (OpenChamber's own requirement). The launcher looks
+  for one in this order: `BWOPENCHAMBER_NODE`, if set (only that one, and an error
+  if it is too old); the `node` on `PATH`, if it is new enough; the newest
+  versioned binary (`node-24`, `nodejs24`) in `/usr/bin` and `/usr/local/bin` that
+  is new enough. That finds the RHEL 10 `nodejs24` package, which installs
+  `node-24` next to the default `node` (22). On RHEL 8 and 9 the base role enables
+  the `nodejs:24` module, which puts a new enough `node` on `PATH`. When none
+  qualifies, the error lists what it found with versions and says what to do. To
+  use a Node from elsewhere, for example pixi, set `BWOPENCHAMBER_NODE` to its
+  path: `BWOPENCHAMBER_NODE=$(pixi exec -s nodejs=24 -- sh -c 'command -v node')`.
 - **OpenChamber** in `/opt/nsls2/openchamber` (`node_modules/@openchamber/web`),
   mounted read-only. `BWOPENCHAMBER_DIR` names another install. The ansible base
   role does not install it yet.
