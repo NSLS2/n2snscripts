@@ -1034,7 +1034,12 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
   damage;
 - it holds a shared lock for the life of the sandbox (a file descriptor that
   the final `exec` passes on to `bwrap`; with a private network see "Where the
-  lock lives" below), so sessions on this host and version can run together;
+  lock lives" below), so sessions on this host and version can run together. The
+  descriptor is numbered 200 or higher on purpose: the launcher hands the sandbox
+  its files and data on descriptors 10 and up, and the relay opens those over
+  whatever is there. With the lock on bash's own choice (10 or 11) it was closed,
+  and so released, whenever the launcher passed two or more data descriptors, as
+  `bwopenchamber` does (found in review of NSLS2/n2snscripts#43);
 - it starts a daily background backup (`opencode2-db backup --if-due`) and keeps
   the newest 3 compressed copies.
 
