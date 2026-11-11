@@ -1416,4 +1416,8 @@ main() {
     fi
 }
 
-main "$@"
+# Run only when executed, so bwopenchamber can source this file for its
+# functions.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
