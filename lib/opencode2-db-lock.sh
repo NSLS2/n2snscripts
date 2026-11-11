@@ -391,9 +391,16 @@ oc2db_guard() {
 
     # Take the session lock last.  Shared: any number of sessions of this
     # version on this host may hold it together.
-    if ! { exec {OC2DB_SESSION_FD}<> "${_locks}/${_own}"; } 2> /dev/null ||
+    # The lock descriptor is a high number (200 up), not bash's {var} choice, which
+    # starts at 10: bwrap_sandbox_lib.sh hands the sandbox its files and data on
+    # descriptors 10 up and its relay opens those over whatever is there, closing
+    # the lock (and so releasing it) while the sandbox runs.
+    oc2db_free_fd 200 249
+    if [[ -z "${OC2DB_SESSION_FD}" ]] ||
+        ! { eval "exec ${OC2DB_SESSION_FD}<> \"\${_locks}/\${_own}\""; } 2> /dev/null ||
         ! flock -s -n "${OC2DB_SESSION_FD}" 2> /dev/null; then
         oc2db_warn "cannot take the session lock ${_locks}/${_own}; continuing without it"
+        [[ -z "${OC2DB_SESSION_FD}" ]] || eval "exec ${OC2DB_SESSION_FD}>&-" 2> /dev/null
         OC2DB_SESSION_FD=""
     elif [[ -n "${_bin_id}" ]]; then
         printf '%s\n' "${_bin_id}" 1>&"${OC2DB_SESSION_FD}" 2> /dev/null || true
@@ -403,6 +410,20 @@ oc2db_guard() {
 
     oc2db_backup_if_due "${_data}" "${_gdir}"
     return 0
+}
+
+# oc2db_free_fd FIRST LAST: set OC2DB_SESSION_FD to the first descriptor number
+# in FIRST..LAST that is not open, or to "" when there is none.
+oc2db_free_fd() {
+    local _n
+    OC2DB_SESSION_FD=""
+    for ((_n = $1; _n <= $2; _n++)); do
+        if ! { true <&"${_n}"; } 2> /dev/null; then
+            OC2DB_SESSION_FD="${_n}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Start the daily backup in the background.  The job closes the session lock
@@ -423,7 +444,7 @@ oc2db_backup_if_due() {
     command -v ionice > /dev/null 2>&1 && _run=(ionice -c 3 nice -n 19)
     command -v setsid > /dev/null 2>&1 && _run=(setsid "${_run[@]}")
     {
-        [[ -n "${OC2DB_SESSION_FD}" ]] && exec {OC2DB_SESSION_FD}>&-
+        [[ -n "${OC2DB_SESSION_FD}" ]] && eval "exec ${OC2DB_SESSION_FD}>&-"
         exec "${_run[@]}" "${_tool}" --data-dir "${_data}" \
             backup --if-due --delay "${OC2DB_BACKUP_DELAY:-30}" --keep "${_keep}" \
             < /dev/null > "${_gdir}/backup.log" 2>&1
