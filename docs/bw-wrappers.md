@@ -1288,20 +1288,34 @@ library is a follow-up.
 
 ### Policy: what is turned off
 
-- **Enterprise mode is forced on through the environment**
-  (`OPENCHAMBER_ENTERPRISE_MODE=1`): no tunnels (Cloudflare, ngrok, Tailscale),
-  no public relay, no classification service (Jev), no adding model providers
-  in the app, no outside integrations catalogue, no extensions that send data
-  off the machine, generic push-notification titles. The push relay is also
-  switched off (`OPENCHAMBER_PUSH_RELAY_DISABLED=true`).
-- **`OPENCHAMBER_ALLOW_NETWORK_ACCESS=1`** lets the server listen on the private
-  network's interface; enterprise mode refuses that by default.
-- **`/etc/openchamber/policy.json` is not mounted.** When that file turns
-  enterprise mode on, only the file decides, and it would override the variable
-  above. Hosts can still deploy it for an OpenChamber run outside a sandbox,
-  with `allowNetworkAccess` left `false` there.
-- **OpenCode is pinned** with `OPENCODE_BINARY` to the installed OpenCode 2
-  binary. The launcher never passes `OPENCODE_HOST`, `OPENCODE_PORT`,
+- **The policy is a read-only file the launcher generates**, mounted from a
+  descriptor at `/etc/openchamber/policy.json` inside the sandbox (the host's
+  file is not visible there and plays no part). It sets enterprise mode (no
+  tunnels (Cloudflare, ngrok, Tailscale), no public relay, no classification
+  service (Jev), no adding model providers in the app, no outside integrations
+  catalogue, no extensions that send data off the machine, generic
+  push-notification titles), `allowNetworkAccess: true` (the server listens on the
+  private network's interface; enterprise mode refuses that by default), the
+  installed OpenCode 2 as `opencodeBinary`, and hides the four built-in
+  third-party skills catalogues. It holds no secret. `OPENCHAMBER_ENTERPRISE_MODE=1`
+  and `OPENCHAMBER_PUSH_RELAY_DISABLED=true` are also set, so that if the file were
+  missing the server would fail closed (enterprise mode refuses a network address
+  without `allowNetworkAccess`) and not run unpinned.
+- **Why a file and not environment variables.** Without a policy file, a saved
+  `opencodeBinary` in OpenChamber's `settings.json` overrides `OPENCODE_BINARY`.
+  That file is in the persistent data directory, which the agent can write, so the
+  agent could name another executable and OpenChamber would start it as
+  "OpenCode" with OpenChamber's environment, bypassing the pin and the database
+  guard's identity check. Only a policy file outranks the saved setting. Copilot
+  review found this; checked with 2.7.0: with the environment alone a fake
+  OpenCode named in `settings.json` ran, and with the read-only policy file
+  OpenChamber started the installed OpenCode and the fake never ran. The first
+  version of this launcher passed the pin as `OPENCODE_BINARY` only and said it was
+  pinned; that was wrong.
+- **The host's own policy** (`/etc/openchamber/policy.json` deployed by ansible)
+  governs an OpenChamber run outside `bwopenchamber`; the launcher's file takes its
+  place inside the sandbox.
+- **Host variables.** The launcher never passes `OPENCODE_HOST`, `OPENCODE_PORT`,
   `OPENCODE_SKIP_START`, a server password or any other host `OPENCODE_*` or
   `OPENCHAMBER_*` variable: the sandbox environment starts clean, and
   `AIFAPIM_*`, the allowlisted `OPENCODE_*` switches and, with
@@ -1383,13 +1397,20 @@ inside it, and the sandbox boundary is what was checked below.
 
 **In a private network namespace without the launcher**, OpenChamber 2.7.0 with
 the launcher's environment: the server answers on `0.0.0.0`, 401 and 200 as
-above, the managed OpenCode starts from `OPENCODE_BINARY` and receives
-`OPENCODE_CONFIG_CONTENT` (the sandbox context), `run/` holds the UI password in
-plain text, and the sign-in key behaves as described under Reaching it.
+above, the managed OpenCode receives `OPENCODE_CONFIG_CONTENT` (the sandbox
+context), `run/` holds the UI password in plain text, and the sign-in key behaves
+as described under Reaching it. With a `settings.json` naming a fake OpenCode,
+the environment alone let the fake run; with a read-only policy file at
+`/etc/openchamber/policy.json` pinning the installed OpenCode the fake never ran,
+and the server still listened on `0.0.0.0` using `allowNetworkAccess` from the
+file.
 
-**Tests:** `tests/test-bwopenchamber.sh` (70 checks through `--dry-run`: argument
-refusals, the environment and mounts built, hostile host variables dropped,
-password and sign-in key handling, Node and install checks).
+**Tests:** `tests/test-bwopenchamber.sh` (81 checks through `--dry-run`: argument
+refusals, the environment and mounts built, the generated policy file, hostile
+host variables dropped, password and sign-in key handling, Node and install
+checks, and that a port held by another session does not change the result: the
+harness stubs the port probe, which Copilot found made the tests depend on running
+sessions).
 
 **Not checked:** git and worktrees from OpenChamber, whether the host listener
 belongs to pasta or to the network log's Python helper (`ss` names
