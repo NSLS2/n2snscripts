@@ -37,6 +37,7 @@ check() { # check DESCRIPTION CONDITION-COMMAND...
 contains() { grep -qF -- "$2" <<< "$1"; }
 lacks() { ! grep -qF -- "$2" <<< "$1"; }
 rc_is() { [[ "${RC}" -eq "$1" ]]; }
+matches() { [[ "$1" =~ $2 ]]; }
 
 # ── fixtures ────────────────────────────────────────────────────────────
 
@@ -92,6 +93,8 @@ check 'network access is allowed for the private network' contains "${OUT}" 'OPE
 check 'the push relay is off' contains "${OUT}" 'OPENCHAMBER_PUSH_RELAY_DISABLED=true'
 check 'OpenCode is the installed binary' contains "${OUT}" "OPENCODE_BINARY=${T}/oc2/opencode.exe"
 check 'the UI password is set and hidden' contains "${OUT}" "OPENCHAMBER_UI_PASSWORD='REDACTED'"
+check 'a sign-in signing key is set and hidden' contains "${OUT}" "OPENCODE_JWT_SECRET='REDACTED'"
+check 'the agent is told not to use the credentials it inherits' contains "${OUT}" 'never read, print or use them'
 check 'a tmpfs covers the run directory (UI password file)' contains "${OUT}" "${T}/home/.local/share/openchamber/run"
 check 'the data directory is the launcher own, not an OpenChamber outside a sandbox' \
     contains "${OUT}" "--bind ${T}/home/.local/share/bwopenchamber ${T}/home/.local/share/openchamber"
@@ -126,13 +129,20 @@ check 'a range that holds the shared OpenCode service port is refused' rc_is 1
 # ── what the host cannot inject ──────────────────────────────────────────
 
 run OPENCODE_HOST=http://127.0.0.1:49374 OPENCODE_PORT=49374 OPENCODE_SKIP_START=true \
-    OPENCODE_SERVER_PASSWORD=hostsecret1 OPENCODE_PASSWORD=hostsecret2 \
+    OPENCODE_SERVER_PASSWORD=hostsecret1 OPENCODE_PASSWORD=hostsecret2 OPENCODE_JWT_SECRET=hostsecret4 \
     OPENCHAMBER_HOST=0.0.0.0 OPENCHAMBER_UI_PASSWORD=hostsecret3 OPENCHAMBER_RELAY_URL=wss://x.example/ws --
 check 'launch with hostile host variables succeeds' rc_is 0
 check 'OPENCODE_HOST is not passed' lacks "${OUT}" 'OPENCODE_HOST='
 check 'OPENCODE_PORT is not passed' lacks "${OUT}" 'OPENCODE_PORT='
 check 'OPENCODE_SKIP_START is not passed' lacks "${OUT}" 'OPENCODE_SKIP_START'
-check 'no host server password is passed' lacks "${OUT}" 'hostsecret'
+# --dry-run prints a variable whose name holds PASSWORD or SECRET as REDACTED, so
+# the values cannot show: check the names, and that ours is the only one of each.
+env_lines() { grep -c "^  $2=" <<< "$1"; }
+check 'no host OPENCODE_SERVER_PASSWORD is passed' lacks "${OUT}" 'OPENCODE_SERVER_PASSWORD='
+check 'no host OPENCODE_PASSWORD is passed' lacks "${OUT}" 'OPENCODE_PASSWORD='
+check 'the UI password is ours alone, not the host one' [ "$(env_lines "${OUT}" OPENCHAMBER_UI_PASSWORD)" -eq 1 ]
+check 'the signing key is ours alone, not the host one' [ "$(env_lines "${OUT}" OPENCODE_JWT_SECRET)" -eq 1 ]
+check 'no host secret value is printed' lacks "${OUT}${ERR}" 'hostsecret'
 check 'OPENCHAMBER_HOST is not passed' lacks "${OUT}" 'OPENCHAMBER_HOST='
 check 'no relay URL is passed' lacks "${OUT}" 'OPENCHAMBER_RELAY_URL'
 check 'the dropped OPENCODE_* names are reported, not their values' contains "${ERR}" 'OPENCODE_HOST'
@@ -146,11 +156,28 @@ check 'a fixed password is accepted' rc_is 0
 check '... and passed to the server as the UI password' contains "${OUT}" "OPENCHAMBER_UI_PASSWORD='REDACTED'"
 check '... and never printed' lacks "${OUT}${ERR}" 'a-fixed-password-123'
 
+# ── the sign-in signing key ──────────────────────────────────────────────
+
+# och_make_jwt_secret in a subshell, so the launcher's options do not reach this script.
+jwt_pair="$(
+    # shellcheck source=../bin/bwopenchamber
+    source "${ROOT}/bin/bwopenchamber"
+    och_make_jwt_secret
+    a="${OCH_JWT_SECRET}"
+    och_make_jwt_secret
+    printf '%s %s' "${a}" "${OCH_JWT_SECRET}"
+)"
+jwt_a="${jwt_pair% *}"
+jwt_b="${jwt_pair#* }"
+check 'the signing key is 64 hex characters' matches "${jwt_a}" '^[0-9a-f]{64}$'
+check 'a new key is made each time' [ "${jwt_a}" != "${jwt_b}" ]
+
 # ── --exec ───────────────────────────────────────────────────────────────
 
 run -- --exec 'bash -c true'
 check '--exec runs the command, not the server' contains "${OUT}" '-- bash -c true'
-check '--exec sets up no UI password' lacks "${OUT}" 'OPENCHAMBER_UI_PASSWORD'
+check '--exec sets up no UI password' [ "$(env_lines "${OUT}" OPENCHAMBER_UI_PASSWORD)" -eq 0 ]
+check '--exec sets up no signing key' [ "$(env_lines "${OUT}" OPENCODE_JWT_SECRET)" -eq 0 ]
 check '--exec starts no server' lacks "${OUT}" 'serve --foreground'
 run -- --exec 'bash -c true' --port 24701
 check '--exec with --port is refused' rc_is 1

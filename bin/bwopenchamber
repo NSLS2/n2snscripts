@@ -50,9 +50,6 @@ set -euo pipefail
 SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck source=bwopencode2
 source "${SCRIPT_DIR}/bwopencode2"
-# bwopencode2 set SCRIPT_DIR from $0; this launcher's directory is the same
-# unless a test harness sources this file.
-SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
 # ═══════════════════════════════════════════════════════════════════
 # Tool-specific state
@@ -67,6 +64,7 @@ OCH_SERVE=1
 OCH_SSH_CONFIG=0
 OCH_DATA_SRC=""
 OCH_DATA_DIR=""
+OCH_JWT_SECRET=""
 
 # ═══════════════════════════════════════════════════════════════════
 # Replacements for functions of bwopencode2
@@ -189,8 +187,10 @@ bwopenchamber — OpenChamber (web UI for OpenCode) inside a bubblewrap sandbox
 OpenChamber, its OpenCode, the browser terminal, git and every tool call run
 inside this one sandbox.  Open the UI from a browser on another machine through
 an ssh tunnel; the command, the URL and a password (new for each session) are
-printed at start.  The server listens on the sandbox's private network and is
-published only on your own loopback address 127.H1.H2.1.
+printed at start.  The server listens on the sandbox's private network and only
+its port is published, on your own loopback address 127.H1.H2.1.  That address
+is not access control: any user of this host can connect to it, and the password
+is what keeps them out.
 
 Wrapper options:
   -h, --help      Show this message.
@@ -215,8 +215,8 @@ Wrapper options:
                   (pasta only).  May be repeated.
   --share-net     Share the host network instead of a private one (the server
                   then binds your address 127.H1.H2.1 itself).  Only for a host
-                  without pasta or slirp4netns; other users of the host can then
-                  reach the port.
+                  without pasta or slirp4netns; OpenCode's own port is then on
+                  the host's loopback too, behind its own random password.
   --net-backend pasta|slirp4netns
                   Use only this backend for the private network.
   --n2c-token NAME
@@ -237,6 +237,11 @@ Wrapper options:
 
 The password is random for each session unless BWOPENCODE2_SERVE_PASSWORD is set
 (at least 12 characters; a fixed one is shared by every session that uses it).
+Browser sign-ins end with the session: their signing key is new for each session.
+
+The agent can read the credentials OpenChamber gives its own OpenCode (the UI
+and server passwords).  Nothing leaves the sandbox, but a misbehaving agent
+could change settings or answer its own permission prompts; see docs/bw-wrappers.md.
 
 No OpenChamber argument is passed through, and nothing else in OpenChamber's
 own configuration is read from the host: tunnels, the public relay, the
@@ -335,6 +340,23 @@ och_resolve_paths() {
     _check_dir_safe "${OCH_DATA_SRC}" "OpenChamber data dir"
 }
 
+# A random signing key for the browser sign-in cookies, new for each session.
+# Without one OpenChamber writes a key to jwt-secret in its data directory and
+# reuses it, so a browser that signed in once stays signed in across restarts
+# and after the password changed (seen with 2.7.0), and the agent can read the
+# file.  With OPENCODE_JWT_SECRET set it neither reads nor writes the file.
+och_make_jwt_secret() {
+    if command -v openssl > /dev/null 2>&1; then
+        OCH_JWT_SECRET="$(openssl rand -hex 32)"
+    else
+        OCH_JWT_SECRET="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    fi
+    if [[ ${#OCH_JWT_SECRET} -lt 64 ]]; then
+        echo "Error: could not generate a random sign-in key." >&2
+        exit 1
+    fi
+}
+
 # Choose port and password and publish the port; give the sandbox its command.
 # Same publish rules as `bwopencode2 --serve`: always your first address
 # 127.H1.H2.1, which the ssh_config alias forwards to.
@@ -342,6 +364,7 @@ och_prepare() {
     SERVE_ADDR="$(net_publish_prefix).1"
     serve_choose_port
     serve_make_password
+    och_make_jwt_secret
     if [[ "${NET_SHARE}" -eq 1 ]]; then
         SERVE_BIND="${SERVE_ADDR}"
     else
@@ -414,7 +437,10 @@ build_openchamber_env() {
         "OPENCODE_BINARY=${OC2_INSTALL_BIN}"
     )
     if [[ "${OCH_SERVE}" -eq 1 ]]; then
-        SANDBOX_ENV+=("OPENCHAMBER_UI_PASSWORD=${SERVE_PASSWORD}")
+        SANDBOX_ENV+=(
+            "OPENCHAMBER_UI_PASSWORD=${SERVE_PASSWORD}"
+            "OPENCODE_JWT_SECRET=${OCH_JWT_SECRET}"
+        )
     fi
 }
 
@@ -424,6 +450,7 @@ build_opencode2_context() {
     SANDBOX_CONTEXT_NOTES=(
         "This session runs under OpenChamber, a web UI started by \`bwopenchamber\`, which runs its own \`opencode serve\` inside this sandbox. Do not start or connect to any other OpenCode server."
         "Do not sign in to GitHub, add SSH keys or tokens in OpenChamber: they would be stored where this agent can read them. Read-only \`GH_TOKEN_*\` variables are passed in with \`--github-tokens\`."
+        "OpenChamber puts its own credentials into the environment this agent inherits (\`OPENCHAMBER_UI_PASSWORD\`, \`OPENCODE_PASSWORD\`, \`OPENCODE_SERVER_PASSWORD\`, \`OPENCODE_JWT_SECRET\`). They are the human user's controls over this session: never read, print or use them, and do not call the OpenChamber or OpenCode HTTP APIs of this session with them."
         "Plan mode writes plan files to \`~/.opencode/plan/\`, which is not mounted: they are lost at exit unless the plan-mirror plugin keeps them."
     )
     build_sandbox_context bwopenchamber
