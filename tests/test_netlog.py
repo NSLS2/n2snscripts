@@ -3,8 +3,9 @@
     python3 -m unittest discover -s tests -p 'test_*.py'
 
 tests/data/pasta-debug.log is part of a real pasta 2026_10_02 debug log
-(--debug --log-file, with its stderr copy of the setup), addresses of the
-host replaced with documentation addresses.
+and tests/data/pasta-stderr.log is a whole short one, both as pasta writes
+them to stderr with --debug and no --log-file ("T: message"), addresses of
+the host replaced with documentation addresses.
 """
 
 import io
@@ -22,6 +23,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "lib"))
 import bwrap_netlog as netlog  # noqa: E402
 
 FIXTURE = os.path.join(HERE, "data", "pasta-debug.log")
+FIXTURE_STDERR = os.path.join(HERE, "data", "pasta-stderr.log")
 
 
 def condense(lines):
@@ -89,11 +91,21 @@ class CondenserTest(unittest.TestCase):
     def test_dns_forward_flows_dropped(self):
         self.assertFalse(any("169.254.1.1:53" in x for x in self.out))
 
-    def test_error_kept(self):
-        self.assertIn('pasta level=error msg="Listening address not allowed for -T 127.0.42.1/3000" t=0.001', self.out)
+    def test_only_flows_and_dns(self):
+        for line in self.out:
+            self.assertRegex(line, r"^(flow=\d+ (open|close|fail) |dns )")
 
-    def test_header(self):
-        self.assertEqual(self.out[0], "pasta version=2026_10_02.cba3570 pid=3962723")
+    def test_real_stderr_capture(self):
+        with open(FIXTURE_STDERR) as f:
+            out = condense(f.read().splitlines() + ["event=end session=x"])
+        self.assertEqual(
+            out,
+            [
+                "flow=0 open proto=tcp dir=out src=[2001:db8::7]:40506 dst=[2001:db8:1::2]:443 t=0.069",
+                "flow=0 close proto=tcp dir=out dst=[2001:db8:1::2]:443 t=0.494 secs=0.425 reason=session-end",
+                "event=end session=x",
+            ],
+        )
 
     def test_names_from_dns(self):
         out = condense(["bwrap-dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21"] + self.raw)

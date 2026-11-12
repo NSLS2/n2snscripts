@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Fake pasta for testing the bw* launchers without /dev/net/tun.
 
-Like the real one it closes inherited descriptors above 2 before opening
---log-file, creates a user namespace (mapping the caller to uid 0) and a
-network namespace, starts the command in it and stays its parent, and
-forwards -t (host -> namespace interface address) and -T (namespace
-loopback -> host loopback) ports.  Like the real one (fwd_rule.c), -T and -U
-take no listening address: "-T ADDR/..." stops it with pasta's error.  With
---dns-forward ADDR it answers DNS queries to ADDR:53 itself (every name is
-192.0.2.10).  Its debug lines (--debug --log-file) use pasta's format: a
-timestamp, then "Flow N (KIND): ..." state changes and endpoints, plus timer
-noise, so the launcher's condenser can be tested against them.  The namespace gets a dummy interface with 192.168.77.2
-instead of a tap with the host's address.  With --debug and --log-file it
-writes header, startup and "Flow" lines to the log file (blocking writes, as
-pasta's are).  The failure mode is read from $FAKE_NET_DIR/pasta.fail
-(bind: refuse every -t port).
+Like the real one it closes inherited descriptors above 2, creates a user
+namespace (mapping the caller to uid 0) and a network namespace, starts the
+command in it and stays its parent, and forwards -t (host -> namespace
+interface address) and -T (namespace loopback -> host loopback) ports.  Like
+the real one (fwd_rule.c), -T and -U take no listening address: "-T ADDR/..."
+stops it with pasta's error.  With --dns-forward ADDR it answers DNS queries
+to ADDR:53 itself (every name is 192.0.2.10).  The namespace gets a dummy
+interface with 192.168.77.2 instead of a tap with the host's address.
+
+With --debug (and no --log-file, as the launchers run it) its debug lines go
+to stderr in pasta's stderr format (log.c vlogmsg): "T: message", with
+"Flow N (KIND): ..." state changes and endpoints plus timer noise, so the
+launcher's condenser can be tested against them.  Writes block, as pasta's
+do.  With --log-file they go to that file instead, with pasta's log file
+header and level column.  The failure mode is read from
+$FAKE_NET_DIR/pasta.fail (bind: refuse every -t port).
 """
 
 import os
@@ -68,18 +70,29 @@ for opt, specs in (("T", fwd_T), ("U", [opts.get("-U", "none")])):
 os.closerange(3, 4096)
 
 log_fd = -1
-if "--log-file" in opts:
-    log_fd = os.open(opts["--log-file"], os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_RDWR, 0o600)
-    os.write(log_fd, ("pasta fake-2026_10_02: %s (%d)\n" % (os.path.realpath(__file__), os.getpid())).encode())
+if "--debug" in opts:
+    if "--log-file" in opts:
+        log_fd = os.open(opts["--log-file"], os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_RDWR, 0o600)
+        os.write(log_fd, ("pasta fake-2026_10_02: %s (%d)\n" % (os.path.realpath(__file__), os.getpid())).encode())
+    else:
+        log_fd = 2
 log_lock = threading.Lock()
 T0 = time.monotonic()
 _flow_ids = []
 
 
 def log(msg, level="        "):
-    if log_fd >= 0 and "--debug" in opts:
-        with log_lock:
-            os.write(log_fd, ("%.4f: %s  %s\n" % (time.monotonic() - T0, level, msg)).encode())
+    if log_fd < 0:
+        return
+    if log_fd == 2:
+        line = "%.4f: %s\n" % (time.monotonic() - T0, msg)  # stderr: no level column
+    else:
+        line = "%.4f: %s  %s\n" % (time.monotonic() - T0, level, msg)
+    with log_lock:
+        try:
+            os.write(log_fd, line.encode())
+        except OSError:
+            pass
 
 
 def ep(a, p):

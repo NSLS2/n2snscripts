@@ -2607,31 +2607,37 @@ _net_session_dir() {
 # linux; /dev/log, so journald or rsyslog).  The launch writes the start
 # record itself, synchronously, which also checks that the tool works.
 #
-# pasta at debug level never uses syslog: it writes to --log-file, and until
-# it starts the command, to stderr too.  So with pasta:
+# pasta at debug level never uses syslog: without --log-file it writes every
+# line, timestamped, to its stderr (log.c vlogmsg).  So with pasta:
 #
 #   launcher ─┬─ supervisor (_net_log_supervisor, background, outside the sandbox)
 #             │    reads the netlog FIFO line by line and writes each line,
 #             │    prefixed with the session, to the tool; at the end writes
 #             │    the end record and removes the session directory
-#             └─ exec env -i ... pasta --debug --log-file FIFO ... 2<>FIFO
+#             └─ exec env -i ... pasta --debug ... 2>>FIFO
 #                  -- relay (prints a marker, reopens its stderr) -- bwrap ...
 #
+#   - pasta's stderr is the FIFO, opened by the launcher write-only, append.
+#     pasta is not given --log-file: it opens that read-write (to rotate it),
+#     and on SELinux hosts (Fedora, RHEL) pasta runs as pasta_t, which passt's
+#     policy lets only append to user_tmp_t FIFOs, so the open is denied and
+#     pasta exits.  An inherited append-only descriptor is allowed; a read-
+#     write one (2<>) would be silently replaced with /dev/null at the exec
+#     into pasta_t, and so would any other read-write descriptor on the FIFO
+#     left open across the exec: the launcher closes its hold before it.
 #   - The supervisor holds the FIFO open read-write, so it never sees EOF
-#     early: pasta closes inherited descriptors before it opens the log file,
-#     and a reader that saw EOF in that gap would leave pasta blocked on a
-#     full pipe, which stalls the sandbox's network.  It stops reading when
-#     the launcher process (pasta) is gone, after draining what is left.
+#     early, and so the launcher's write-only open does not block.  It stops
+#     reading when the launcher process (pasta) is gone, after draining what
+#     is left.  pasta keeps descriptors 0-2 across its own sandboxing (it
+#     closes from 3 up).
 #   - It never blocks pasta: if the tool dies it goes on reading and drops the
 #     lines.
-#   - --log-size is huge: pasta rotates its log with fallocate/lseek, which
-#     fail on a FIFO and would make it drop every later line.
-#   - pasta's stderr goes to the FIFO as well (its startup lines would
-#     otherwise print on the terminal); the relay prints a marker there and
-#     then reopens the user's stderr by path (a terminal or a file), or
-#     through a second FIFO that the supervisor copies to it (a pipe).  If
-#     pasta exits before the marker (a failed start), the supervisor prints
-#     its lines on the terminal, so its errors are not lost.
+#   - pasta's startup lines would otherwise print on the terminal; the relay
+#     prints a marker on the FIFO and then reopens the user's stderr by path
+#     (a terminal or a file), or through a second FIFO that the supervisor
+#     copies to it (a pipe).  If pasta exits before the marker (a failed
+#     start), the supervisor prints its lines on the terminal, so its errors
+#     are not lost.
 # With slirp4netns or --share-net only the start and end records are written
 # (slirp4netns has no flow log); the supervisor just waits for the end.
 
@@ -2649,8 +2655,6 @@ _NET_LOG_FLOWS=0
 _NET_LOG_FIFO=""
 _NET_LOG_ERR_FIFO=""
 _NET_LOG_MARKER=""
-# pasta's --log-size: 1 TiB, never reached (see above).
-_NET_LOG_PASTA_SIZE=1099511627776
 
 # _net_log_detect
 #   List the usable logging tools, best first (_NET_LOG_TOOLS: systemd-cat
@@ -2721,8 +2725,7 @@ _net_log_record() {
 # _net_log_start
 #   Called by launch_sandbox just before it execs: write the start record
 #   (which checks the tool; without one, warn and log nothing), then with
-#   pasta add the log options and the stderr hand-over, and start the
-#   supervisor.
+#   pasta add --debug and the stderr hand-over, and start the supervisor.
 _net_log_start() {
     local _err _launcher="${0##*/}" _t
     _NET_LOG_TOOL=""
@@ -2758,7 +2761,7 @@ _net_log_start() {
         for _i in "${!PASTA_ARGS[@]}"; do
             [[ "${PASTA_ARGS[${_i}]}" != --quiet ]] || unset 'PASTA_ARGS[_i]'
         done
-        PASTA_ARGS=("${PASTA_ARGS[@]}" --debug --log-file "${_NET_LOG_FIFO}" --log-size "${_NET_LOG_PASTA_SIZE}")
+        PASTA_ARGS=("${PASTA_ARGS[@]}" --debug)
         # The relay restores the user's stderr: by path when it is a terminal
         # or a file, else through a FIFO the supervisor copies.
         _err="$(readlink "/proc/$$/fd/2" 2> /dev/null || true)"
@@ -2803,6 +2806,9 @@ _net_log_supervisor() {
     fi
 
     if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        # Read-write, so end-of-file is never seen before pasta writes.  This
+        # descriptor is the supervisor's alone; the launcher's own hold on
+        # the FIFO is closed before it execs pasta (see launch_sandbox).
         exec {_fifo}<> "${_NET_LOG_FIFO}"
         if [[ -n "${_NET_LOG_ERR_FIFO}" ]]; then
             cat < "${_NET_LOG_ERR_FIFO}" >&2 &
@@ -2894,9 +2900,9 @@ _net_log_print_dry_run() {
     printf 'the launcher writes the start record (session %s) with\n#   %s\n' \
         "${_NET_LOG_SESSION}" "${_NET_LOG_CMD[*]}"
     if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
-        printf '# and pasta gets --debug --log-file <session dir>/netlog --log-size %s (not --quiet)\n' "${_NET_LOG_PASTA_SIZE}"
-        printf '# with its stderr on that FIFO; a supervisor copies each line to the log and the\n'
-        printf '# relay first reopens your stderr.  The end record is written when pasta exits.\n'
+        printf '# and pasta gets --debug (not --quiet) with its stderr on <session dir>/netlog,\n'
+        printf '# a FIFO; a supervisor copies each line to the log and the relay first reopens\n'
+        printf '# your stderr.  The end record is written when pasta exits.\n'
         if [[ -n "${_NET_LOG_PY}" ]]; then
             printf '# The lines are condensed (one per connection opened and closed) by
 '
@@ -5639,8 +5645,15 @@ launch_sandbox() {
 
     [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_start
     if [[ -n "${_NET_LOG_FIFO}" ]]; then
-        # pasta's stderr goes to the network log (see "Network log").
-        exec 2<> "${_NET_LOG_FIFO}"
+        # pasta's stderr goes to the network log (see "Network log"): a
+        # write-only, append descriptor, the only kind SELinux lets pasta
+        # keep.  The hold makes the open return at once even if the reader
+        # is not yet there; it must not survive into pasta, so it is closed
+        # again before the exec.
+        local _hold
+        exec {_hold}<> "${_NET_LOG_FIFO}"
+        exec 2>> "${_NET_LOG_FIFO}"
+        exec {_hold}<&-
     fi
     exec "${_ENV_BIN}" -i \
         HOME="${_HOME}" \

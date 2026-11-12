@@ -4,12 +4,12 @@
 platform-python) and later.
 
     bwrap_netlog.py condense --session ID [--dns-forward ADDR] -- CMD...
-        Read pasta's debug log (and the DNS relay's lines) on standard input
-        and write one line when a connection opens and one when it closes,
-        with the domain of the destination when the relay saw it, to CMD's
-        standard input (systemd-cat or logger).  Everything else pasta writes
-        at debug level (timers, ACK and buffer bookkeeping, state changes,
-        its setup dump) is dropped; its warnings and errors are kept.
+        Read pasta's debug output (its stderr, and the DNS relay's lines) on
+        standard input and write one line when a connection opens and one
+        when it closes, with the domain of the destination when the relay saw
+        it, to CMD's standard input (systemd-cat or logger).  Everything else
+        pasta writes at debug level (timers, ACK and buffer bookkeeping, state
+        changes, its setup dump) is dropped.
 
     bwrap_netlog.py dns LISTEN UPSTREAM PARENT_PID
         A DNS relay for the sandbox's network namespace: listen on LISTEN
@@ -42,13 +42,15 @@ import threading
 
 # ── condense ────────────────────────────────────────────────────────────
 
+# pasta's debug lines on stderr (log.c vlogmsg): "T: message", T in seconds
+# since pasta started.  (In its --log-file a level column follows the
+# timestamp; \s+ absorbs it, should a log file ever be fed in.)
 _TS = re.compile(r"^(\d+\.\d+):\s+(.*)$")
 _FLOW = re.compile(r"^Flow (\d+) \((.*?)\):\s+(.*)$")
 _ENDPOINTS = re.compile(
     r"^(\w+) \[([^\]]*)\]:(\d+) -> \[([^\]]*)\]:(\d+) => "
     r"(?:(\w+) \[([^\]]*)\]:(\d+) -> \[([^\]]*)\]:(\d+)|\?)$"
 )
-_HEADER = re.compile(r"^pasta (\S+): (\S+) \((\d+)\)$")
 _DIRS = {
     ("TAP", "HOST"): "out",
     ("HOST", "SPLICE"): "publish",
@@ -82,7 +84,6 @@ class Condenser:
         self.flows = {}
         self.names = {}
         self.last_t = 0.0
-        self.header_seen = False
 
     def line(self, raw):
         raw = raw.rstrip("\n")
@@ -94,22 +95,12 @@ class Condenser:
         if raw.startswith("bwrap-dns "):
             self._dns(raw[len("bwrap-dns ") :])
             return
-        m = _HEADER.match(raw)
-        if m and not self.header_seen:
-            self.header_seen = True
-            self.emit("pasta version=%s pid=%s" % (m.group(1), m.group(3)))
-            return
         m = _TS.match(raw)
         if not m:
-            return  # pasta's stderr copy of its setup, or noise
+            return  # not a pasta debug line (a message from the relay, noise)
         t = float(m.group(1))
         self.last_t = max(self.last_t, t)
-        rest = m.group(2)
-        if rest.startswith(("ERROR:", "WARNING:")):
-            level, _, msg = rest.partition(":")
-            self.emit("pasta level=%s msg=%s t=%.3f" % (level.lower(), _value(msg.strip()), t))
-            return
-        m = _FLOW.match(rest)
+        m = _FLOW.match(m.group(2))
         if m:
             self._flow(int(m.group(1)), m.group(2), m.group(3).strip(), t)
 

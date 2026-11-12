@@ -432,7 +432,6 @@ change them, and they are the data needed for a later egress allowlist.
 | Record | Content |
 | --- | --- |
 | start | `event=start session=ID launcher=... user=... uid=... pid=... backend=... flows=logged\|unavailable publish=ADDR:PORTS host_ports=... dir=...` |
-| pasta | `session=ID pasta version=... pid=...`, and pasta's warnings and errors (`pasta level=error msg=...`) |
 | dns | `session=ID dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21`, plus `cname=...` when the answer went through aliases |
 | open | `session=ID flow=7 open proto=tcp dir=out src=ADDR:PORT dst=140.82.112.21:443 domain=github.com t=21.359` |
 | close | `session=ID flow=7 close proto=tcp dir=out dst=140.82.112.21:443 domain=github.com t=33.770 secs=12.411` |
@@ -470,33 +469,38 @@ field, for example the domains an agent reached:
   are written; the start record says `flows=unavailable`.
 - When the launcher runs on a terminal it prints the tool and the session ID.
 - **How (pasta).** pasta logs flows only at debug level, and at debug level it
-  never uses syslog. So pasta gets `--debug --log-file FIFO` (and not
-  `--quiet`), with the FIFO in the launch's
-  [session directory](#runtime-directory), and a supervisor started by the
-  launcher (outside the sandbox) copies each line to the log:
-  - It holds the FIFO open read-write. pasta closes inherited descriptors
-    before it opens its log file; a reader that saw end-of-file in that gap
-    would leave pasta blocked on a full pipe, which stalls the sandbox's
-    network. It stops when pasta has exited, after draining the pipe, then
+  never uses syslog: without `--log-file` it writes every line, timestamped,
+  to its stderr. So pasta gets `--debug` (and not `--quiet`), with its stderr
+  on a FIFO in the launch's [session directory](#runtime-directory), and a
+  supervisor started by the launcher (outside the sandbox) copies each line
+  to the log:
+  - **Why stderr and not `--log-file`.** pasta opens its log file read-write
+    (to rotate it). On SELinux hosts (Fedora, RHEL) pasta runs in its own
+    domain, `pasta_t`, which passt's policy lets only *append* to FIFOs
+    labelled `user_tmp_t`; the open is denied and pasta exits before the
+    sandbox starts. An inherited append-only descriptor is allowed. (A
+    read-write one, or any other descriptor on the FIFO that pasta is not
+    allowed, is silently replaced with `/dev/null` at the exec into
+    `pasta_t`, so the launcher opens its stderr with `>>` and keeps no other
+    descriptor on the FIFO across the exec.)
+  - The supervisor holds the FIFO open read-write, so it never sees
+    end-of-file before pasta writes and the launcher's write-only open does
+    not block. It stops when pasta has exited, after draining the pipe, then
     writes the end record and removes the session directory.
   - If the tool dies, it goes on reading and drops the lines, so pasta never
     blocks on it.
-  - `--log-size` is set to 1 TiB: pasta rotates its log with `fallocate` or
-    `lseek`, which fail on a FIFO and would make it drop every later line.
-  - pasta also prints its setup to stderr until it starts the command. Its
-    stderr is therefore the FIFO too, so those lines go to the log instead of
-    your terminal. The descriptor relay (pasta's command) prints a marker there
-    and reopens your stderr: by path when it is a terminal or a file, else (a
-    pipe) through a second FIFO that the supervisor copies. If pasta stops
-    before the marker (a failed start), the supervisor prints pasta's lines on
-    your terminal, prefixed `<launcher>: pasta:`, just after the launcher has
-    exited.
+  - pasta prints its setup first, and if it fails to start, its error. The
+    descriptor relay (pasta's command) prints a marker on the FIFO and reopens
+    your stderr: by path when it is a terminal or a file, else (a pipe)
+    through a second FIFO that the supervisor copies. If pasta stops before
+    the marker, the supervisor prints pasta's lines on your terminal, prefixed
+    `<launcher>: pasta:`, just after the launcher has exited.
   - **Condensed.** pasta's debug log has about 34 lines per connection (state
-    changes, timers, ACK and buffer bookkeeping) and repeats its setup. The
+    changes, timers, ACK and buffer bookkeeping) and its setup dump. The
     supervisor sends it through `lib/bwrap_netlog.py condense`, which keeps one
-    line when a connection opens and one when it closes, plus pasta's warnings
-    and errors, and drops the rest (in a real session, 5000 lines became
-    280). It writes to `systemd-cat` / `logger` itself.
+    line when a connection opens and one when it closes and drops the rest (in
+    a real session, 5000 lines became 280). It writes to `systemd-cat` /
+    `logger` itself.
 - **DNS relay (pasta).** To name destinations, `lib/bwrap_netlog.py dns`
   listens on `127.53.0.1:53` (UDP and TCP) in the sandbox's network namespace,
   forwards each lookup to `169.254.1.1` (pasta's DNS forward) and writes one
