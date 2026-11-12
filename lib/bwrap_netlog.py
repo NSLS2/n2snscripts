@@ -3,13 +3,17 @@
 "Network log").  Standard library only; runs on Python 3.6 (RHEL 8
 platform-python) and later.
 
-    bwrap_netlog.py condense --session ID [--dns-forward ADDR] -- CMD...
-        Read pasta's debug output (its stderr, and the DNS relay's lines) on
-        standard input and write one line when a connection opens and one
-        when it closes, with the domain of the destination when the relay saw
-        it, to CMD's standard input (systemd-cat or logger).  Everything else
-        pasta writes at debug level (timers, ACK and buffer bookkeeping, state
-        changes, its setup dump) is dropped.
+    bwrap_netlog.py condense --session ID [--dns-forward ADDR]
+        [--fifo PATH --parent PID [--marker TEXT] [--end-record TEXT]
+         [--session-dir DIR]] -- CMD...
+        Read pasta's debug output (its stderr, and the DNS relay's lines) and
+        write one line when a connection opens and one when it closes, with
+        the domain of the destination when the relay saw it, to CMD's
+        standard input (systemd-cat or logger).  Everything else pasta writes
+        at debug level (timers, ACK and buffer bookkeeping, state changes,
+        its setup dump) is dropped.  Without --fifo it filters standard
+        input; with it, it reads the FIFO (see the launcher's "Network log")
+        until the launcher, PID, has exited, then writes the end record.
 
     bwrap_netlog.py dns LISTEN UPSTREAM PARENT_PID
         A DNS relay for the sandbox's network namespace: listen on LISTEN
@@ -185,23 +189,149 @@ class Condenser:
         self.flows.clear()
 
 
+def _parent_is(pid):
+    """True while PID is our parent: then it is alive and its pid cannot have
+    been reused (the launcher keeps its pid through exec; when it exits we
+    are re-parented)."""
+    return os.getppid() == pid
+
+
+class FifoReader:
+    """Read lines from a FIFO without ever blocking its writer.
+
+    The FIFO is opened read-only and non-blocking: a read-only reader sees
+    EOF whenever no writer has it open, which happens before the launcher
+    opens its stderr on it and, briefly, if pasta is ever without the fd.
+    So EOF is not the end: `lines()` keeps polling until `done()` says the
+    session is over, and then drains what is left.  The launcher opens its
+    end only after this reader exists (it is told, see `ready`), so its
+    write-only open does not block.
+    """
+
+    def __init__(self, path, done):
+        import select
+
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self.done = done
+        self.poll = select.poll()
+        self.poll.register(self.fd, select.POLLIN)
+        self.buf = b""
+
+    def _read(self, timeout_ms):
+        """Return the bytes available within TIMEOUT_MS; b"" when none.
+        Waits out TIMEOUT_MS even while the FIFO reports hang-up (no writer),
+        which poll() would otherwise report at once, over and over."""
+        import time
+
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return b""
+            if self.poll.poll(int(left * 1000)):
+                try:
+                    data = os.read(self.fd, 65536)
+                except (BlockingIOError, InterruptedError):
+                    data = b""
+                if data:
+                    return data
+                time.sleep(min(0.05, max(left, 0)))  # hang-up: no writer yet, or none left
+
+    def lines(self, poll_ms=1000):
+        """Yield complete lines (without the newline) until the session is
+        over and the FIFO is drained."""
+        while True:
+            data = self._read(poll_ms)
+            if data:
+                self.buf += data
+                while b"\n" in self.buf:
+                    line, _, self.buf = self.buf.partition(b"\n")
+                    yield line.decode("utf-8", "replace")
+                continue
+            if self.done():
+                break
+        # The writers are gone; whatever they left is read at once.
+        while True:
+            data = self._read(200)
+            if not data:
+                break
+            self.buf += data
+        for line in self.buf.split(b"\n"):
+            if line:
+                yield line.decode("utf-8", "replace")
+        self.buf = b""
+        os.close(self.fd)
+
+
+def _bridge_stderr(path, stop):
+    """Copy PATH (a FIFO the relay opens as the sandbox's stderr when the
+    user's is a pipe) to our stderr until STOP is set and it is drained."""
+    reader = FifoReader(path, stop.is_set)
+    for line in reader.lines():
+        try:
+            sys.stderr.write(line + "\n")
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
+
+
 def condense(argv):
+    """Condense pasta's debug log into the system log.
+
+    Run by the launcher in the background, before it opens its stderr on the
+    FIFO and execs pasta.  It reads the FIFO itself, writes one record per
+    connection to CMD (systemd-cat or logger), writes the end record once the
+    launcher (then pasta) has exited, and removes the session directory.
+    The relay prints MARKER on pasta's stderr when the sandbox is about to
+    start; pasta's lines before it are its setup and, if it fails, its error:
+    they go to the terminal (this process's stderr) when the launcher exits
+    without the marker ever arriving.
+    """
     import subprocess
 
     session, dns_forward, cmd = "", "169.254.1.1", []
+    fifo, parent, marker, end_record, session_dir, stderr_fifo = None, None, None, None, None, None
     i = 0
     while i < len(argv):
-        if argv[i] == "--session":
+        a = argv[i]
+        if a == "--session":
             session = argv[i + 1]
-            i += 2
-        elif argv[i] == "--dns-forward":
+        elif a == "--dns-forward":
             dns_forward = argv[i + 1]
-            i += 2
-        elif argv[i] == "--":
+        elif a == "--fifo":
+            fifo = argv[i + 1]
+        elif a == "--parent":
+            parent = int(argv[i + 1])
+        elif a == "--marker":
+            marker = argv[i + 1]
+        elif a == "--end-record":
+            end_record = argv[i + 1]
+        elif a == "--session-dir":
+            session_dir = argv[i + 1]
+        elif a == "--stderr-fifo":
+            stderr_fifo = argv[i + 1]
+        elif a == "--":
             cmd = argv[i + 1 :]
             break
         else:
-            sys.exit("bwrap_netlog condense: unknown argument %r" % argv[i])
+            sys.exit("bwrap_netlog condense: unknown argument %r" % a)
+        i += 2
+    if fifo is not None and parent is None:
+        sys.exit("bwrap_netlog condense: --fifo needs --parent")
+
+    # Signals meant for the session (Ctrl-C on the terminal, a hangup, a kill
+    # of the process group) must not cost the end record: this process ends
+    # by itself once the launcher has gone.
+    for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGHUP, signal.SIGTERM, signal.SIGPIPE):
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
+    try:
+        signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+    except (OSError, ValueError, AttributeError):
+        pass
+
     sink = None
     if cmd:
         sink = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -221,18 +351,61 @@ def condense(argv):
             state["dead"] = True
 
     c = Condenser(emit, dns_forward)
-    for raw in sys.stdin.buffer:
+
+    def feed(raw):
         try:
-            c.line(raw.decode("utf-8", "replace"))
+            c.line(raw)
         except Exception as e:  # never stop reading pasta's log
             emit("condense level=error msg=%s" % _value(repr(e)))
+
+    if fifo is None:
+        # Plain filter: standard input to the log (tests, by hand).
+        for raw in sys.stdin.buffer:
+            feed(raw.decode("utf-8", "replace"))
+    else:
+        reader = FifoReader(fifo, lambda: not _parent_is(parent))
+        bridge, bridge_stop = None, threading.Event()
+        if stderr_fifo:
+            bridge = threading.Thread(target=_bridge_stderr, args=(stderr_fifo, bridge_stop))
+            bridge.daemon = True
+            bridge.start()
+        # The launcher waits for this before it opens its stderr on the FIFO.
+        try:
+            os.write(3, b"ready\n")
+            os.close(3)
+        except OSError:
+            pass
+        started, early = marker is None, []
+        for raw in reader.lines():
+            if not started:
+                if raw == marker:
+                    started = True
+                    early = []
+                    continue
+                if len(early) < 200:
+                    early.append(raw)
+            feed(raw)
+        if not started:
+            # pasta stopped before starting the sandbox: show what it said.
+            for raw in early:
+                sys.stderr.write("pasta: %s\n" % raw)
+            sys.stderr.flush()
+        if bridge:
+            bridge_stop.set()
+            bridge.join(5)
     c.finish()
+    if end_record:
+        emit(end_record, prefix=False)
     if sink:
         try:
             sink.stdin.close()
         except OSError:
             pass
         sink.wait()
+    if session_dir:
+        import shutil
+
+        shutil.rmtree(session_dir, ignore_errors=True)
 
 
 # ── dns relay ───────────────────────────────────────────────────────────

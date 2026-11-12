@@ -2610,10 +2610,12 @@ _net_session_dir() {
 # pasta at debug level never uses syslog: without --log-file it writes every
 # line, timestamped, to its stderr (log.c vlogmsg).  So with pasta:
 #
-#   launcher ─┬─ supervisor (_net_log_supervisor, background, outside the sandbox)
-#             │    reads the netlog FIFO line by line and writes each line,
-#             │    prefixed with the session, to the tool; at the end writes
-#             │    the end record and removes the session directory
+#   launcher ─┬─ condenser (bwrap_netlog.py condense, background, outside the
+#             │    sandbox): reads the netlog FIFO, writes one record per
+#             │    connection to the tool; once the launcher (pasta) has gone
+#             │    writes the end record and removes the session directory.
+#             │    Without Python: _net_log_supervisor, which copies pasta's
+#             │    lines as they are.
 #             └─ exec env -i ... pasta --debug ... 2>>FIFO
 #                  -- relay (prints a marker, reopens its stderr) -- bwrap ...
 #
@@ -2625,19 +2627,19 @@ _net_session_dir() {
 #     write one (2<>) would be silently replaced with /dev/null at the exec
 #     into pasta_t, and so would any other read-write descriptor on the FIFO
 #     left open across the exec: the launcher closes its hold before it.
-#   - The supervisor holds the FIFO open read-write, so it never sees EOF
-#     early, and so the launcher's write-only open does not block.  It stops
-#     reading when the launcher process (pasta) is gone, after draining what
-#     is left.  pasta keeps descriptors 0-2 across its own sandboxing (it
-#     closes from 3 up).
+#   - The reader opens the FIFO first (the launcher waits for its "ready"),
+#     so the launcher's write-only open does not block, and the reader
+#     ignores end-of-file: it stops only when the launcher process is gone,
+#     after draining what is left.  pasta keeps descriptors 0-2 across its
+#     own sandboxing (it closes from 3 up).
 #   - It never blocks pasta: if the tool dies it goes on reading and drops the
 #     lines.
 #   - pasta's startup lines would otherwise print on the terminal; the relay
 #     prints a marker on the FIFO and then reopens the user's stderr by path
 #     (a terminal or a file), or through a second FIFO that the supervisor
 #     copies to it (a pipe).  If pasta exits before the marker (a failed
-#     start), the supervisor prints its lines on the terminal, so its errors
-#     are not lost.
+#     start), the reader prints its lines on the terminal, so its errors are
+#     not lost.
 # With slirp4netns or --share-net only the start and end records are written
 # (slirp4netns has no flow log); the supervisor just waits for the end.
 
@@ -2655,6 +2657,7 @@ _NET_LOG_FLOWS=0
 _NET_LOG_FIFO=""
 _NET_LOG_ERR_FIFO=""
 _NET_LOG_MARKER=""
+_NET_LOG_PASTA_VERSION=""
 
 # _net_log_detect
 #   List the usable logging tools, best first (_NET_LOG_TOOLS: systemd-cat
@@ -2714,6 +2717,7 @@ _net_log_record() {
         else
             _r+=" flows=unavailable"
         fi
+        [[ -z "${_NET_LOG_PASTA_VERSION}" ]] || _r+=" pasta=${_NET_LOG_PASTA_VERSION}"
         [[ -z "${_NET_PUBLISH_ADDR_EFFECTIVE}" ]] || _r+=" publish=${_NET_PUBLISH_ADDR_EFFECTIVE}:$(_net_join ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"})"
         for _i in ${NET_HOST_PORTS[@]+"${NET_HOST_PORTS[@]}"}; do _hp+="${_hp:+,}${_i}"; done
         [[ -z "${_hp}" ]] || _r+=" host_ports=${_hp}"
@@ -2725,10 +2729,15 @@ _net_log_record() {
 # _net_log_start
 #   Called by launch_sandbox just before it execs: write the start record
 #   (which checks the tool; without one, warn and log nothing), then with
-#   pasta add --debug and the stderr hand-over, and start the supervisor.
+#   pasta add --debug and the stderr hand-over, and start the reader (the
+#   condenser, or without Python the supervisor), waiting until it has the
+#   FIFO open.
 _net_log_start() {
-    local _err _launcher="${0##*/}" _t
+    local _err _launcher="${0##*/}" _t _ready _rfd
     _NET_LOG_TOOL=""
+    if [[ "${_NET_BACKEND}" == pasta ]]; then
+        _NET_LOG_PASTA_VERSION="$("${_PASTA_BIN}" --version 2> /dev/null | awk 'NR == 1 { print $2 }' || true)"
+    fi
     for _t in ${_NET_LOG_TOOLS[@]+"${_NET_LOG_TOOLS[@]}"}; do
         _NET_LOG_TOOL="${_t}"
         _net_log_cmd
@@ -2763,7 +2772,7 @@ _net_log_start() {
         done
         PASTA_ARGS=("${PASTA_ARGS[@]}" --debug)
         # The relay restores the user's stderr: by path when it is a terminal
-        # or a file, else through a FIFO the supervisor copies.
+        # or a file, else through a FIFO the reader copies.
         _err="$(readlink "/proc/$$/fd/2" 2> /dev/null || true)"
         if [[ "${_err}" != /* || "${_err}" == *" (deleted)" ]] ||
             { [[ ! -c "${_err}" && ! -f "${_err}" ]]; }; then
@@ -2779,12 +2788,36 @@ _net_log_start() {
         fi
         _BWRAP_FD_RELAY=("${_pre[@]}" 2 append "${_err}" ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
     fi
+
+    if [[ "${_NET_LOG_FLOWS}" -eq 1 && -n "${_NET_LOG_PY}" ]]; then
+        # The condenser reads the FIFO.  It says "ready" on descriptor 3
+        # once it has it open, so that nothing pasta writes is lost; its
+        # stderr is the user's, for pasta's lines if pasta fails to start.
+        local -a _cond=("${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense
+            --session "${_NET_LOG_SESSION}" --dns-forward "${_NET_DNS_FORWARD_ADDR}"
+            --fifo "${_NET_LOG_FIFO}" --parent "$$" --marker "${_NET_LOG_MARKER}"
+            --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}")
+        [[ -z "${_NET_LOG_ERR_FIFO}" ]] || _cond+=(--stderr-fifo "${_NET_LOG_ERR_FIFO}")
+        exec {_rfd}< <(exec setsid "${_cond[@]}" -- "${_NET_LOG_CMD[@]}" 3>&1 > /dev/null < /dev/null)
+        IFS= read -r -t 10 _ready <&"${_rfd}" || _ready=""
+        exec {_rfd}<&-
+        if [[ "${_ready}" != ready ]]; then
+            printf 'Warning: %s: the network log condenser did not start; connections are not\n' "${_launcher}" >&2
+            printf '         logged for this session.\n' >&2
+            # Keep pasta's stderr off a FIFO no one reads.
+            _NET_LOG_FIFO=""
+            _NET_LOG_FLOWS=0
+        fi
+        return 0
+    fi
     _net_log_supervisor &
 }
 
 # _net_log_supervisor
-#   The background half of the network log (see "Network log").  Runs in a
-#   subshell; $$ is still the launcher, which is pasta (or bwrap) by then.
+#   The background half of the network log without Python (see "Network
+#   log"): copies pasta's lines as they are, prefixed with the session, or
+#   without pasta just waits for the end.  Runs in a subshell; $$ is still
+#   the launcher, which is pasta (or bwrap) by then.
 _net_log_supervisor() {
     local _sink _prefix _fifo _line="" _part="" _rc _started=0 _dead=0 _bridge="" _i
     local -a _early=()
@@ -2794,16 +2827,8 @@ _net_log_supervisor() {
     # the launcher has gone.
     trap '' INT QUIT TSTP HUP TERM PIPE
     exec < /dev/null > /dev/null
-    if [[ -n "${_NET_LOG_PY}" ]]; then
-        # The condenser writes session=ID itself.
-        exec {_sink}> >(exec setsid "${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense \
-            --session "${_NET_LOG_SESSION}" --dns-forward "${_NET_DNS_FORWARD_ADDR}" \
-            -- "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
-        _prefix=""
-    else
-        exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
-        _prefix="session=${_NET_LOG_SESSION} "
-    fi
+    exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
+    _prefix="session=${_NET_LOG_SESSION} "
 
     if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
         # Read-write, so end-of-file is never seen before pasta writes.  This
@@ -2901,18 +2926,17 @@ _net_log_print_dry_run() {
         "${_NET_LOG_SESSION}" "${_NET_LOG_CMD[*]}"
     if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
         printf '# and pasta gets --debug (not --quiet) with its stderr on <session dir>/netlog,\n'
-        printf '# a FIFO; a supervisor copies each line to the log and the relay first reopens\n'
-        printf '# your stderr.  The end record is written when pasta exits.\n'
+        printf '# a FIFO; the relay first reopens your stderr.  The end record is written when\n'
+        printf '# pasta exits.\n'
         if [[ -n "${_NET_LOG_PY}" ]]; then
-            printf '# The lines are condensed (one per connection opened and closed) by
-'
-            printf '#   %s -I %s condense
-' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}"
-            printf '# and the relay first starts the DNS relay on %s:53 in the namespace:
-' "${_NET_DNS_RELAY_ADDR}"
-            printf '#   %s -I %s dns %s %s <relay pid>
-' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
+            printf '# The FIFO is read, and the lines condensed (one per connection opened and\n'
+            printf '# closed), by\n'
+            printf '#   %s -I %s condense --fifo <session dir>/netlog ...\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}"
+            printf '# and the relay first starts the DNS relay on %s:53 in the namespace:\n' "${_NET_DNS_RELAY_ADDR}"
+            printf '#   %s -I %s dns %s %s <relay pid>\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
                 "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_FORWARD_ADDR}"
+        else
+            printf '# A supervisor copies each line to the log as it is.\n'
         fi
     else
         printf '# and a supervisor writes the end record when the sandbox exits (no flow log\n'
