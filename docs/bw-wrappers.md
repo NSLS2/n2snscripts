@@ -18,8 +18,7 @@ option list; the tables below summarise the common surface.
 - `bubblewrap` (`bwrap`) >= 0.4.0
   - binary masking is verified on RHEL 8.10 (`bubblewrap-0.4.0-3.el8_10`) and EL9 (0.6.3)
 - For the private network namespace, one of: `pasta` (package `passt`,
-  RHEL 9 and later) **with bwrap >= 0.4.1** (see
-  [Implementation notes: pasta](#implementation-notes-pasta)), or
+  RHEL 9 and later), or
   `slirp4netns` >= 0.4.0 with libslirp >= 4.3.0 (package `slirp4netns`,
   RHEL 8 AppStream) and `python3` (or RHEL 8's
   `/usr/libexec/platform-python`); plus `/dev/net/tun` and unprivileged user
@@ -550,13 +549,14 @@ field, for example the domains an agent reached:
 - pasta maps you to uid 0 in its user namespace, so bwrap runs the agent in a
   nested user namespace as your real uid and gid (`--unshare-user --uid
   --gid`); file ownership looks as before and the agent has no capabilities.
-- **pasta needs bwrap 0.4.1 or later** and the launcher checks before using
-  it. In 0.4.0 `drop_privs()` tests `geteuid() == 0` instead of "installed
-  setuid root", so inside pasta's namespace — where uid 0 is the only mapped
-  id — it calls `setuid(<your uid>)` on an unmapped id and dies with
-  `unable to drop root uid: Invalid argument`. 0.4.1 changed the guard to
-  `is_privileged`. RHEL 8 ships 0.4.0, but also has no pasta, so in practice
-  this only bites a hand-built pasta or a backported one.
+- **Not tested: pasta with bwrap 0.4.0.** pasta maps you to uid 0 alone
+  (its source writes `0 <uid> 1`), and bwrap 0.4.0 run with `--unshare-user
+  --uid <your uid>` in such a namespace stopped with `unable to drop root uid:
+  Invalid argument` on RHEL 8.10 (see
+  [Implementation notes: slirp4netns](#implementation-notes-slirp4netns)).
+  Whether pasta with bwrap 0.4.0 hits the same error has not been tried: the
+  RHEL 8 hosts tested have bwrap 0.4.0 and no pasta. The launcher does not
+  check for it.
 - pasta renames the host to `pasta-<name>`; bwrap's `--unshare-uts
   --hostname` restores the real name.
 - `--no-pidns` is passed when the installed pasta supports it (2026-09 and
@@ -590,23 +590,18 @@ launcher ─┬─ helper (background): waits for the namespace, starts slirp4ne
   it.
 - **The ids are mapped to themselves, not to root.** The launcher unshares and
   writes the maps itself, in about fifteen lines of Python
-  (`_NET_NS_IDENTITY`), rather than calling `unshare --user --map-root-user
-  --net`, for two reasons:
-  - RHEL 8 is the only platform this backend exists for, and its bwrap is
-    0.4.0, which cannot start under a root-only map at all (see the pasta
-    notes above). An identity map leaves your uid mapped, so bwrap's
-    `--uid`/`--gid` name an id that exists.
-  - Nothing in the sandbox runs as uid 0, not even for the moment before bwrap
-    switches back.
+  (`_NET_NS_IDENTITY`), instead of calling `unshare --user --map-root-user
+  --net`. With that root map, bwrap 0.4.0 (RHEL 8.10) run with `--uid <your
+  uid>` stopped with `unable to drop root uid: Invalid argument`: its
+  `drop_privs()` calls `setuid(<your uid>)` when `geteuid() == 0`, and your
+  uid is not mapped there (`EINVAL`). With your uid mapped to itself, bwrap
+  starts and the agent runs as your uid. slirp4netns joins the namespace and
+  configures `tap0` in it.
 
-  util-linux grew `--map-user`/`--map-current-user` in 2.38 and could do this
-  directly, but RHEL 8 has 2.32, whose `unshare` offers only
-  `--map-root-user`. Writing a single-line map of your own id needs no
-  privilege, so this needs neither `newuidmap`/`newgidmap` nor `/etc/subuid`
-  entries — unlike rootless podman, which uses both to build a much wider map
-  and then runs the payload as uid 0 inside it. slirp4netns still gets full
-  capabilities when it joins, because the namespace is owned by your uid,
-  which is the uid it runs as.
+  Writing a single-line map of your own id needs no helper (no
+  `newuidmap`, no `/etc/subuid`). The `unshare` on these hosts documents
+  `--map-root-user` and no option that maps your own uid (its man page), so
+  the launcher writes the map itself.
 - Python (`python3`, or RHEL 8's `/usr/libexec/platform-python`) is therefore
   required for this backend, not only for `--publish`. Standard library only,
   3.6 or later.
@@ -619,35 +614,22 @@ launcher ─┬─ helper (background): waits for the namespace, starts slirp4ne
   `/run`.
 - **DNS lookups are logged**, and with no flow log they are the only account
   of what the sandbox reached for. The relay runs inside the network
-  namespace and forwards to the backend's own DNS, so it is not pasta-only —
-  but it cannot bind port 53 for itself here. Capabilities survive `execve`
-  only for uid 0, and this namespace maps your uid, so by the time the relay
-  starts (after the mapper's exec and the descriptor relay's) it holds none.
-  The mapper therefore raises loopback and binds the relay's UDP and TCP
-  sockets while it still can, between the unshare and the exec, and leaves
-  them on descriptors 88 and 89 for `DnsRelay.adopt`. A fresh namespace also
-  has `lo` down, and slirp4netns only raises it later in `configure_network`,
-  so binding early removes that race too.
-- **`--enable-sandbox` is not passed**, and this is the cost of the identity
-  map. After joining the launcher's namespace, slirp4netns does
-  `setegid(0)`/`seteuid(0)` (`main.c`); with no uid 0 mapped that fails and
-  the launch stops with `setegid(0)` / `parent failed`. An unprivileged
-  process may write only one line into `uid_map` — the line mapping its own
-  id — so the namespace can map uid 0 *or* your uid, not both:
-
-  | map | slirp4netns `--enable-sandbox` | bwrap 0.4.0 |
-  | --- | --- | --- |
-  | uid 0 only | works | dies, unless the agent runs as uid 0 |
-  | your uid (what we do) | cannot `setegid(0)` | works, agent keeps its uid |
-
-  Your uid wins: it is what the agent runs as and what every file it writes
-  is owned by, whereas `--enable-sandbox` only hardens slirp4netns itself (a
-  mount namespace pivot-rooted into an empty directory, plus dropping
-  capabilities). `--enable-seccomp`, which bounds what a compromised libslirp
-  can call, is a separate flag with no id requirement and is still passed.
-  Mapping both ids needs a multi-line map, which takes `newuidmap`/`newgidmap`
-  and an `/etc/subuid` entry — the way rootless podman does it, and the way to
-  restore `--enable-sandbox` if it is wanted.
+  namespace and forwards to the backend's own DNS, so it is not pasta-only,
+  but here it cannot bind port 53 for itself: under this map, after the
+  mapper's exec and the descriptor relay's, it holds no capabilities (seen:
+  `CapEff` 0, the bind refused). The mapper, which still has them after the
+  unshare, brings loopback up (a new namespace starts with `lo` down) and
+  binds the relay's UDP and TCP sockets before its exec, and leaves them on
+  descriptors 88 and 89 for `DnsRelay.adopt`.
+- **`--enable-sandbox` is not passed.** After joining the launcher's
+  namespace, slirp4netns does `setegid(0)` (`main.c`); with no uid 0 mapped
+  the launch stopped with `setegid(0)` / `parent failed`. Without privilege
+  a process may write a single line to `uid_map`, mapping its own uid
+  (`user_namespaces(7)`), so this namespace maps your uid and not uid 0.
+  slirp4netns describes `--enable-sandbox` as "create a new mount namespace
+  (and drop all caps except CAP_NET_BIND_SERVICE if running as the root)".
+  `--enable-seccomp` is a separate option (slirp4netns applies the two
+  independently) and is still passed; launches with it work under this map.
 - slirp4netns runs in its own session (Ctrl-C does not reach it) with a
   scrubbed environment (no API keys). It exits when bwrap does: its
   `--exit-fd` is the other end of bwrap's `--sync-fd`.

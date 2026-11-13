@@ -224,37 +224,6 @@ _version_ge() {
     [[ "$(printf '%s\n%s\n' "${a}" "${b}" | sort -V | head -n1)" == "${b}" ]]
 }
 
-# Lowest bwrap usable under a user namespace that maps the caller to uid 0 and
-# maps nothing else (what pasta builds, and what util-linux `unshare
-# --map-root-user` writes).  bubblewrap 0.4.0's drop_privs() is
-#
-#     if (geteuid () == 0 && setuid (opt_sandbox_uid) < 0)
-#       die_with_error ("unable to drop root uid");
-#
-# which mistakes "root in a user namespace" for "installed setuid root": it
-# calls setuid(<your uid>) on an id that namespace does not map, gets EINVAL
-# and dies with "unable to drop root uid: Invalid argument" before the sandbox
-# starts.  0.4.1 changed the guard to is_privileged.  RHEL 8 ships 0.4.0, one
-# patch release short, so this has to be checked and not assumed.
-_BWRAP_MIN_VERSION_MAPROOT=0.4.1
-
-# _bwrap_version
-#   Print the version of the bwrap that will be used ("0.4.0"), nothing and
-#   return 1 if it cannot be determined.  Cached: bwrap is resolved and run
-#   once per launch.
-_BWRAP_VERSION=""
-_bwrap_version() {
-    local _bin _out
-    if [[ -z "${_BWRAP_VERSION}" ]]; then
-        _bin="$(resolve_bwrap_bin)" || return 1
-        [[ -n "${_bin}" && -x "${_bin}" ]] || return 1
-        _out="$("${_bin}" --version 2> /dev/null)" || return 1
-        [[ "${_out}" =~ bubblewrap\ ([0-9][0-9.]*) ]] || return 1
-        _BWRAP_VERSION="${BASH_REMATCH[1]}"
-    fi
-    printf '%s' "${_BWRAP_VERSION}"
-}
-
 # Detect kernel-level security features that affect bwrap argument choice.
 #
 # TIOCSTI capability guard (Linux 5.14+):
@@ -2504,25 +2473,11 @@ detect_net_capabilities() {
 #   assumed to work.
 _NET_TRY_REASON=""
 _net_try_pasta() {
-    local _out _rc _bver
+    local _out _rc
     _NET_TRY_REASON=""
     _PASTA_BIN="$(command -v pasta 2> /dev/null || true)"
     if [[ -z "${_PASTA_BIN}" || ! -x "${_PASTA_BIN}" ]]; then
         _NET_TRY_REASON="not found on PATH (package passt)"
-        return 1
-    fi
-    # pasta builds the user namespace itself and maps the caller to uid 0 in
-    # it, so bwrap has to switch back to the real uid: see
-    # _BWRAP_MIN_VERSION_MAPROOT.  Unlike the slirp4netns backend, which maps
-    # the ids itself, there is nothing to work around here, so refuse the
-    # backend rather than fail at exec with bwrap's obscure message.
-    _bver="$(_bwrap_version 2> /dev/null || true)"
-    if [[ -z "${_bver}" ]]; then
-        _NET_TRY_REASON="the bwrap version could not be read ('bwrap --version'; ${_BWRAP_MIN_VERSION_MAPROOT} or later is needed)"
-        return 1
-    fi
-    if ! _version_ge "${_bver}" "${_BWRAP_MIN_VERSION_MAPROOT}"; then
-        _NET_TRY_REASON="bwrap ${_bver} cannot run in pasta's root-mapped user namespace (${_BWRAP_MIN_VERSION_MAPROOT} or later is needed)"
         return 1
     fi
     # --no-pidns (2026-09) is not in RHEL 9 / EPEL builds; without it pasta
@@ -3109,8 +3064,9 @@ _net_log_print_dry_run() {
 #   --cidr                   192.168.254.0/24 (BNL uses 10/8, slirp's default
 #                            range); sandbox .100, gateway .2, DNS .3.
 #   --enable-seccomp         as podman does, when /etc/resolv.conf resolves
-#                            inside /etc or /run (required by --enable-sandbox,
-#                            which the resolv.conf test was written for).
+#                            inside /etc or /run (the condition this launcher
+#                            set for --enable-sandbox and --enable-seccomp
+#                            together, kept as it was).
 #   --enable-sandbox         only when the namespace maps uid 0, which this
 #                            launcher's does not; see _NET_NS_ROOT_MAPPED.
 # --publish works through the API socket (add_hostfwd, IPv4 TCP, one port per
@@ -3167,53 +3123,36 @@ for spec in sys.argv[2:]:
         sys.exit("%s:%s -> sandbox port %s: %s" % (addr, hport, gport, reply.get("error", reply)))
 '
 
-# Whether the namespace the launcher builds maps uid and gid 0.
+# Whether the namespace the launcher builds maps uid and gid 0.  It does not:
+# it maps the real uid and gid to themselves (_NET_NS_IDENTITY).  Without
+# privilege a process may write a single line to uid_map, mapping its own
+# effective uid (user_namespaces(7)), so the map holds uid 0 or the real uid,
+# not both.  Seen on RHEL 8.10 (bubblewrap 0.4.0, slirp4netns 1.2.3):
 #
-# It does not, and the two backends cannot both have what they want, because
-# an unprivileged process may write only ONE line into uid_map -- the line
-# mapping its own id:
+#   map 0 only          bwrap --unshare-user --uid <real uid> stops with
+#                       "unable to drop root uid: Invalid argument" (0.4.0's
+#                       drop_privs() calls setuid() when geteuid() == 0, and
+#                       the real uid is not mapped: EINVAL)
+#   map the real id     bwrap starts and the sandbox runs as the real uid;
+#                       slirp4netns --enable-sandbox stops at setegid(0)
+#                       ("parent failed"), so it is not passed
 #
-#   map 0 only          slirp4netns --enable-sandbox works; bwrap 0.4.0 dies
-#                       with "unable to drop root uid" unless the agent is
-#                       left running as uid 0 (see _BWRAP_MIN_VERSION_MAPROOT)
-#   map the real id     bwrap works and the agent keeps its own uid;
-#                       slirp4netns --enable-sandbox cannot setegid(0)
-#
-# The real id wins: it is what the sandbox runs as, and the agent's uid is a
-# property of every file it writes, whereas --enable-sandbox only hardens
-# slirp4netns itself (a mount namespace pivot_rooted into an empty directory,
-# plus dropping capabilities).  --enable-seccomp is kept; it is a separate
-# flag with no id requirement, and it is the filter that bounds what a
-# compromised libslirp could call.
-#
-# Mapping both would need a multi-line map, which takes the setuid helpers
-# newuidmap/newgidmap and an /etc/subuid entry -- how rootless podman does it.
-# That is the way to restore --enable-sandbox if it is wanted; it needs the
-# helper to write the map for the launcher's pid between the unshare and the
-# exec, so it is a real change, not a flag.
+# --enable-sandbox is what slirp4netns describes as "create a new mount
+# namespace (and drop all caps except CAP_NET_BIND_SERVICE if running as the
+# root)".  --enable-seccomp is a separate option (slirp4netns.c applies the two
+# independently) and is still passed; launches with it work under this map.
 _NET_NS_ROOT_MAPPED=0
 
 # The identity mapper, which replaces `unshare --user --map-root-user --net`:
 # unshare a user and a network namespace, map the real uid and gid to
-# themselves, then exec the rest of the argument list.
+# themselves, then exec the rest of the argument list.  Writing a single-line
+# map of one's own id needs no helper (no newuidmap, no /etc/subuid).  The
+# unshare on these hosts documents --map-root-user and no option that maps
+# one's own uid (its man page), so the launcher does this itself.
 #
 # It does not fork, so the launcher keeps its pid: $$ is what the helper waits
-# for and what slirp4netns is pointed at.
-#
-# An identity map, rather than util-linux's root map, for two reasons:
-#   - bwrap 0.4.0 (RHEL 8, the only platform this backend exists for) cannot
-#     start under a root-only map at all; see _BWRAP_MIN_VERSION_MAPROOT.
-#   - the sandbox keeps the real uid without bwrap having to switch back to
-#     it, so nothing in it runs as uid 0 even for the moment before bwrap
-#     drops privileges.
-# util-linux grew --map-user/--map-current-user in 2.38 and could do this
-# directly; RHEL 8 has 2.32, whose unshare offers only --map-root-user.
-#
-# A process may always write a single-line map of its own id without any
-# helper, so this needs neither newuidmap/newgidmap nor /etc/subuid entries
-# (which is how rootless podman builds a much wider map).  slirp4netns still
-# gets full capabilities when it joins: the namespace is owned by the real
-# uid, which is the uid it runs as.
+# for and what slirp4netns is pointed at.  slirp4netns joins this namespace
+# and configures tap0 in it (seen: "sent tapfd=5 for tap0" after --configure).
 #
 # Both ids must be read before the unshare; afterwards the process is the
 # overflow id (65534) and a map naming that id is refused with EPERM.
@@ -3223,16 +3162,16 @@ _NET_NS_ROOT_MAPPED=0
 # the relay that the descriptor relay spawns later.  That work has to happen
 # HERE, in this process, between the unshare and the exec:
 #
-#   - creating the user namespace grants a full capability set, so this
-#     process has CAP_NET_ADMIN (loopback up) and CAP_NET_BIND_SERVICE
-#     (port 53);
-#   - execve recomputes the sets, and with no file capabilities and a
-#     non-zero euid it clears them.  Under pasta the namespace maps the
-#     caller to 0 and capabilities survive, which is why the relay binds for
-#     itself there; here nothing downstream of the exec can.
+#   - after the unshare this process has a full capability set in the
+#     namespace, including CAP_NET_ADMIN (loopback up) and
+#     CAP_NET_BIND_SERVICE (port 53);
+#   - after an execve the set was empty under this map (CapEff 0, bind to
+#     port 53 refused), while under a map of uid 0 it was kept.  pasta writes
+#     a map of uid 0 ("0 <uid> 1", pasta_start_ns), and there the relay binds
+#     for itself.
 #
-# Bringing lo up also removes a race: slirp4netns raises lo in
-# configure_network, but the descriptor relay runs before it is ready.
+# A new network namespace starts with lo down.  slirp4netns brings lo up too
+# (configure_network), but only once it has started, after this exec.
 _NET_NS_IDENTITY='
 import ctypes, fcntl, os, socket, struct, sys
 CLONE_NEWUSER, CLONE_NEWNET = 0x10000000, 0x40000000

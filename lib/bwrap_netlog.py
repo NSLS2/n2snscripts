@@ -625,12 +625,13 @@ class DnsRelay:
     def adopt(self, udp_fd, tcp_fd):
         """Take over sockets bound before the exec that dropped our privileges.
 
-        Binding port 53 needs CAP_NET_BIND_SERVICE, and capabilities survive
-        execve only for uid 0.  With pasta the namespace maps the caller to 0,
-        so bind() works; with slirp4netns the namespace maps the real uid, the
-        exec chain leaves us with no capabilities at all, and the sockets are
-        bound instead by the process that creates the namespace and handed
-        over here (see _NET_NS_IDENTITY in bwrap_sandbox_lib.sh).
+        Binding port 53 needs CAP_NET_BIND_SERVICE.  With pasta, whose
+        namespace maps the caller to uid 0, the relay binds for itself
+        (bind()).  With slirp4netns the namespace maps the real uid, and after
+        the exec chain the relay holds no capabilities (seen: CapEff 0, the
+        bind refused), so the process that creates the namespace binds the
+        sockets and hands them over here (see _NET_NS_IDENTITY in
+        bwrap_sandbox_lib.sh).
         """
         self.udp = socket.fromfd(udp_fd, socket.AF_INET, socket.SOCK_DGRAM)
         self.tcp = socket.fromfd(tcp_fd, socket.AF_INET, socket.SOCK_STREAM)

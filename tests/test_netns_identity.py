@@ -5,9 +5,10 @@
 The snippet replaces `unshare --user --map-root-user --net` for the
 slirp4netns backend: it unshares a user and a network namespace, maps the
 real uid and gid to themselves and execs its arguments in the same process.
-The identity map matters because bubblewrap 0.4.0 (RHEL 8) cannot start under
-a namespace that maps only uid 0 -- it calls setuid() on an unmapped id and
-dies with "unable to drop root uid: Invalid argument".
+The identity map matters because bubblewrap 0.4.0 (seen on RHEL 8.10), run
+with --unshare-user --uid <real uid> in a namespace that maps only uid 0,
+calls setuid() on the unmapped real uid and stops with "unable to drop root
+uid: Invalid argument".
 
 The snippet is read out of the shell library rather than copied, so the tests
 fail if the two drift apart.

@@ -32,12 +32,13 @@ def _keep_caps_across_exec():
 
     After joining a user namespace we own, this process has every capability
     in it.  The real slirp4netns configures the interface right there, with
-    ioctls in the same process.  The fake execs `ip` instead, and execve
-    clears the capability sets unless the process is uid 0 in the namespace:
-    true when the launcher mapped the caller to root, false with the identity
-    map the slirp4netns launch uses (_NET_NS_IDENTITY).  Raising each
-    permitted capability into the ambient set keeps them across the exec, so
-    the fake can do what the real program does.
+    ioctls in the same process (configure_network).  The fake execs `ip`
+    instead.  Under the launcher's old map of uid 0 the exec kept the
+    capabilities; under the identity map the slirp4netns launch now uses
+    (_NET_NS_IDENTITY) it does not (seen: `ip link set lo up` fails with
+    "Operation not permitted").  Raising each permitted capability into the
+    ambient set keeps them across the exec, so the fake can do what the real
+    program does.
     """
     libc = ctypes.CDLL(None, use_errno=True)
     header = ctypes.create_string_buffer(struct.pack("II", 0x20080522, 0))  # v3, this thread
