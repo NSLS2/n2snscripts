@@ -17,7 +17,15 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-readonly PROGRAM_NAME="${0##*/}"
+# Where this script really is. Everything is derived from the resolved path, so
+# running it through a symlink cannot change the command sudo is asked for, or
+# the name in the audit line. SCRIPT_DIR is where the bw* wrappers sit: they are
+# run by absolute path, because sudo replaces PATH with its secure_path and the
+# profile.d snippet that adds them is only read by a login shell.
+SCRIPT_PATH="$(readlink -f -- "$0")"
+readonly SCRIPT_PATH
+readonly SCRIPT_DIR="${SCRIPT_PATH%/*}"
+readonly PROGRAM_NAME="${SCRIPT_PATH##*/}"
 
 # The account the agents run as. The caller runs this script as whoever they
 # are -- the sudoers rule names the beamline operator account, so that is
@@ -25,12 +33,6 @@ readonly PROGRAM_NAME="${0##*/}"
 # the account name or the sudo line. The sudoers rule still decides who is
 # allowed.
 readonly AGENT_ACCOUNT=xfagent
-
-# The bw* wrappers sit next to this script, and are run by absolute path: sudo
-# replaces PATH with its secure_path, and the profile.d snippet that adds them
-# is only read by a login shell.
-SCRIPT_DIR="$(cd -P -- "$(dirname -- "$(readlink -f -- "$0")")" && pwd -P)"
-readonly SCRIPT_DIR
 
 # The wrappers find their agent by name, and sudo's secure_path does not hold
 # /usr/local/bin, where npm installs them.
@@ -281,7 +283,7 @@ main() {
         ensure_agent_dir "${HOME}" "$(id -un)"
         check_profile_collection "${HOME}"
         share_profile_collection "${HOME}" "$(id -un)"
-        exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_DIR}/${PROGRAM_NAME}" "${agent}"
+        exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_PATH}" "${agent}"
     fi
 
     # The bw* launchers run this too; running it before the audit line keeps a
