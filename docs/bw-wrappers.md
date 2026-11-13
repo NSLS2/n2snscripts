@@ -1133,9 +1133,23 @@ above is about servers that run outside it), and the OpenCode web UI is then
 reachable from a browser.
 
 ```text
-bwopencode2 --serve [--serve-port N]
+bwopencode2 --serve [--serve-port N] [--serve-open]
 bwopencode2 --serve-ssh-config
 ```
+
+Two ways to reach it, both signed in with a one-time link and no password to
+type:
+
+- **From your own machine, over ssh** (the usual case). When the server is up
+  the launcher prints one block with the `ssh -L` command (and the `ssh
+  <host>-oc` alias), the sign-in link for `http://127.0.0.1:PORT`, and the same
+  link as a `google-chrome --app=...` command, which opens the UI as an app
+  window without tabs or an address bar. A link works once and expires after 5
+  minutes, and setting up a tunnel can take longer than that, so **press Enter
+  in the server's terminal for a new link** (the block is printed again).
+- **On the same host** (a desktop or remote desktop session), start with
+  `--serve-open`: the browser opens by itself, already signed in.
+  See [`--serve-open`](#--serve-open-a-browser-on-the-same-host).
 
 - **One server per invocation.** Each `--serve` is its own sandbox with its own
   server; stop it with Ctrl-C in its terminal.
@@ -1177,17 +1191,23 @@ bwopencode2 --serve-ssh-config
   (the wrapper refuses it, and outside the sandbox it points at the shared
   service). Instead the sandbox runs a small wrapper, not `opencode2 serve`
   directly: it starts the server, waits until it answers, asks it for a
-  one-time pairing code and prints the link twice, for the tunnel
-  (`http://127.0.0.1:<port>/auth/connect/<code>`) and for this host
-  (`http://127.H1.H2.1:<port>/...`). Open one to be signed in, with the 30-day cookie, without typing the password.
-  The link works once and expires after 5 minutes; after that, or if the
-  printed link failed, click **Use password** and enter the password. The
-  password reaches `curl` on its standard input (`-K -`), never on a command
-  line, because a process in the sandbox is visible to `ps` on the host. The
-  wrapper stays in the foreground and stops the server on Ctrl-C or when the
-  sandbox ends.
+  one-time pairing code and prints one block: the `ssh -L` command and the
+  alias, the link through the tunnel
+  (`http://127.0.0.1:<port>/auth/connect/<code>`), the same as a
+  `google-chrome --app=...` command, the link for this host
+  (`http://127.H1.H2.1:<port>/...`) and the password. Open a link to be signed
+  in, with the 30-day cookie, without typing the password. A link works once
+  and expires after 5 minutes. **Enter** in the terminal asks the server for a
+  new code and prints the block again; it is only read when the wrapper has a
+  terminal, and at end of input the wrapper stops reading and keeps waiting
+  for the server. If the server gives no link, the block shows the plain page
+  and the password and you click **Use password**. The password reaches `curl`
+  on its standard input (`-K -`), never on a command line, because a process in
+  the sandbox is visible to `ps` on the host (a backslash or double quote in a
+  fixed password is escaped for curl's config file). The wrapper stays in the
+  foreground and stops the server on Ctrl-C or when the sandbox ends.
 - **Password.** The server needs one (Basic auth, user `opencode`). The launcher uses a **random password for each
-  session** and prints it at start. To use a fixed one, export
+  session** and prints it with the sign-in block. To use a fixed one, export
   `BWOPENCODE2_SERVE_PASSWORD` (at least 12 characters, for example from
   `load-env`); the launcher prints nothing about it. Either way it reaches the
   server only as `OPENCODE_PASSWORD` in the sandbox environment (the host's
@@ -1211,13 +1231,56 @@ bwopencode2 --serve-ssh-config
 - **Limits.** `--serve` takes no opencode2 arguments and cannot be combined with
   `--exec`; `serve`, `--server`, `pair` and the other refused arguments stay
   refused. `--dry-run` shows the command (password redacted) and claims
-  nothing.
+  nothing, and opens no browser.
 - **Cookie.** The server names its login cookie `opencode_session_<port>` from
   the port in the address the browser used (checked with 2.2.6 using curl), so
   sessions on different ports do not log each other out. The cookie holds an
   expiry (30 days) and a hash made with the server password: with a fixed
   password a cookie is accepted by any session that shares it, with a random
   one it stops working when the session ends.
+
+#### `--serve-open`: a browser on the same host
+
+For a session on a workstation or a remote desktop, where the browser runs on
+the host that runs the server:
+
+```text
+bwopencode2 --serve --serve-open
+```
+
+- **Only when asked.** Without `--serve-open` nothing is ever opened, also
+  with a display available (an `ssh -X` session has one, and Chrome should not
+  start over X forwarding by surprise). It needs `--serve`.
+- **Started on the host, outside the sandbox.** The sandbox cannot start a
+  browser and does not try. Before the launcher replaces itself with the
+  sandbox it starts a small helper in the background (the launcher's pid does
+  not change at `exec`, so the helper can tell when the launcher has gone). The
+  helper waits up to about a minute for the server to answer on
+  `127.H1.H2.1:<port>`, asks it for **a one-time pairing code of its own**
+  (the sandbox prints another for the ssh case, so neither uses the other's),
+  and starts the browser detached (`setsid`, output discarded), so ending the
+  server does not close the window. The password reaches `curl` on its standard
+  input. The helper prints one line when it starts the browser, and a line when
+  the server never answered; it opens nothing in that case, nor when the
+  launcher has exited.
+- **Which browser.** The first of `google-chrome`, `google-chrome-stable`,
+  `chromium`, `chromium-browser` on `PATH`, started as `BROWSER
+  --app=LINK` (an app window); else `xdg-open LINK` (the default browser).
+  `BWOPENCODE2_SERVE_BROWSER` names another command, which must exist
+  (otherwise the launch stops): a name containing `chrom`, `edge` or `brave`
+  gets `--app=`, any other (`firefox`, `xdg-open`) gets the plain link.
+- **No desktop session.** If neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, or
+  no browser is found, the launch continues and the launcher says that nothing
+  will be opened and why; the ssh instructions then apply.
+- **The link is on the browser's command line.** Another user of the host can
+  read it with `ps` for the moment the browser starts. It works once and
+  expires after 5 minutes, but a local user who gets there first would hold a
+  signed-in session for 30 days (the published address already accepts
+  connections from every local user, and the password is the only thing that
+  stops them). Do not use `--serve-open` on a host where other people log in.
+- **Cookie.** The cookie goes into the browser's normal profile, named by the
+  port as above. Opening `http://127.H1.H2.1:<port>/` again later stays signed
+  in for as long as the session lives.
 
 Checked against OpenCode 2.2.6 with curl and an isolated data directory: the
 server answers 401 without the password and 200 with it, serves the web UI page
@@ -1231,6 +1294,20 @@ because it needs a browser or the real launcher: signing in with the link in a
 browser, entering the password, a Ctrl-C from the terminal, and two sessions
 open in one browser. Whether the agent can read `OPENCODE_PASSWORD` in tool
 output (`printenv`) is also unchecked.
+
+The sign-in block, Enter for a new link and `--serve-open` were tested without a
+real OpenCode or browser: `tests/test_serve_signin.py` runs the wrapper against
+a fake server (the right password reaches it through curl, including a quote and
+a backslash; a new code on Enter through a pseudo-terminal; no spinning at end
+of input; a failed pairing) and the host helper against a stub browser (the
+`--app=` link, the plain link, the login page when no link came, a launcher
+that has gone, a helper that survives the launcher's `exec`, nothing on
+`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 31 checks through
+`--dry-run` (arguments, browser choice, no display). Not checked, because it
+needs a real launch and a browser: that Chrome opens an app window signed in,
+whether `/auth/connect/<code>` goes on to the UI after setting the cookie,
+Enter at a terminal inside `bwrap --new-session`, and the helper's output on a
+terminal.
 
 ## `bwopenchamber`
 

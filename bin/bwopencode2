@@ -86,6 +86,11 @@
 # an ssh -L tunnel).  The launcher builds those arguments itself; nothing from
 # the command line reaches `serve`.  See docs/bw-wrappers.md.
 #
+# --serve-open (with --serve) opens the signed-in web UI on the SAME host: a
+# helper on the host (outside the sandbox) waits for the server, asks it for
+# its own one-time sign-in link and starts google-chrome --app=LINK (or
+# chromium, else xdg-open).  Never started without the option.
+#
 # Usage:
 #   bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 #   bwopencode2 --help
@@ -104,6 +109,8 @@
 #                   TUI and publish its port (see above).  One server per invocation.
 #   --serve-port N  With --serve: use port N (must be in the range) instead of the
 #                   first free one.
+#   --serve-open    With --serve: open the web UI, already signed in, in a browser on
+#                   this host (see above).
 #   --serve-ssh-config
 #                   Print the ssh_config block that forwards the whole port range, then
 #                   exit.
@@ -186,6 +193,10 @@ OC2_CONFIG_BINDS=()
 # --serve state.  The password is passed to the server only as OPENCODE_PASSWORD
 # (see build_opencode2_env) and is never written to a file.
 SERVE=0
+SERVE_OPEN=0
+SERVE_OPEN_BIN=""
+SERVE_OPEN_APP=0
+SERVE_OPEN_WHY=""
 SERVE_SSH_CONFIG=0
 SERVE_PORT_REQUEST=""
 SERVE_PORT=""
@@ -256,6 +267,10 @@ parse_wrapper_args() {
                 ;;
             --serve)
                 SERVE=1
+                shift
+                ;;
+            --serve-open)
+                SERVE_OPEN=1
                 shift
                 ;;
             --serve-port)
@@ -361,9 +376,10 @@ Wrapper options (consumed before opencode2 sees the command line):
                   --serve-ssh-config alias forwards to it; not with
                   --publish-addr; with --share-net the server binds that
                   address itself, never 0.0.0.0).  Open it
-                  from a browser through an ssh tunnel; the command, a one-time
-                  pairing link (valid 5 minutes) and the password are printed at
-                  start; the web UI's "Use password" button also works.  The
+                  from a browser through an ssh tunnel; once the server is up the
+                  ssh command, a one-time sign-in link (valid 5 minutes; press
+                  Enter for a new one) and the password are printed; the web UI's
+                  "Use password" button also works.  The
                   password is random for each
                   session unless BWOPENCODE2_SERVE_PASSWORD is set (at least 12
                   characters; a fixed password is shared by every session that
@@ -371,6 +387,15 @@ Wrapper options (consumed before opencode2 sees the command line):
                   with --exec.  One server per invocation.
   --serve-port N  With --serve, use port N (inside the range) instead of the first
                   free one; fails if it is taken.
+  --serve-open    With --serve, on a host with a desktop session: open the web UI,
+                  already signed in, in a browser on this host (never started
+                  without this option).  The browser is started outside the sandbox
+                  with a one-time link of its own: google-chrome --app=LINK (an
+                  app window), else google-chrome-stable, chromium,
+                  chromium-browser, else xdg-open LINK.  BWOPENCODE2_SERVE_BROWSER
+                  names another browser.  Opens nothing, and says so, when neither
+                  DISPLAY nor WAYLAND_DISPLAY is set.  Not for use over ssh from
+                  another machine: use the printed ssh command there.
   --serve-ssh-config
                   Print the ssh_config block (one alias, one LocalForward per port
                   of the range, to your address 127.H1.H2.1) for the machine your
@@ -540,6 +565,10 @@ serve_check_args() {
             echo "Error: --serve-port needs --serve." >&2
             exit 1
         fi
+        if [[ "${SERVE_OPEN}" -eq 1 ]]; then
+            echo "Error: --serve-open needs --serve." >&2
+            exit 1
+        fi
         return 0
     fi
     if [[ -n "${TEST_CMD}" ]]; then
@@ -561,6 +590,9 @@ serve_check_args() {
             exit 1
         fi
         SERVE_PORT_REQUEST=$((10#${SERVE_PORT_REQUEST}))
+    fi
+    if [[ "${SERVE_OPEN}" -eq 1 ]]; then
+        serve_open_pick_browser
     fi
 }
 
@@ -690,26 +722,83 @@ serve_make_password() {
     SERVE_PASSWORD_RANDOM=1
 }
 
-# The command run INSIDE the sandbox for --serve: start the server, then print a
-# one-time pairing link so the browser can sign in without typing the password
-# (the web UI's "Use password" button still works).  It runs as
-# `bash -c SERVE_WRAPPER bwopencode2-serve BINARY PORT BIND`.  OPENCODE_PASSWORD is in
-# its environment.  The password reaches curl on stdin (-K -), never on a command
-# line: a process in the sandbox is visible to `ps` on the host.  printf is a
-# builtin, so it does not show either.  Needs only bash and curl.
+# The command run INSIDE the sandbox for --serve: start the server, then print
+# how to reach it, with a one-time sign-in link so the browser needs no password
+# (the web UI's "Use password" button still works), and print a new link each
+# time Enter is pressed (a link works once and expires after 5 minutes, and
+# setting up an ssh tunnel can take longer than that).  It runs as
+# `bash -c SERVE_WRAPPER bwopencode2-serve BINARY PORT BIND SSHHOST SSHALIAS PWKIND`
+# (PWKIND is `random` or `fixed`).  OPENCODE_PASSWORD is in its environment.  The
+# password reaches curl on stdin (-K -), never on a command line: a process in the
+# sandbox is visible to `ps` on the host.  printf is a builtin, so it does not
+# show either.  Needs only bash and curl.
 read -r -d '' SERVE_WRAPPER << 'SERVE_WRAPPER_EOF' || true
 set -u
-bin=$1 port=$2 bind=$3
+bin=$1 port=$2 bind=$3 ssh_host=${4:-localhost} ssh_alias=${5:-} pw_kind=${6:-random}
 # The server's own address for the requests below, and the host-side address
-# for the printed link (the publish address, or the bound one with --share-net).
+# for the printed links (the publish address, or the bound one with --share-net).
 local_addr=$bind
 [[ $bind != 0.0.0.0 ]] || local_addr=127.0.0.1
 base="http://${local_addr}:${port}"
 host_addr=${BWRAP_NET_PUBLISH_ADDR:-$bind}
+code=""
+stop=0
 
 "$bin" serve --hostname "$bind" --port "$port" &
 srv=$!
-trap 'kill "$srv" 2>/dev/null' INT TERM HUP
+trap 'stop=1; kill "$srv" 2>/dev/null' INT TERM HUP
+
+# Ask the server for a one-time pairing code; sets $code, empty on failure.  A
+# backslash or double quote in a fixed password is escaped for curl's config.
+pair() {
+    local pw=$OPENCODE_PASSWORD resp
+    code=""
+    pw=${pw//\\/\\\\}
+    pw=${pw//\"/\\\"}
+    resp=$(printf 'user = "opencode:%s"\n' "$pw" |
+        curl -s --noproxy '*' --connect-timeout 1 --max-time 5 \
+            -K - -X POST "${base}/api/pair") || resp=""
+    if [[ $resp =~ \"code\":\"([A-Za-z0-9_-]+)\" ]]; then
+        code=${BASH_REMATCH[1]}
+    fi
+}
+
+# Print the instructions for the current $code (or the plain page without one).
+show() {
+    local path=/
+    [[ -z $code ]] || path=/auth/connect/$code
+    {
+        if [[ -n $code ]]; then
+            printf '\nbwopencode2: the OpenCode web UI is up on port %s.\n' "$port"
+        else
+            printf '\nbwopencode2: the OpenCode web UI is up on port %s, but the server gave\n' "$port"
+            printf '  no sign-in link (could not get a pairing link): use the password below.\n'
+        fi
+        printf '\n  From your own machine (the server is reachable on this host only):\n'
+        printf '    1. forward the port:  ssh -L %s:%s:%s %s\n' "$port" "$host_addr" "$port" "$ssh_host"
+        [[ -z $ssh_alias ]] || printf '              or:  ssh %s   (the ssh_config alias, see bwopencode2 --serve-ssh-config)\n' "$ssh_alias"
+        if [[ -n $code ]]; then
+            printf '    2. open the sign-in link (works once, expires in 5 minutes):\n'
+        else
+            printf '    2. open the page and click "Use password":\n'
+        fi
+        printf '         http://127.0.0.1:%s%s\n' "$port" "$path"
+        printf '       (keep the same port number at both ends: the login cookie is named by it)\n'
+        printf '       or as an app window:\n'
+        printf '         google-chrome --app=http://127.0.0.1:%s%s\n' "$port" "$path"
+        printf '\n  On this host:\n'
+        printf '    http://%s:%s%s\n' "$host_addr" "$port" "$path"
+        printf '    (or start with --serve-open to have a browser opened here)\n'
+        if [[ -n $code ]]; then
+            printf '\n  Link used or expired?  Press Enter here for a new one.\n'
+        fi
+        if [[ $pw_kind == random ]]; then
+            printf '  Password (new for this session): %s\n\n' "$OPENCODE_PASSWORD"
+        else
+            printf '  Password: the value of BWOPENCODE2_SERVE_PASSWORD (shared by every session that uses it)\n\n'
+        fi
+    } >&2
+}
 
 # Wait up to about 30 s for the server to answer; without credentials /api/info
 # gives 401, which is enough to know it is listening.
@@ -717,32 +806,34 @@ ready=0
 deadline=$((SECONDS + 30))
 while ((SECONDS < deadline)); do
     kill -0 "$srv" 2> /dev/null || break
-    code=$(curl -s --noproxy '*' --connect-timeout 1 --max-time 2 \
-        -o /dev/null -w '%{http_code}' "${base}/api/info") || code=000
-    if [[ $code == 401 || $code == 200 ]]; then
+    http=$(curl -s --noproxy '*' --connect-timeout 1 --max-time 2 \
+        -o /dev/null -w '%{http_code}' "${base}/api/info") || http=000
+    if [[ $http == 401 || $http == 200 ]]; then
         ready=1
         break
     fi
     sleep 0.5
 done
 
-{
-    if [[ $ready -eq 1 ]]; then
-        resp=$(printf 'user = "opencode:%s"\n' "$OPENCODE_PASSWORD" |
-            curl -s --noproxy '*' --connect-timeout 1 --max-time 5 \
-                -K - -X POST "${base}/api/pair") || resp=""
-        if [[ $resp =~ \"code\":\"([A-Za-z0-9_-]+)\" ]]; then
-            printf '\nbwopencode2: pairing link (works once, expires in 5 minutes):\n'
-            printf '  through the ssh tunnel:  http://127.0.0.1:%s/auth/connect/%s\n' "$port" "${BASH_REMATCH[1]}"
-            printf '  on this host:            http://%s:%s/auth/connect/%s\n' "$host_addr" "$port" "${BASH_REMATCH[1]}"
-            printf '  After it expires, click "Use password" in the web UI instead.\n\n'
-        else
-            printf 'bwopencode2: could not get a pairing link; click "Use password" in the web UI.\n'
-        fi
-    else
-        printf 'bwopencode2: the server did not start listening on %s.\n' "$bind:$port"
+if [[ $ready -eq 1 ]]; then
+    pair
+    show
+    # Enter asks for a new link.  The server was started as a background job, so
+    # it has no stdin and cannot take the key.  Without a terminal, or at end of
+    # input, stop listening for it: the loop must not spin.
+    if [[ -t 0 ]]; then
+        while ((!stop)) && kill -0 "$srv" 2> /dev/null; do
+            if IFS= read -r -t 1 _; then
+                pair
+                show
+            elif (($? <= 128)); then
+                break
+            fi
+        done
     fi
-} >&2
+else
+    printf 'bwopencode2: the server did not start listening on %s.\n' "$bind:$port" >&2
+fi
 
 wait "$srv"
 SERVE_WRAPPER_EOF
@@ -765,36 +856,163 @@ serve_prepare() {
         # shellcheck disable=SC2034  # read by bwrap_sandbox_lib.sh
         NET_PUBLISH_ADDR_FIXED_BY="--serve"
     fi
-    _TOOL_CMD=(/usr/bin/bash -c "${SERVE_WRAPPER}" bwopencode2-serve "${_TOOL_BIN}" "${SERVE_PORT}" "${SERVE_BIND}")
+    _TOOL_CMD=(/usr/bin/bash -c "${SERVE_WRAPPER}" bwopencode2-serve "${_TOOL_BIN}" "${SERVE_PORT}" "${SERVE_BIND}"
+        "$(serve_host_name)" "$(serve_ssh_alias)" "$([[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]] && echo random || echo fixed)")
     TOOL_ARGS=()
 }
-# Tell the user how to reach the server (stderr, before the exec).
+# Tell the user what starts (stderr, before the exec).  The ssh command, the
+# sign-in link and the password are printed by the wrapper inside the sandbox
+# once the server answers (see SERVE_WRAPPER).
 serve_print_info() {
-    local _p="${SERVE_PORT}" _host _alias _addr="${SERVE_ADDR}"
+    local _addr="${SERVE_ADDR}"
     if [[ "${NET_SHARE}" -eq 0 && "${_NET_PUBLISH_ADDR_EFFECTIVE}" != "${_addr}" ]]; then
         echo "Error: --serve: the port was published on ${_NET_PUBLISH_ADDR_EFFECTIVE}, not ${_addr}." >&2
         exit 1
     fi
-    _host="$(serve_host_name)"
-    _alias="$(serve_ssh_alias)"
     {
-        printf '\nbwopencode2: sandboxed OpenCode 2 web UI on %s:%s (this host only)\n' "${_addr}" "${_p}"
-        printf '  1. On the machine with your browser, forward the port:\n'
-        printf '       ssh -L %s:%s:%s %s\n' "${_p}" "${_addr}" "${_p}" "${_host}"
-        printf '     or use the ssh_config alias (bwopencode2 --serve-ssh-config):  ssh %s\n' "${_alias}"
-        printf '     then open http://127.0.0.1:%s/ there.  On this host itself, open http://%s:%s/.\n' "${_p}" "${_addr}" "${_p}"
-        printf '  2. Open the pairing link printed below once the server is up (it works once and\n'
-        printf '     expires in 5 minutes), or open the page above, click "Use password"\n'
-        printf '     and enter the server password.\n'
+        printf '\nbwopencode2: starting the sandboxed OpenCode 2 web UI on %s:%s (this host only)\n' "${_addr}" "${SERVE_PORT}"
+        printf '  The ssh command, a one-time sign-in link and the password are printed once the server is up.\n'
         if [[ "${DRY_RUN}" -eq 1 ]]; then
-            printf '     Password: (not shown on --dry-run)\n'
-        elif [[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]]; then
-            printf '     Password (new for this session): %s\n' "${SERVE_PASSWORD}"
-        else
-            printf '     Password: the value of BWOPENCODE2_SERVE_PASSWORD (shared by every session that uses it)\n'
+            printf '  Password: (not shown on --dry-run)\n'
         fi
-        printf '  Keep the same port number at both ends of the tunnel: the browser cookie is named by it.\n\n'
+        if [[ "${SERVE_OPEN}" -eq 1 ]]; then
+            if [[ -n "${SERVE_OPEN_BIN}" ]]; then
+                if [[ "${SERVE_OPEN_APP}" -eq 1 ]]; then
+                    printf '  --serve-open: %s --app=http://%s:%s/auth/connect/CODE will be started on this host once the server is up.\n' \
+                        "${SERVE_OPEN_BIN}" "${_addr}" "${SERVE_PORT}"
+                else
+                    printf '  --serve-open: %s http://%s:%s/auth/connect/CODE will be started on this host once the server is up.\n' \
+                        "${SERVE_OPEN_BIN}" "${_addr}" "${SERVE_PORT}"
+                fi
+            else
+                printf '  --serve-open: nothing will be opened (%s); use the ssh command printed below.\n' "${SERVE_OPEN_WHY}"
+            fi
+        fi
+        printf '\n'
     } >&2
+}
+
+# ── --serve-open: a browser on the same host ─────────────────────────
+# The browser is started by the launcher's host side, outside the sandbox, as
+# the user: it is the user's own browser opening the user's own web UI.  The
+# sandbox cannot start it, and only does so when --serve-open is given.  A
+# helper in the background waits for the server, asks it for a one-time pairing
+# link of its own (the sandbox prints another one for the ssh case) and starts
+# the browser with it, detached, so closing the terminal's server does not close
+# the window.  It ends by itself after about a minute, or when the launcher has
+# gone (the launcher's pid does not change at exec).
+#
+# The link is on the browser's command line, so another user of this host can
+# read it with ps for the moment the browser starts.  It works once and expires
+# after 5 minutes, and the published address already accepts connections from
+# every local user, with the password as the only protection.
+
+# Choose the browser: sets SERVE_OPEN_BIN (empty when nothing will be opened,
+# with SERVE_OPEN_WHY saying why) and SERVE_OPEN_APP (1 for Chromium-based
+# browsers, which take --app=URL).
+serve_open_pick_browser() {
+    local _b="" _cand
+    SERVE_OPEN_BIN=""
+    SERVE_OPEN_APP=0
+    SERVE_OPEN_WHY=""
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        SERVE_OPEN_WHY="neither DISPLAY nor WAYLAND_DISPLAY is set, so there is no desktop session here"
+        return 0
+    fi
+    if [[ -n "${BWOPENCODE2_SERVE_BROWSER:-}" ]]; then
+        _b="$(command -v -- "${BWOPENCODE2_SERVE_BROWSER}" 2> /dev/null)" || _b=""
+        if [[ -z "${_b}" ]]; then
+            echo "Error: BWOPENCODE2_SERVE_BROWSER='${BWOPENCODE2_SERVE_BROWSER}' is not a command on PATH." >&2
+            exit 1
+        fi
+    else
+        for _cand in google-chrome google-chrome-stable chromium chromium-browser xdg-open; do
+            _b="$(command -v -- "${_cand}" 2> /dev/null)" && break
+            _b=""
+        done
+        if [[ -z "${_b}" ]]; then
+            SERVE_OPEN_WHY="none of google-chrome, chromium or xdg-open was found"
+            return 0
+        fi
+    fi
+    SERVE_OPEN_BIN="${_b}"
+    case "$(basename -- "${_b}")" in
+        *chrom* | *edge* | *brave*) SERVE_OPEN_APP=1 ;;
+    esac
+}
+
+# Ask the server for a one-time pairing code; prints it, or nothing.  The
+# password reaches curl on stdin, never on a command line.
+serve_request_code() {
+    local _pw="${SERVE_PASSWORD}" _resp
+    _pw="${_pw//\\/\\\\}"
+    _pw="${_pw//\"/\\\"}"
+    _resp="$(printf 'user = "opencode:%s"\n' "${_pw}" |
+        curl -s --noproxy '*' --connect-timeout 1 --max-time 5 \
+            -K - -X POST "http://${SERVE_ADDR}:${SERVE_PORT}/api/pair")" || _resp=""
+    if [[ "${_resp}" =~ \"code\":\"([A-Za-z0-9_-]+)\" ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# The helper body.  $1 and $2: the launcher's pid and start time, to notice that
+# it has gone.  Runs in a background subshell (see serve_open_start).
+serve_open_run() {
+    local _pid="$1" _start="$2" _base="http://${SERVE_ADDR}:${SERVE_PORT}"
+    local _http _ready=0 _deadline _code _url
+    local -a _cmd
+    _deadline=$((SECONDS + 60))
+    while ((SECONDS < _deadline)); do
+        bwrap_proc_is "${_pid}" "${_start}" || return 0
+        _http="$(curl -s --noproxy '*' --connect-timeout 1 --max-time 2 \
+            -o /dev/null -w '%{http_code}' "${_base}/api/info")" || _http=000
+        if [[ "${_http}" == 401 || "${_http}" == 200 ]]; then
+            _ready=1
+            break
+        fi
+        sleep 0.5
+    done
+    if [[ "${_ready}" -eq 0 ]]; then
+        printf 'bwopencode2: --serve-open: the server did not answer on %s:%s; no browser opened.\n' "${SERVE_ADDR}" "${SERVE_PORT}" >&2
+        return 0
+    fi
+    _code="$(serve_request_code)"
+    if [[ -n "${_code}" ]]; then
+        _url="${_base}/auth/connect/${_code}"
+    else
+        _url="${_base}/"
+        printf 'bwopencode2: --serve-open: could not get a pairing link; opening the login page, click "Use password".\n' >&2
+    fi
+    _cmd=("${SERVE_OPEN_BIN}")
+    if [[ "${SERVE_OPEN_APP}" -eq 1 ]]; then
+        _cmd+=("--app=${_url}")
+    else
+        _cmd+=("${_url}")
+    fi
+    if command -v setsid > /dev/null 2>&1; then
+        setsid "${_cmd[@]}" < /dev/null > /dev/null 2>&1 &
+    else
+        "${_cmd[@]}" < /dev/null > /dev/null 2>&1 &
+    fi
+    printf 'bwopencode2: --serve-open: started %s on this host.\n' "${SERVE_OPEN_BIN}" >&2
+}
+
+# The helper as a background job: it ignores the terminal's signals (the
+# server's Ctrl-C is not its own) and reads nothing.
+serve_open_detached() {
+    trap '' INT QUIT HUP
+    exec < /dev/null
+    serve_open_run "$@"
+}
+
+# Start the helper in the background, just before the sandbox replaces this
+# process.  Not on --dry-run, and not when no browser was chosen.
+serve_open_start() {
+    [[ "${SERVE_OPEN}" -eq 1 && -n "${SERVE_OPEN_BIN}" && "${DRY_RUN}" -eq 0 ]] || return 0
+    local _start
+    _start="$(bwrap_proc_start_time "$$")"
+    serve_open_detached "$$" "${_start}" &
+    disown
 }
 # ── Sandbox-escape guard (arguments) ─────────────────────────────
 # The OpenCode 2 background service listens on a fixed, shared port and runs
@@ -1413,6 +1631,7 @@ main() {
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         print_dry_run
     else
+        serve_open_start
         launch_sandbox
     fi
 }
