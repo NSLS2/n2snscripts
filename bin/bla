@@ -292,8 +292,13 @@ main() {
         "${ACCOUNT_CHECK}" || exit $?
     fi
 
+    # Not a permission check: the agent account is already here. SUDO_USER is
+    # the only way to tell whose home to find ~/agent and the profile
+    # collection in, whose session directory to use, and whose name to log.
+    # The agent account's own home holds none of that, so guessing it would
+    # mount an empty directory and attribute the session to nobody.
     local user="${SUDO_USER:-}"
-    [[ -n "${user}" ]] || die "cannot tell who you are: run ${PROGRAM_NAME} from the account you logged in with, not as ${AGENT_ACCOUNT}"
+    [[ -n "${user}" ]] || die "cannot tell whose home to mount: run ${PROGRAM_NAME} from the account you logged in with, not as ${AGENT_ACCOUNT}"
     [[ "${user}" != root ]] || die "refusing to run for root"
 
     local home
