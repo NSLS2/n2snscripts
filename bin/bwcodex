@@ -490,9 +490,11 @@ build_codex_home_mount() {
     # Keep the managed daemon package in tmpfs.  The complete CLI package
     # mounted by build_codex_bin_mount seeds it on each launch.  Disable the
     # daemon's updater before Codex starts so it does not fetch a newer copy.
-    BWRAP_ARGS+=(--perms 0700 --dir "${CODEX_HOME_DIR}/app-server-daemon")
+    # No --perms: it needs bwrap 0.5.0 and RHEL 8 ships 0.4.0.  Both paths
+    # live in the sandbox's private tmpfs, so their modes guard nothing.
+    BWRAP_ARGS+=(--dir "${CODEX_HOME_DIR}/app-server-daemon")
     bwrap_fd_from_data "Codex daemon settings" '{"updater":{"autoUpdateEnabled":false}}'
-    BWRAP_ARGS+=(--perms 0600 --file "${_BWRAP_FD}" "${CODEX_DAEMON_SETTINGS_FILE}")
+    BWRAP_ARGS+=(--file "${_BWRAP_FD}" "${CODEX_DAEMON_SETTINGS_FILE}")
 
     # auth.json: only persist if it already exists on the host.
     # Use --init-auth on first run to bootstrap persistent ChatGPT-login auth.
