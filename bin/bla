@@ -63,6 +63,9 @@ readonly ACCOUNT_CHECK=/opt/nsls2/libexec/agent-account-check
 # Made by the n2c_agent role, on the tmpfs next to the tokens: owned by the
 # agent account with mode 0700, so no one else can take a caller's name, and
 # nothing kept here outlives a reboot.
+#
+# On the host rather than a tmpfs inside the sandbox, so a session's state
+# outlives the sandbox that wrote it and a session can be reopened later.
 readonly AGENT_HOME_BASE=/run/nsls2/agent/home
 
 # The live profile collection, relative to the caller's home. $HOME is a tmpfs
@@ -302,6 +305,10 @@ main() {
     # the same database, and two people sharing an operator account do not
     # read each other's conversations. The cache is per caller instead: it is
     # most of the size and holds nothing personal.
+    #
+    # Each run makes a new session directory, so nothing is reopened yet. The
+    # state is kept rather than discarded so that reopening one is a change
+    # here, not a change to where every agent stores its data.
     [[ -d "${AGENT_HOME_BASE}" ]] ||
         die "'${AGENT_HOME_BASE}' is missing: is the n2c_agent role deployed on this host?"
     local caller_dir="${AGENT_HOME_BASE}/${user}"
