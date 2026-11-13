@@ -438,9 +438,9 @@ change them, and they are the data needed for a later egress allowlist.
 | fail | `session=ID flow=9 fail ...`: a connection that never became active (refused, unreachable) |
 | end | `event=end session=ID ...`, when the sandbox has exited |
 
-Every line is `key=value` (logfmt), so Loki's `| logfmt` can filter on any
-field, for example the domains an agent reached:
-`{syslog_identifier="bwrap-net"} | logfmt | dir="out"` grouped by `domain`.
+Every line is `key=value` (logfmt), so a log store's logfmt parser can filter
+on any field. See [Reading the network log](#reading-the-network-log) for how
+to fetch the records.
 
 - `dir` is `out` (the sandbox to the network), `publish` (a host client to a
   `--publish` port) or `host-port` (the sandbox to a `--host-port` service).
@@ -459,6 +459,11 @@ field, for example the domains an agent reached:
 - **Tag** (`SYSLOG_IDENTIFIER`): `bwrap-net`. `journalctl -t bwrap-net` shows
   all sessions; `journalctl -t bwrap-net -g ID` one. Inside the sandbox
   `BWRAP_SESSION` is the same ID, and the context file names it.
+- **Who logged it.** Only the `start` and `end` records name the user
+  (`user=`, `uid=`, `launcher=`, `dir=`). Every other record (dns, open, close,
+  fail) carries only `session=ID`. To list what one user's agents did, first
+  find that user's session IDs from the `start` records, then select the other
+  records by those IDs.
 - **Tool:** `systemd-cat` when the journal's stream socket exists and accepts a
   connection, else `logger` (util-linux) on `/dev/log` (journald or rsyslog).
   Both are tried at launch without logging anything; the launcher then writes
@@ -537,6 +542,63 @@ field, for example the domains an agent reached:
 - Both need Python 3.6 or later, standard library only (RHEL 8's
   `/usr/libexec/platform-python`, else `python3`). Without it pasta's lines go
   to the log unfiltered, and DNS goes straight to `169.254.1.1`.
+
+### Reading the network log
+
+**Wire format.** Each record is one syslog line (RFC 5424: priority `<14>`,
+timestamp, host, tag `bwrap-net`, the writer's pid) followed by the logfmt
+fields, for example:
+
+```text
+<14>1 2026-01-01T12:00:00+00:00 HOST bwrap-net 1234 - - session=0123456789ab dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21
+<14>1 2026-01-01T12:00:05+00:00 HOST bwrap-net 1234 - - session=0123456789ab flow=7 open proto=tcp dir=out src=10.0.0.5:44464 dst=140.82.112.21:443 domain=github.com t=21.359
+```
+
+The records are written on the host the launcher runs on, so the first place to
+read them is that host's journal. If you forward syslog to a central log store,
+the records are there too, with the tag and the sending host as the fields your
+pipeline keeps from the syslog header. Which names it gives them depends on the
+pipeline (the journal's `SYSLOG_IDENTIFIER` is not always kept as a label), so
+check the names in your store before writing a selector. The message is the
+whole line above.
+
+**On the host (journal).**
+
+```bash
+journalctl -t bwrap-net --since '-12h'              # every session on this host
+journalctl -t bwrap-net -g 'session=ID'             # one session
+journalctl -t bwrap-net -g 'event=start.*user=NAME' # a user's sessions
+journalctl -t bwrap-net -g ' dns domain='           # DNS lookups only
+```
+
+Inside a sandbox, `BWRAP_SESSION` is the session ID (the context file names it
+too).
+
+**Everything one user's agents looked up.** Records after `start` do not name
+the user, so this takes two steps:
+
+1. List that user's `start` records (`journalctl -t bwrap-net -g
+   'event=start.*user=NAME'`). They give the session IDs, and also the
+   launcher, directory and backend, which say whether flows and DNS were
+   logged.
+2. Select the `dns` records of those sessions, for example
+   `journalctl -t bwrap-net -g 'session=(ID1|ID2) dns domain='`, and count by
+   `domain`.
+
+A and AAAA lookups are separate records (`type=`), so count by `domain` and
+`type` to tell them apart, or divide by about two for the number of names
+looked up.
+
+**What is and is not in the log.**
+
+- Sessions with `dns=unavailable` (`--share-net`, `backend=none`) have a start
+  and an end record only.
+- Sessions with `flows=unavailable` (slirp4netns) have DNS records but no
+  `open`/`close` records. For those, DNS is the only account of what was
+  reached.
+- `domain` on a flow is the last relayed lookup that returned that address, so
+  treat it as a record, not proof (see above).
+- A session that is still running has no `end` record yet.
 
 ### Implementation notes: pasta
 
