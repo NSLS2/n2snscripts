@@ -199,10 +199,13 @@ class DnsRelayTest(unittest.TestCase):
         self.out = io.StringIO()
         self.relay = netlog.DnsRelay("127.0.0.1:0", "127.0.0.1:%d" % port, self.out)
         self.relay.listen = ("127.0.0.1", 0)
-        self.relay.bind()
+        self._open(self.relay)
         self.addr = self.relay.udp.getsockname()
         self.relay_thread = threading.Thread(target=self.relay.serve)
         self.relay_thread.start()
+
+    def _open(self, relay):
+        relay.bind()
 
     def tearDown(self):
         self.stop.set()
@@ -315,6 +318,31 @@ class DnsRelayTest(unittest.TestCase):
             gate.set()
             relay.close()
             serve_thread.join(timeout=3)
+
+
+class DnsRelayAdoptTest(DnsRelayTest):
+    """Every DnsRelayTest case again, against pre-bound sockets.
+
+    With slirp4netns the relay cannot bind for itself: the namespace maps the
+    real uid, so the execve that starts the relay clears its capabilities and
+    port 53 is out of reach.  The process that creates the namespace binds
+    first and passes the descriptors (_NET_NS_IDENTITY in
+    bwrap_sandbox_lib.sh), which DnsRelay.adopt takes over.
+    """
+
+    def _open(self, relay):
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind(("127.0.0.1", 0))
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp.bind(udp.getsockname())
+        tcp.listen(16)
+        # Duplicate and close, as inheriting across the launcher's exec does.
+        udp_fd, tcp_fd = os.dup(udp.fileno()), os.dup(tcp.fileno())
+        udp.close()
+        tcp.close()
+        relay.adopt(udp_fd, tcp_fd)
+        self.assertEqual(relay.listen, relay.udp.getsockname())
 
 
 if __name__ == "__main__":

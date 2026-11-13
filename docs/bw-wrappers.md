@@ -465,9 +465,12 @@ field, for example the domains an agent reached:
   Both are tried at launch without logging anything; the launcher then writes
   the start record itself. With neither, the launch warns and continues
   without the log.
-- **Flows only with pasta.** slirp4netns has no flow log, so with it (and with
-  `--share-net`, recorded as `backend=none`) only the start and end records
-  are written; the start record says `flows=unavailable`.
+- **Flows only with pasta; DNS with either.** slirp4netns has no flow log, so
+  with it the records are the start, the end and the DNS relay's lookups —
+  which are then the only account of what the sandbox reached for. With
+  `--share-net` (recorded as `backend=none`) there is no namespace to relay
+  in, so only the start and end records are written. The start record says
+  which is which: `flows=logged|unavailable dns=logged|unavailable`.
 - When the launcher runs on a terminal it prints the tool and the session ID.
 - **How (pasta).** pasta logs flows only at debug level, and at debug level it
   never uses syslog: without `--log-file` it writes every line, timestamped,
@@ -497,7 +500,9 @@ field, for example the domains an agent reached:
     your stderr: by path when it is a terminal or a file, else (a pipe)
     through a second FIFO that the reader copies. If pasta stops before the
     marker, the reader prints pasta's lines on your terminal, prefixed
-    `pasta:`, just after the launcher has exited.
+    `pasta:`, just after the launcher has exited. (With slirp4netns the same
+    FIFO, marker and reader are used for the DNS relay's lines, and a failed
+    start shows the identity mapper's message prefixed `slirp4netns:`.)
   - **Condensed.** pasta's debug log has about 34 lines per connection (state
     changes, timers, ACK and buffer bookkeeping) and its setup dump. The reader
     keeps one line when a connection opens and one when it closes and drops
@@ -506,11 +511,14 @@ field, for example the domains an agent reached:
     (`pasta=`), from `pasta --version`.
   - Without Python a bash supervisor copies pasta's lines to the log as they
     are.
-- **DNS relay (pasta).** To name destinations, `lib/bwrap_netlog.py dns`
+- **DNS relay (both backends).** To name destinations, `lib/bwrap_netlog.py dns`
   listens on `127.53.0.1:53` (UDP and TCP) in the sandbox's network namespace,
-  forwards each lookup to `169.254.1.1` (pasta's DNS forward) and writes one
-  `dns` line per lookup to the log, before it answers, so the name is known
-  when the connection that follows is logged. The condenser keeps a map from the answers'
+  forwards each lookup to the backend's DNS (`169.254.1.1`, pasta's DNS
+  forward, or `192.168.254.3`, slirp4netns's built-in one; the addresses
+  below are pasta's) and writes one `dns` line per lookup to the log, before
+  it answers, so the name is known when the connection that follows is
+  logged. With slirp4netns the relay cannot bind port 53 itself; see
+  [Implementation notes: slirp4netns](#implementation-notes-slirp4netns). The condenser keeps a map from the answers'
   addresses to domains. The sandbox's `/etc/resolv.conf` lists the relay first
   and `169.254.1.1` second, so lookups go on working, at once, if the relay is
   down (its port is then closed); pasta's own leg of a relayed lookup (UDP to
@@ -566,7 +574,7 @@ foreground, so the terminal, job control, the exit status and
 ```text
 launcher ─┬─ helper (background): waits for the namespace, starts slirp4netns,
           │    adds the --publish forwards, then releases the sandbox
-          └─ exec env -i ... python -I -c <_NET_NS_IDENTITY>
+          └─ exec env -i ... python -I -c <_NET_NS_IDENTITY> [--dns ...] --
                bash <descriptor relay> -- bwrap --unshare-user --uid --gid
                --info-fd --block-fd --sync-fd ... -- <tool>
 ```
@@ -609,6 +617,17 @@ launcher ─┬─ helper (background): waits for the namespace, starts slirp4ne
   4.3.0 and later, which the launcher checks), `--mtu=65520`, and
   `--enable-seccomp` when `/etc/resolv.conf` resolves inside `/etc` or
   `/run`.
+- **DNS lookups are logged**, and with no flow log they are the only account
+  of what the sandbox reached for. The relay runs inside the network
+  namespace and forwards to the backend's own DNS, so it is not pasta-only —
+  but it cannot bind port 53 for itself here. Capabilities survive `execve`
+  only for uid 0, and this namespace maps your uid, so by the time the relay
+  starts (after the mapper's exec and the descriptor relay's) it holds none.
+  The mapper therefore raises loopback and binds the relay's UDP and TCP
+  sockets while it still can, between the unshare and the exec, and leaves
+  them on descriptors 88 and 89 for `DnsRelay.adopt`. A fresh namespace also
+  has `lo` down, and slirp4netns only raises it later in `configure_network`,
+  so binding early removes that race too.
 - **`--enable-sandbox` is not passed**, and this is the cost of the identity
   map. After joining the launcher's namespace, slirp4netns does
   `setegid(0)`/`seteuid(0)` (`main.c`); with no uid 0 mapped that fails and

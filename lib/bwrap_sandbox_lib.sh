@@ -2685,8 +2685,14 @@ _net_session_dir() {
 #     copies to it (a pipe).  If pasta exits before the marker (a failed
 #     start), the reader prints its lines on the terminal, so its errors are
 #     not lost.
-# With slirp4netns or --share-net only the start and end records are written
-# (slirp4netns has no flow log); the supervisor just waits for the end.
+# slirp4netns has no flow log, so with it the records are the start, the end
+# and the DNS relay's lookups -- which are then the only account of what the
+# sandbox reached for, and the reason the relay is not left to pasta.  The
+# FIFO, the reader and the marker work as above, with the identity mapper
+# (_NET_NS_IDENTITY) in pasta's place as the launcher's exec and as the
+# writer of whatever is said before the marker.  With --share-net there is
+# no namespace to relay in: only start and end are written and the
+# supervisor just waits for the end.
 
 _NET_LOG_TAG="bwrap-net"
 # Condenser and DNS relay (lib/bwrap_netlog.py), and the relay's address in
@@ -2695,6 +2701,15 @@ _NET_LOG_HELPER="${BASH_SOURCE[0]%/*}/bwrap_netlog.py"
 _NET_LOG_PY=""
 _NET_DNS_RELAY=0
 _NET_DNS_RELAY_ADDR="127.53.0.1"
+_NET_DNS_RELAY_PORT=53
+# The DNS relay's sockets when they must be bound before the exec chain (see
+# _NET_NS_IDENTITY).  Fixed numbers just below the slirp4netns launch
+# descriptors; _bwrap_fd_* allocates below them.
+_NET_FD_DNS_UDP=88
+_NET_FD_DNS_TCP=89
+# 1 when the log needs the FIFO, the supervisor and the condenser: pasta's
+# flow log, the DNS relay, or both.
+_NET_LOG_PIPE=0
 _NET_LOG_TOOL=""
 _NET_LOG_TOOLS=()
 _NET_LOG_SESSION=""
@@ -2728,13 +2743,18 @@ _net_log_detect() {
     [[ -z "${_NET_LOG_TOOL}" || "${_NET_BACKEND}" != pasta ]] || _NET_LOG_FLOWS=1
     # With Python the flow log is condensed (one line per open and close)
     # and the DNS relay names the destinations; without it pasta's lines go
-    # to the log as they are.
+    # to the log as they are.  The relay runs inside the sandbox's network
+    # namespace and forwards to whatever DNS the backend provides, so it is
+    # not pasta-only: with slirp4netns, which has no flow log, the lookups
+    # are the only record of what the sandbox reached for.
     _NET_LOG_PY=""
     _NET_DNS_RELAY=0
-    if [[ "${_NET_LOG_FLOWS}" -eq 1 && -r "${_NET_LOG_HELPER}" ]]; then
+    if [[ -n "${_NET_LOG_TOOL}" && "${_NET_PRIVATE}" -eq 1 && -r "${_NET_LOG_HELPER}" ]]; then
         _NET_LOG_PY="$(_net_python)"
         [[ -z "${_NET_LOG_PY}" ]] || _NET_DNS_RELAY=1
     fi
+    _NET_LOG_PIPE=0
+    [[ "${_NET_LOG_FLOWS}" -eq 0 && "${_NET_DNS_RELAY}" -eq 0 ]] || _NET_LOG_PIPE=1
     SANDBOX_ENV+=("BWRAP_SESSION=${_NET_LOG_SESSION}")
 }
 
@@ -2762,6 +2782,11 @@ _net_log_record() {
         else
             _r+=" flows=unavailable"
         fi
+        if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+            _r+=" dns=logged"
+        else
+            _r+=" dns=unavailable"
+        fi
         [[ -z "${_NET_LOG_PASTA_VERSION}" ]] || _r+=" pasta=${_NET_LOG_PASTA_VERSION}"
         [[ -z "${_NET_PUBLISH_ADDR_EFFECTIVE}" ]] || _r+=" publish=${_NET_PUBLISH_ADDR_EFFECTIVE}:$(_net_join ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"})"
         for _i in ${NET_HOST_PORTS[@]+"${NET_HOST_PORTS[@]}"}; do _hp+="${_hp:+,}${_i}"; done
@@ -2779,6 +2804,7 @@ _net_log_record() {
 #   FIFO open.
 _net_log_start() {
     local _err _launcher="${0##*/}" _t _ready _rfd
+    local -a _relay_orig=()
     _NET_LOG_TOOL=""
     if [[ "${_NET_BACKEND}" == pasta ]]; then
         _NET_LOG_PASTA_VERSION="$("${_PASTA_BIN}" --version 2> /dev/null | awk 'NR == 1 { print $2 }' || true)"
@@ -2806,16 +2832,18 @@ _net_log_start() {
             "${_NET_LOG_TAG}" "${_NET_LOG_SESSION}" >&2
     fi
 
-    if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+    if [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
         _net_session_dir
         _NET_LOG_FIFO="${_NET_SESSION_DIR}/netlog"
         mkfifo -m 0600 "${_NET_LOG_FIFO}"
         _NET_LOG_MARKER="bwrap-net relay started ${_NET_LOG_SESSION}"
-        local _i
-        for _i in "${!PASTA_ARGS[@]}"; do
-            [[ "${PASTA_ARGS[${_i}]}" != --quiet ]] || unset 'PASTA_ARGS[_i]'
-        done
-        PASTA_ARGS=("${PASTA_ARGS[@]}" --debug)
+        if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+            local _i
+            for _i in "${!PASTA_ARGS[@]}"; do
+                [[ "${PASTA_ARGS[${_i}]}" != --quiet ]] || unset 'PASTA_ARGS[_i]'
+            done
+            PASTA_ARGS=("${PASTA_ARGS[@]}" --debug)
+        fi
         # The relay restores the user's stderr: by path when it is a terminal
         # or a file, else through a FIFO the reader copies.
         _err="$(readlink "/proc/$$/fd/2" 2> /dev/null || true)"
@@ -2825,33 +2853,56 @@ _net_log_start() {
             mkfifo -m 0600 "${_NET_LOG_ERR_FIFO}"
             _err="${_NET_LOG_ERR_FIFO}"
         fi
+        # Kept so that a reader that fails to start can undo the hand-over.
+        _relay_orig=(${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
         local -a _pre=(2 note "${_NET_LOG_MARKER}")
         if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
             # The DNS relay, started by the descriptor relay in the sandbox's
-            # network namespace (outside bwrap), logs on the same FIFO.
-            _pre+=(2 spawn "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_FORWARD_ADDR}")
+            # network namespace (outside bwrap), logs on the same FIFO and
+            # forwards to the backend's own DNS address.  Under pasta it
+            # binds port 53 itself; under slirp4netns the exec chain has no
+            # capabilities, so it takes the sockets _NET_NS_IDENTITY bound.
+            local _udp=- _tcp=-
+            if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+                _udp="${_NET_FD_DNS_UDP}"
+                _tcp="${_NET_FD_DNS_TCP}"
+            fi
+            _pre+=(2 spawn "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}" "${_udp}" "${_tcp}")
         fi
         _BWRAP_FD_RELAY=("${_pre[@]}" 2 append "${_err}" ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
     fi
 
-    if [[ "${_NET_LOG_FLOWS}" -eq 1 && -n "${_NET_LOG_PY}" ]]; then
-        # The condenser reads the FIFO.  It says "ready" on descriptor 3
-        # once it has it open, so that nothing pasta writes is lost; its
-        # stderr is the user's, for pasta's lines if pasta fails to start.
+    if [[ "${_NET_LOG_PIPE}" -eq 1 && -n "${_NET_LOG_PY}" ]]; then
+        # The condenser reads the FIFO: pasta's flows, the DNS relay's
+        # lookups, or both.  It says "ready" on descriptor 3 once it has it
+        # open, so that nothing written to it is lost; its stderr is the
+        # user's, for what the backend said if the start fails.
         local -a _cond=("${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense
             --session "${_NET_LOG_SESSION}" --dns-forward "${_NET_DNS_FORWARD_ADDR}"
             --fifo "${_NET_LOG_FIFO}" --parent "$$" --marker "${_NET_LOG_MARKER}"
-            --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}")
+            --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}"
+            --backend "${_NET_BACKEND}")
         [[ -z "${_NET_LOG_ERR_FIFO}" ]] || _cond+=(--stderr-fifo "${_NET_LOG_ERR_FIFO}")
         exec {_rfd}< <(exec setsid "${_cond[@]}" -- "${_NET_LOG_CMD[@]}" 3>&1 > /dev/null < /dev/null)
         IFS= read -r -t 10 _ready <&"${_rfd}" || _ready=""
         exec {_rfd}<&-
         if [[ "${_ready}" != ready ]]; then
-            printf 'Warning: %s: the network log condenser did not start; connections are not\n' "${_launcher}" >&2
-            printf '         logged for this session.\n' >&2
-            # Keep pasta's stderr off a FIFO no one reads.
+            printf 'Warning: %s: the network log condenser did not start; connections and\n' "${_launcher}" >&2
+            printf '         lookups are not logged for this session.\n' >&2
+            # Keep the backend's stderr off a FIFO no one reads, and take
+            # back the relay's hand-over: with no FIFO its marker, and the
+            # DNS relay's lines, would land on the user's terminal.
             _NET_LOG_FIFO=""
             _NET_LOG_FLOWS=0
+            _NET_DNS_RELAY=0
+            _NET_LOG_PIPE=0
+            _BWRAP_FD_RELAY=(${_relay_orig[@]+"${_relay_orig[@]}"})
+            # No reader is left to remove the session directory, and its
+            # FIFOs would make it look owned (see _net_slirp_start): remove
+            # it now; slirp4netns makes a fresh one if it needs one.
+            rm -rf -- "${_NET_SESSION_DIR}"
+            _NET_SESSION_DIR=""
+            _NET_LOG_ERR_FIFO=""
         fi
         return 0
     fi
@@ -2875,10 +2926,12 @@ _net_log_supervisor() {
     exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
     _prefix="session=${_NET_LOG_SESSION} "
 
-    if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+    if [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
         # Read-write, so end-of-file is never seen before pasta writes.  This
         # descriptor is the supervisor's alone; the launcher's own hold on
         # the FIFO is closed before it execs pasta (see launch_sandbox).
+        # Without Python there is no DNS relay, so here the FIFO only ever
+        # carries pasta's flows.
         exec {_fifo}<> "${_NET_LOG_FIFO}"
         if [[ -n "${_NET_LOG_ERR_FIFO}" ]]; then
             cat < "${_NET_LOG_ERR_FIFO}" >&2 &
@@ -2918,9 +2971,10 @@ _net_log_supervisor() {
         done
         exec {_fifo}<&-
         if [[ "${_started}" -eq 0 ]]; then
-            # pasta stopped before starting the sandbox: show what it said.
+            # The namespace stopped before starting the sandbox: show what it
+            # said (pasta's own messages, or the descriptor relay's).
             for _line in ${_early[@]+"${_early[@]}"}; do
-                printf '%s: pasta: %s\n' "${0##*/}" "${_line}" >&2
+                printf '%s: %s: %s\n' "${0##*/}" "${_NET_BACKEND}" "${_line}" >&2
             done
         fi
         if [[ -n "${_bridge}" ]]; then
@@ -2953,6 +3007,9 @@ _net_log_context_text() {
     _NET_LOG_CTX="The host records this network session in its system log (tag \`${_NET_LOG_TAG}\`, session \`${_NET_LOG_SESSION}\`, also in \`BWRAP_SESSION\`)"
     if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
         _NET_LOG_CTX+=", with every connection pasta makes for it"
+        [[ "${_NET_DNS_RELAY}" -ne 1 ]] || _NET_LOG_CTX+=" and every name it looks up"
+    elif [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+        _NET_LOG_CTX+=", with every name it looks up (${_NET_BACKEND} has no flow log, so connections are not recorded)"
     fi
     _NET_LOG_CTX+=". The sandbox cannot read or change that log."$'\n\n'
 }
@@ -2973,19 +3030,34 @@ _net_log_print_dry_run() {
         printf '# and pasta gets --debug (not --quiet) with its stderr on <session dir>/netlog,\n'
         printf '# a FIFO; the relay first reopens your stderr.  The end record is written when\n'
         printf '# pasta exits.\n'
-        if [[ -n "${_NET_LOG_PY}" ]]; then
-            printf '# The FIFO is read, and the lines condensed (one per connection opened and\n'
-            printf '# closed), by\n'
-            printf '#   %s -I %s condense --fifo <session dir>/netlog ...\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}"
-            printf '# and the relay first starts the DNS relay on %s:53 in the namespace:\n' "${_NET_DNS_RELAY_ADDR}"
-            printf '#   %s -I %s dns %s %s <relay pid>\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
-                "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_FORWARD_ADDR}"
-        else
-            printf '# A supervisor copies each line to the log as it is.\n'
-        fi
+    elif [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
+        printf '# and the launcher'"'"'s stderr goes to <session dir>/netlog, a FIFO, until the\n'
+        printf '# relay reopens yours (%s has no flow log: the FIFO carries the DNS relay'"'"'s\n' "${_NET_BACKEND}"
+        printf '# lines).  The end record is written when the sandbox exits.\n'
     else
         printf '# and a supervisor writes the end record when the sandbox exits (no flow log\n'
         printf '# with %s).\n' "${_NET_BACKEND}"
+    fi
+    if [[ "${_NET_LOG_PIPE}" -eq 1 && -n "${_NET_LOG_PY}" ]]; then
+        printf '# The FIFO is read, and the lines condensed (one per connection opened and\n'
+        printf '# closed, one per lookup), by\n'
+        printf '#   %s -I %s condense --fifo <session dir>/netlog ...\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}"
+    elif [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        printf '# A supervisor copies each line to the log as it is.\n'
+    fi
+    if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+        printf '# The descriptor relay starts the DNS relay on %s:%s in the namespace:\n' \
+            "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_RELAY_PORT}"
+        if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+            printf '#   %s -I %s dns %s %s <relay pid> %s %s\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
+                "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}" "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
+            printf '# on the sockets descriptors %s and %s already hold: the namespace maps your own\n' \
+                "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
+            printf '# uid, so nothing after the exec can bind port %s and they are bound before it.\n' "${_NET_DNS_RELAY_PORT}"
+        else
+            printf '#   %s -I %s dns %s %s <relay pid> - -\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
+                "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}"
+        fi
     fi
 }
 
@@ -3002,8 +3074,14 @@ _net_log_print_dry_run() {
 #             │    for it to be ready, adds the --publish forwards through its
 #             │    API socket, then releases the sandbox (--block-fd) and exits
 #             └─ exec env -i ... python -I -c <_NET_NS_IDENTITY>
+#                  [--dns 127.53.0.1 53 88 89] --
 #                  bash <fd relay> -- bwrap --unshare-user --uid U --gid G
 #                  --info-fd 90 --block-fd 91 --sync-fd 92 ... -- tool
+#
+# With the network log's DNS relay the mapper also raises loopback and binds
+# the relay's sockets on descriptors 88 and 89 before it execs, because after
+# the exec nothing holds the capability to bind port 53 (see
+# _NET_NS_IDENTITY); the descriptor relay then starts the relay on them.
 #
 # On a failure the helper kills the still-blocked sandbox (its pid comes
 # from --info-fd) and then bwrap: bwrap's --die-with-parent refers to the
@@ -3139,10 +3217,31 @@ _NET_NS_ROOT_MAPPED=0
 #
 # Both ids must be read before the unshare; afterwards the process is the
 # overflow id (65534) and a map naming that id is refused with EPERM.
+#
+# With "--dns ADDR PORT UDPFD TCPFD" it also brings the namespace's loopback
+# up and binds the DNS relay's sockets, leaving them at UDPFD and TCPFD for
+# the relay that the descriptor relay spawns later.  That work has to happen
+# HERE, in this process, between the unshare and the exec:
+#
+#   - creating the user namespace grants a full capability set, so this
+#     process has CAP_NET_ADMIN (loopback up) and CAP_NET_BIND_SERVICE
+#     (port 53);
+#   - execve recomputes the sets, and with no file capabilities and a
+#     non-zero euid it clears them.  Under pasta the namespace maps the
+#     caller to 0 and capabilities survive, which is why the relay binds for
+#     itself there; here nothing downstream of the exec can.
+#
+# Bringing lo up also removes a race: slirp4netns raises lo in
+# configure_network, but the descriptor relay runs before it is ready.
 _NET_NS_IDENTITY='
-import ctypes, os, sys
+import ctypes, fcntl, os, socket, struct, sys
 CLONE_NEWUSER, CLONE_NEWNET = 0x10000000, 0x40000000
-cmd = sys.argv[1:]
+SIOCSIFFLAGS, IFF_UP, IFF_RUNNING = 0x8914, 0x1, 0x40
+argv = sys.argv[1:]
+dns = None
+if argv[:1] == ["--dns"]:
+    dns, argv = (argv[1], int(argv[2]), int(argv[3]), int(argv[4])), argv[5:]
+cmd = argv[1:] if argv[:1] == ["--"] else argv
 uid, gid = os.getuid(), os.getgid()
 libc = ctypes.CDLL(None, use_errno=True)
 if libc.unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0:
@@ -3156,6 +3255,21 @@ try:
         f.write("%d %d 1" % (gid, gid))
 except OSError as e:
     sys.exit("netns: writing the id maps failed: %s" % e)
+if dns is not None:
+    addr, port, udp_fd, tcp_fd = dns
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
+            fcntl.ioctl(c, SIOCSIFFLAGS, struct.pack("16sh22x", b"lo", IFF_UP | IFF_RUNNING))
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind((addr, port))
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp.bind((addr, port))
+        tcp.listen(16)
+        os.dup2(udp.fileno(), udp_fd)  # dup2 inherits across the exec
+        os.dup2(tcp.fileno(), tcp_fd)
+    except OSError as e:
+        sys.exit("netns: DNS relay sockets (%s:%d) failed: %s" % (addr, port, e))
 os.execvp(cmd[0], cmd)
 '
 
@@ -3267,7 +3381,16 @@ _net_slirp_publish_fwds() {
 _net_slirp_start() {
     local _f
     _net_session_dir
-    _NET_SLIRP_DIR="${_NET_SESSION_DIR}"
+    if [[ -n "${_NET_LOG_FIFO}" ]]; then
+        # The network log owns the session directory (its FIFOs are there,
+        # and its reader removes the directory when the session ends), so
+        # the pipes get a directory of their own: the rmdir below and the
+        # helper's rm -rf must not take the log's FIFOs with them.
+        _NET_SLIRP_DIR="${_NET_SESSION_DIR}/slirp"
+        mkdir -m 0700 -- "${_NET_SLIRP_DIR}"
+    else
+        _NET_SLIRP_DIR="${_NET_SESSION_DIR}"
+    fi
     for _f in info block sync ready; do
         mkfifo -m 0600 "${_NET_SLIRP_DIR}/${_f}"
     done
@@ -5378,18 +5501,24 @@ _bwrap_toml_string() {
 #   note TEXT  the relay prints TEXT on the descriptor (a marker on stderr).
 #   append PATH  the relay opens PATH for appending on the descriptor (the
 #              user's stderr again).
-#   spawn PY HELPER LISTEN UPSTREAM  the relay starts the DNS relay
-#              (`PY -I -S HELPER dns LISTEN UPSTREAM <relay pid>`) in the
-#              background, its output on the descriptor, and waits until it
-#              listens (it says so on descriptor 3; a Python start, some tens
-#              of milliseconds), at most 0.25 s, so the first lookups are
-#              logged too.
+#   spawn PY HELPER LISTEN UPSTREAM UDPFD TCPFD  the relay starts the DNS
+#              relay (`PY -I -S HELPER dns LISTEN UPSTREAM <relay pid> UDPFD
+#              TCPFD`) in the background, its output on the descriptor, and
+#              waits until it listens (it says so on descriptor 3; a Python
+#              start, some tens of milliseconds), at most 0.25 s, so the
+#              first lookups are logged too.  UDPFD and TCPFD are sockets
+#              already bound (slirp4netns) or "-" (pasta: the relay binds);
+#              the relay closes its own copies afterwards.
+# Every walker of _BWRAP_FD_RELAY (_bwrap_fd_data_numbers) must step over
+# exactly as many words per entry as the shim shifts: data 2, spawn 8, the
+# rest 3.
 
 # _bwrap_fd_check_room
-#   Exit 1 when the reserved numbers would reach 90, where the slirp4netns
-#   launch keeps its own descriptors (_NET_FD_*).
+#   Exit 1 when the reserved numbers would reach _NET_FD_DNS_UDP, above which
+#   the DNS relay's pre-bound sockets and then the slirp4netns launch
+#   (_NET_FD_*, 90-99) keep their own descriptors.
 _bwrap_fd_check_room() {
-    if [[ ${_BWRAP_FD_NEXT} -ge 90 ]]; then
+    if [[ ${_BWRAP_FD_NEXT} -ge ${_NET_FD_DNS_UDP} ]]; then
         echo "Error: too many files to pass to the sandbox by descriptor." >&2
         exit 1
     fi
@@ -5462,10 +5591,13 @@ while [[ $# -gt 0 && "$1" != -- ]]; do
             shift 3
             ;;
         spawn)
-            coproc _bwrap_dns { exec "$3" -I -S "$4" dns "$5" "$6" "$$" 3>&1 1>&"$1" 2>&"$1" < /dev/null; }
+            coproc _bwrap_dns { exec "$3" -I -S "$4" dns "$5" "$6" "$$" "$7" "$8" 3>&1 1>&"$1" 2>&"$1" < /dev/null; }
             read -r -t 0.25 _v <&"${_bwrap_dns[0]}"
             eval "exec ${_bwrap_dns[0]}<&- ${_bwrap_dns[1]}>&-"
-            shift 6
+            # Pre-bound sockets: the relay has its own copies, so close ours
+            # rather than leak listening sockets into the sandbox.
+            [[ "$7" == - ]] || eval "exec $7<&- $8<&-"
+            shift 8
             ;;
         *)
             echo "$0: bad relay entry: $2" >&2
@@ -5507,7 +5639,9 @@ _bwrap_fd_data_numbers() {
                 _BWRAP_FD_DATA_NUMS+=("${_BWRAP_FD_RELAY[${_r}]}")
                 _r=$((_r + 2))
                 ;;
-            spawn) _r=$((_r + 6)) ;;
+            # Must match the shim's `shift` for spawn (see
+            # _BWRAP_FD_RELAY_SHIM); tests/test_fd_relay.py checks the two.
+            spawn) _r=$((_r + 8)) ;;
             *) _r=$((_r + 3)) ;;
         esac
     done
@@ -5688,6 +5822,11 @@ print_dry_run() {
     [[ "${_NET_BACKEND}" != pasta ]] || printf "    -- \\\\\n"
     if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
         printf "  %s -I -c '<_NET_NS_IDENTITY from bwrap_sandbox_lib.sh>' \\\\\n" "${_NET_PY_BIN}"
+        if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+            printf "    --dns %s %s %s %s \\\\\n" "${_NET_DNS_RELAY_ADDR}" \
+                "${_NET_DNS_RELAY_PORT}" "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
+        fi
+        printf "    -- \\\\\n"
     fi
     printf "  %s -c '<_BWRAP_FD_RELAY_SHIM from bwrap_sandbox_lib.sh>' bwrap-fd-relay \\\\\n" "${_BASH_BIN}"
     local _r=0
@@ -5775,6 +5914,11 @@ launch_sandbox() {
         _net_prefix=("${_PASTA_BIN}" "${PASTA_ARGS[@]}" --)
     elif [[ "${_NET_BACKEND}" == slirp4netns ]]; then
         _net_prefix=("${_NET_PY_BIN}" -I -c "${_NET_NS_IDENTITY}")
+        if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+            _net_prefix+=(--dns "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_RELAY_PORT}"
+                "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}")
+        fi
+        _net_prefix+=(--)
     fi
     _bwrap_fd_data_numbers
     for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do

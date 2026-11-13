@@ -5,7 +5,7 @@ platform-python) and later.
 
     bwrap_netlog.py condense --session ID [--dns-forward ADDR]
         [--fifo PATH --parent PID [--marker TEXT] [--end-record TEXT]
-         [--session-dir DIR]] -- CMD...
+         [--session-dir DIR] [--backend NAME]] -- CMD...
         Read pasta's debug output (its stderr, and the DNS relay's lines) and
         write one line when a connection opens and one when it closes, with
         the domain of the destination when the relay saw it, to CMD's
@@ -15,12 +15,14 @@ platform-python) and later.
         input; with it, it reads the FIFO (see the launcher's "Network log")
         until the launcher, PID, has exited, then writes the end record.
 
-    bwrap_netlog.py dns LISTEN UPSTREAM PARENT_PID
+    bwrap_netlog.py dns LISTEN UPSTREAM PARENT_PID [UDP_FD TCP_FD]
         A DNS relay for the sandbox's network namespace: listen on LISTEN
         (ADDR or ADDR:PORT, UDP and TCP), forward every query to UPSTREAM
-        (pasta's DNS forward address) and print one line per query on
-        standard output.  It exits when PARENT_PID (the descriptor relay,
-        which becomes bwrap) does.
+        (the backend's DNS address) and print one line per query on standard
+        output.  It exits when PARENT_PID (the descriptor relay, which
+        becomes bwrap) does.  UDP_FD and TCP_FD are sockets already bound to
+        LISTEN, for a namespace where this process cannot bind port 53
+        itself; "-" means bind here (see DnsRelay.adopt).
 
 Output lines are logfmt (key=value), so Loki's `| logfmt` can filter them:
 
@@ -291,6 +293,7 @@ def condense(argv):
 
     session, dns_forward, cmd = "", "169.254.1.1", []
     fifo, parent, marker, end_record, session_dir, stderr_fifo = None, None, None, None, None, None
+    backend = "pasta"
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -310,6 +313,8 @@ def condense(argv):
             session_dir = argv[i + 1]
         elif a == "--stderr-fifo":
             stderr_fifo = argv[i + 1]
+        elif a == "--backend":
+            backend = argv[i + 1]
         elif a == "--":
             cmd = argv[i + 1 :]
             break
@@ -386,9 +391,11 @@ def condense(argv):
                     early.append(raw)
             feed(raw)
         if not started:
-            # pasta stopped before starting the sandbox: show what it said.
+            # The backend stopped before starting the sandbox: show what it
+            # said (pasta's own lines; with slirp4netns, the identity
+            # mapper's or the descriptor relay's).
             for raw in early:
-                sys.stderr.write("pasta: %s\n" % raw)
+                sys.stderr.write("%s: %s\n" % (backend, raw))
             sys.stderr.flush()
         if bridge:
             bridge_stop.set()
@@ -615,6 +622,23 @@ class DnsRelay:
         self.tcp.bind(self.udp.getsockname())
         self.tcp.listen(16)
 
+    def adopt(self, udp_fd, tcp_fd):
+        """Take over sockets bound before the exec that dropped our privileges.
+
+        Binding port 53 needs CAP_NET_BIND_SERVICE, and capabilities survive
+        execve only for uid 0.  With pasta the namespace maps the caller to 0,
+        so bind() works; with slirp4netns the namespace maps the real uid, the
+        exec chain leaves us with no capabilities at all, and the sockets are
+        bound instead by the process that creates the namespace and handed
+        over here (see _NET_NS_IDENTITY in bwrap_sandbox_lib.sh).
+        """
+        self.udp = socket.fromfd(udp_fd, socket.AF_INET, socket.SOCK_DGRAM)
+        self.tcp = socket.fromfd(tcp_fd, socket.AF_INET, socket.SOCK_STREAM)
+        # fromfd duplicates; the inherited numbers are not needed again.
+        os.close(udp_fd)
+        os.close(tcp_fd)
+        self.listen = self.udp.getsockname()
+
     def serve(self):
         def tcp_loop():
             while not self.stopping.is_set():
@@ -661,6 +685,10 @@ def _drop_capabilities():
 
 def dns(argv):
     listen, upstream, parent = argv[0], argv[1], int(argv[2])
+    # Optional pre-bound sockets, "-" when this process may bind for itself.
+    fds = None
+    if len(argv) >= 5 and argv[3] != "-":
+        fds = (int(argv[3]), int(argv[4]))
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
@@ -670,7 +698,10 @@ def dns(argv):
         return
     relay = DnsRelay(listen, upstream)
     try:
-        relay.bind()
+        if fds is None:
+            relay.bind()
+        else:
+            relay.adopt(*fds)
     except OSError as e:
         sys.stdout.write("bwrap-dns domain=- type=- proto=- rcode=RELAY-FAILED answers=%s\n" % _value(str(e)))
         sys.stdout.flush()
@@ -687,7 +718,7 @@ def dns(argv):
 def main():
     if len(sys.argv) >= 2 and sys.argv[1] == "condense":
         condense(sys.argv[2:])
-    elif len(sys.argv) == 5 and sys.argv[1] == "dns":
+    elif len(sys.argv) in (5, 7) and sys.argv[1] == "dns":
         try:
             dns(sys.argv[2:])
         except KeyboardInterrupt:

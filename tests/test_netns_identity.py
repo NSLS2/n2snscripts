@@ -14,6 +14,7 @@ fail if the two drift apart.
 """
 
 import os
+import socket
 import subprocess
 import sys
 import unittest
@@ -22,7 +23,32 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = os.path.join(HERE, "..", "lib", "bwrap_sandbox_lib.sh")
 
 
+INSPECT = """
+import fcntl, socket, struct, sys
+SIOCGIFFLAGS, IFF_UP = 0x8913, 0x1
+udp_fd, tcp_fd = int(sys.argv[1]), int(sys.argv[2])
+c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+flags = struct.unpack('16sh22x', fcntl.ioctl(c, SIOCGIFFLAGS, struct.pack('16sh22x', b'lo', 0)))[1]
+u = socket.fromfd(udp_fd, socket.AF_INET, socket.SOCK_DGRAM)
+t = socket.fromfd(tcp_fd, socket.AF_INET, socket.SOCK_STREAM)
+print('lo_up=%d' % bool(flags & IFF_UP))
+print('udp=%s:%d' % u.getsockname())
+print('tcp=%s:%d' % t.getsockname())
+print('udp_type=%d' % u.type)
+print('listening=%d' % t.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN))
+"""
+
 _SNIPPET = None
+
+
+def shell_var(name):
+    """Read a plain variable out of the shell library."""
+    out = subprocess.run(
+        ["bash", "-c", 'source "$1" 2>/dev/null; printf "%%s" "${%s}"' % name, "_", LIB],
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    return out.stdout.decode()
 
 
 def snippet():
@@ -106,6 +132,65 @@ class NetNsIdentityRunTests(unittest.TestCase):
     def test_failure_to_exec_is_reported(self):
         got = run("/nonexistent/command")
         self.assertNotEqual(got.returncode, 0)
+
+
+@unittest.skipUnless(userns_available(), "unprivileged user namespaces are unavailable")
+class NetNsIdentityDnsTests(unittest.TestCase):
+    """The --dns pre-bind, which the DNS relay depends on under slirp4netns.
+
+    The relay is started after two execs and the namespace maps the real uid,
+    so it holds no capabilities and cannot bind port 53 or raise loopback.
+    The mapper does both while it still can, between the unshare and the exec.
+    """
+
+    def setUp(self):
+        self.addr = shell_var("_NET_DNS_RELAY_ADDR")
+        self.port = shell_var("_NET_DNS_RELAY_PORT")
+        self.udp_fd = shell_var("_NET_FD_DNS_UDP")
+        self.tcp_fd = shell_var("_NET_FD_DNS_TCP")
+
+    def fields(self, *extra):
+        got = run(
+            "--dns",
+            self.addr,
+            self.port,
+            self.udp_fd,
+            self.tcp_fd,
+            "--",
+            sys.executable,
+            "-c",
+            INSPECT,
+            self.udp_fd,
+            self.tcp_fd,
+            *extra,
+        )
+        self.assertEqual(got.returncode, 0, got.stderr.decode())
+        return dict(line.split("=", 1) for line in got.stdout.decode().split())
+
+    def test_descriptors_are_bound_to_the_relay_address(self):
+        f = self.fields()
+        self.assertEqual(f["udp"], "%s:%s" % (self.addr, self.port))
+        self.assertEqual(f["tcp"], "%s:%s" % (self.addr, self.port))
+
+    def test_loopback_is_up(self):
+        """A fresh network namespace has lo down, so :53 could not be bound."""
+        self.assertEqual(self.fields()["lo_up"], "1")
+
+    def test_tcp_socket_is_listening(self):
+        self.assertEqual(self.fields()["listening"], "1")
+
+    def test_udp_socket_is_a_datagram_socket(self):
+        self.assertEqual(int(self.fields()["udp_type"]), int(socket.SOCK_DGRAM))
+
+    def test_without_dns_the_descriptors_are_absent(self):
+        got = run(sys.executable, "-c", INSPECT, self.udp_fd, self.tcp_fd)
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn("Bad file descriptor", got.stderr.decode())
+
+    def test_a_bad_address_fails_the_launch(self):
+        got = run("--dns", "203.0.113.9", self.port, self.udp_fd, self.tcp_fd, "--", "/bin/true")
+        self.assertNotEqual(got.returncode, 0)
+        self.assertIn("DNS relay sockets", got.stderr.decode())
 
 
 if __name__ == "__main__":
