@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+# bla — the beamline-agent launcher. Starts a beamline coding agent as the
+# agent service account.
+#
+#     bla            # the default agent
+#     bla opencode2  # a named one
+#
+# This launcher, not the caller, decides what the agent can reach: only the
+# agent name is taken from the command line, from a fixed list, and no option
+# is passed through. The calling user is logged to syslog first, so an action
+# can be traced to a person even though the agent runs as a shared account.
+#
+# Requires the n2c_agent ansible role (gateway key, token minter) and the base
+# role (the bw* launchers and the account check).
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Where this script really is. Everything is derived from the resolved path, so
+# running it through a symlink cannot change the command sudo is asked for, or
+# the name in the audit line. SCRIPT_DIR is where the bw* wrappers sit: they are
+# run by absolute path, because sudo replaces PATH with its secure_path and the
+# profile.d snippet that adds them is only read by a login shell.
+SCRIPT_PATH="$(readlink -f -- "$0")"
+readonly SCRIPT_PATH
+readonly SCRIPT_DIR="${SCRIPT_PATH%/*}"
+readonly PROGRAM_NAME="${SCRIPT_PATH##*/}"
+
+# The account the agents run as. The caller runs this script as whoever they
+# are -- the sudoers rule names the beamline operator account, so that is
+# normally it -- and it re-runs itself through sudo, so nobody has to remember
+# the account name or the sudo line. The sudoers rule still decides who is
+# allowed.
+readonly AGENT_ACCOUNT=xfagent
+
+# The wrappers find their agent by name, and sudo's secure_path does not hold
+# /usr/local/bin, where npm installs them.
+readonly AGENT_PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+# The agents that may be started, and the wrapper each one runs in. On one
+# line because shfmt's keep_padding indents a multi-line array one space
+# further on every run, so it never settles and CI never goes green.
+declare -A AGENT_WRAPPERS=([opencode]=bwopencode [opencode2]=bwopencode2 [claude]=bwclaude)
+
+# Started when no agent is named, so the common case is just "bla". opencode2
+# because it is the wrapper that sends the gateway an Entra token; opencode
+# sends only the subscription key and the gateway refuses it.
+readonly DEFAULT_AGENT=opencode2
+
+# Installed by the n2c_agent role; see its defaults in NSLS2/ansible.
+readonly AIFAPIM_KEY_PATH=/etc/nsls2/agent/aifapim/key
+readonly AGENT_CREDS_DIR=/run/nsls2/agent/creds
+# The gateway. The n2c_agent role writes the host next to the key, from the
+# same variable the base role puts in /etc/profile.d/aifapim.sh, so a gateway
+# move is fixed by a baseline run rather than a release of this script. The
+# constant is only the fallback for a host the role has not reached yet.
+readonly AIFAPIM_HOST_PATH=/etc/nsls2/agent/aifapim/host
+readonly AIFAPIM_GATEWAY_HOST=aifapim.nsls2.bnl.gov # gitleaks:allow
+readonly ACCOUNT_CHECK=/opt/nsls2/libexec/agent-account-check
+
+# $HOME for the agent account. The bw* launchers create their authoring
+# directories under it on the host before bind-mounting them in, so it has to
+# exist and be writable. It cannot be the caller's agent directory: a wrapper
+# refuses to run where the working directory is $HOME or above it.
+#
+# Made by the n2c_agent role, on the tmpfs next to the tokens: owned by the
+# agent account with mode 0700, so no one else can take a caller's name, and
+# nothing kept here outlives a reboot.
+#
+# On the host rather than a tmpfs inside the sandbox, so a session's state
+# outlives the sandbox that wrote it and a session can be reopened later.
+readonly AGENT_HOME_BASE=/run/nsls2/agent/home
+
+# The live profile collection, relative to the caller's home. $HOME is a tmpfs
+# in the sandbox, so the rest of the home stays hidden and this one directory
+# is mounted read-write: the agent edits and commits in the real repository,
+# and a person reviews and pushes afterwards. Not every host has one.
+readonly PROFILE_COLLECTION=.ipython/profile_collection
+
+# The one directory the agent may write in, inside the caller's home.
+readonly AGENT_SUBDIR=agent
+
+# Filesystems that take POSIX ACLs, so the agent directory and the profile
+# collection can be shared with the agent account. Shared storage is not one:
+# see the ansible compliance role's compliance_agent_acls_fstypes.
+readonly ACL_FSTYPES="xfs ext4 ext3 btrfs"
+
+die() {
+    echo "${PROGRAM_NAME}: $*" >&2
+    exit 1
+}
+
+# ensure_agent_dir HOME
+#   Create the agent directory and the ACLs that share it with the agent
+#   account. Runs as the caller, who owns their home, so this needs no root
+#   and no prior ansible run. Idempotent: setfacl -m is a no-op when the entry
+#   is already there.
+#
+#   Traverse-only on the home: the agent reaches its own directory and the
+#   profile collection, nothing else. Both accounts get default entries on the
+#   agent directory, or whichever one did not create a file cannot read it.
+ensure_agent_dir() {
+    local home="$1" dir="$1/${AGENT_SUBDIR}" user="$2"
+
+    [[ -d "${dir}" ]] || {
+        mkdir -p "${dir}" || die "cannot create '${dir}'"
+        echo "${PROGRAM_NAME}: created ${dir}" >&2
+    }
+    reject_symlink "${dir}"
+
+    setfacl -m "u:${AGENT_ACCOUNT}:x" "${home}" || _acl_failed
+    setfacl -m "u:${AGENT_ACCOUNT}:rwx" -m "d:u:${AGENT_ACCOUNT}:rwx" "${dir}" || _acl_failed
+    setfacl -m "d:u:${user}:rwx" "${dir}" || _acl_failed
+}
+
+_acl_failed() {
+    die "cannot share the agent directory with ${AGENT_ACCOUNT}: does this filesystem support ACLs?"
+}
+
+# reject_symlink DIR
+#   The agent directory has to be a real directory in the caller's home. A
+#   symlink would move the agent's one writable mount somewhere else, and the
+#   caller owns their home, so only this stops them pointing it anywhere.
+#   Checked again as the agent account, after the caller's last chance to swap
+#   it.
+reject_symlink() {
+    [[ ! -L "$1" ]] ||
+        die "'$1' is a symlink: the agent directory has to be a real directory in your home"
+}
+
+# write_npm_config AGENT_HOME CACHE_DIR
+#   Point npm at the per-caller cache. npm reads ~/.npm, which is in the
+#   per-session home and so would be thrown away and re-downloaded every
+#   time. npm_config_cache in the environment does not survive the sandbox's
+#   fixed variable list, but a dotfile in $HOME is mounted.
+write_npm_config() {
+    local agent_home="$1" cache_dir="$2"
+
+    printf '# %s\ncache=%s/npm\n' "written by ${PROGRAM_NAME}" "${cache_dir}" \
+        > "${agent_home}/.npmrc" || die "cannot write '${agent_home}/.npmrc'"
+}
+
+# write_git_config AGENT_HOME DIR...
+#   Mark DIRs safe. git refuses every command in a repository owned by someone
+#   else — which each of these is, belonging to the caller or to the beamline
+#   on shared storage — so without this the agent cannot even run git status.
+#
+#   No identity is set. The agent edits but does not commit, and leaving the
+#   identity out makes a commit fail with "please tell me who you are" rather
+#   than succeed quietly. A guard against a mistake, not a boundary: anyone
+#   can pass git -c user.name.
+#
+#   Written in $HOME, which the wrappers mount into the sandbox.
+write_git_config() {
+    local agent_home="$1" dir
+    shift
+    {
+        printf '# %s\n[safe]\n' "written by ${PROGRAM_NAME}"
+        for dir in "$@"; do
+            # continue, not &&: a false test on the last argument would be the
+            # group's exit status and look like a write failure.
+            [[ -n "${dir}" ]] || continue
+            printf '\tdirectory = %s\n' "${dir}"
+        done
+    } > "${agent_home}/.gitconfig" || die "cannot write '${agent_home}/.gitconfig'"
+}
+
+# say_how_to_publish [PROFILE]
+#   The agent edits but neither commits nor pushes: the sandbox has no git
+#   identity, no GitHub credentials and no SSH. Say so at the start, with the
+#   command to review afterwards, or the work looks lost.
+say_how_to_publish() {
+    local profile="$1"
+
+    [[ -n "${profile}" ]] || return 0
+    cat >&2 << EOF
+${PROGRAM_NAME}: the profile collection is mounted read-write at
+  ${profile}
+The agent edits it but does not commit, and cannot push: the sandbox has no
+git identity and no GitHub credentials. Review and commit yourself afterwards:
+  cd ${profile} && git diff
+EOF
+}
+
+# check_profile_collection HOME
+#   The agent may only reach what the caller can reach.
+#
+#   The link is in the caller's home, so they choose where it points, and the
+#   sandbox mounts whatever it resolves to. The agent account is granted on
+#   every beamline's storage, so without this check a caller could aim the
+#   link at another beamline's profile collection and have the agent open it
+#   read-write on their behalf — access they do not have themselves.
+#
+#   Run as the caller, so -w is their access, not the agent account's. This
+#   catches a mistake, not a determined caller: they own the link and can
+#   repoint it after the check. Scoping the agent account per beamline is
+#   what would make that pointless.
+check_profile_collection() {
+    local dir="$1/${PROFILE_COLLECTION}" real
+
+    # -L before -e: a link to a directory the caller cannot traverse is not
+    # -e, and returning here would skip the check in the one case it is for.
+    [[ -L "${dir}" || -e "${dir}" ]] || return 0
+
+    # || true: readlink -f fails on a path the caller cannot resolve, and
+    # errexit would end the script here with no message at all.
+    real="$(readlink -f "${dir}" 2> /dev/null || true)"
+    [[ -n "${real}" && -d "${real}" ]] ||
+        die "'${dir}' points somewhere you cannot reach"
+    [[ -w "${real}" ]] ||
+        die "'${dir}' points at '${real}', which you cannot write: the agent will not open it for you"
+}
+
+# share_profile_collection HOME CALLER
+#   Both accounts write in one directory, so without default entries the files
+#   one creates are unwritable by the other and the person is locked out of
+#   committing what the agent wrote — which is the whole hand-off.
+#
+#   Only on a filesystem that takes POSIX ACLs. A profile collection usually
+#   lives on shared storage, where setfacl fails and a recursive attempt walks
+#   thousands of files to achieve nothing. The list matches the ansible
+#   compliance role's compliance_agent_acls_fstypes.
+#
+#   Resolved first: on some hosts this is a symlink to shared storage, and
+#   setfacl on a symlink fails.
+share_profile_collection() {
+    local dir="$1/${PROFILE_COLLECTION}" caller="$2" fstype
+
+    [[ -d "${dir}" ]] || return 0
+    dir="$(readlink -f "${dir}")"
+
+    fstype="$(findmnt -no FSTYPE --target "${dir}" 2> /dev/null)"
+    if [[ " ${ACL_FSTYPES} " != *" ${fstype} "* ]]; then
+        echo "${PROGRAM_NAME}: '${dir}' is on ${fstype:-an unknown filesystem}, which does not take POSIX ACLs; the agent can read it but not change it" >&2
+        return 0
+    fi
+
+    setfacl -R -m "u:${AGENT_ACCOUNT}:rwx" -m "d:u:${AGENT_ACCOUNT}:rwx" -m "d:u:${caller}:rwx" "${dir}" 2> /dev/null ||
+        echo "${PROGRAM_NAME}: could not share '${dir}' with ${AGENT_ACCOUNT}; it can read it but not change it" >&2
+}
+
+usage() {
+    cat << EOF
+Usage: ${PROGRAM_NAME} [agent]
+
+Start a beamline coding agent in its sandbox. It may write only in your agent
+directory, and reaches the AI gateway and the read-only NSLS-II APIs with the
+credentials this host keeps.
+
+Agents (${DEFAULT_AGENT} when none is named):
+$(printf '  %s\n' "${!AGENT_WRAPPERS[@]}" | sort)
+
+No other options are accepted.
+EOF
+}
+
+main() {
+    # Before anything else, so asking what this is needs no sudo rule and
+    # creates nothing.
+    case "${1:-}" in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+    esac
+
+    local agent="${1:-${DEFAULT_AGENT}}"
+
+    # All argument checking before anything is created, so a typo does not
+    # leave a directory behind. Named first, or an option in the agent's place
+    # is reported as a stray argument instead of an unknown agent.
+    local wrapper="${AGENT_WRAPPERS[${agent}]:-}"
+    [[ -n "${wrapper}" ]] ||
+        die "unknown agent '${agent}'. Known agents: $(echo "${!AGENT_WRAPPERS[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')"
+    [[ $# -le 1 ]] || die "no options are accepted after the agent name (got: ${*:2})"
+
+    # Still the caller here, normally the beamline operator account. Set up the
+    # agent directory now, while we are the account that owns the home, because
+    # the agent account cannot create it there. Then re-run as the agent.
+    if [[ "$(id -un)" != "${AGENT_ACCOUNT}" ]]; then
+        [[ "$(id -un)" != root ]] || die "refusing to run for root"
+        ensure_agent_dir "${HOME}" "$(id -un)"
+        check_profile_collection "${HOME}"
+        share_profile_collection "${HOME}" "$(id -un)"
+        exec sudo -u "${AGENT_ACCOUNT}" "${SCRIPT_PATH}" "${agent}"
+    fi
+
+    # The bw* launchers run this too; running it before the audit line keeps a
+    # refused account out of the log and away from the key.
+    if [[ -f "${ACCOUNT_CHECK}" && -x "${ACCOUNT_CHECK}" ]]; then
+        "${ACCOUNT_CHECK}" || exit $?
+    fi
+
+    # Not a permission check: the agent account is already here. SUDO_USER is
+    # the only way to tell whose home to find ~/agent and the profile
+    # collection in, whose session directory to use, and whose name to log.
+    # The agent account's own home holds none of that, so guessing it would
+    # mount an empty directory and attribute the session to nobody.
+    local user="${SUDO_USER:-}"
+    [[ -n "${user}" ]] || die "cannot tell whose home to mount: run ${PROGRAM_NAME} from the account you logged in with, not as ${AGENT_ACCOUNT}"
+    [[ "${user}" != root ]] || die "refusing to run for root"
+
+    local home
+    home="$(getent passwd "${user}" | cut -d: -f6)"
+    [[ -n "${home}" ]] || die "cannot find the home directory of '${user}'"
+
+    # Writable, and shared with the caller by ACL so each can read what the
+    # other writes.
+    local agent_dir="${home}/${AGENT_SUBDIR}"
+    reject_symlink "${agent_dir}"
+    [[ -w "${agent_dir}" ]] || die "'${agent_dir}' is not writable by ${AGENT_ACCOUNT}: check its ACL"
+
+    # A $HOME per session, so two agents started at once do not race to create
+    # the same database, and two people sharing an operator account do not
+    # read each other's conversations. The cache is per caller instead: it is
+    # most of the size and holds nothing personal.
+    #
+    # Each run makes a new session directory, so nothing is reopened yet. The
+    # state is kept rather than discarded so that reopening one is a change
+    # here, not a change to where every agent stores its data.
+    [[ -d "${AGENT_HOME_BASE}" ]] ||
+        die "'${AGENT_HOME_BASE}' is missing: is the n2c_agent role deployed on this host?"
+    local caller_dir="${AGENT_HOME_BASE}/${user}"
+    mkdir -p "${caller_dir}/cache" || die "cannot create '${caller_dir}'"
+    local agent_home
+    agent_home="$(mktemp -d "${caller_dir}/session-XXXXXX")" ||
+        die "cannot create a session directory in '${caller_dir}'"
+
+    # Passed in the environment because that is how the wrappers take it; the
+    # file itself is never mounted. Readability is checked first, or bash
+    # prints its own error about the path before ours.
+    local key
+    [[ -r "${AIFAPIM_KEY_PATH}" ]] ||
+        die "cannot read the AI gateway key '${AIFAPIM_KEY_PATH}': is the n2c_agent role deployed on this host?"
+    key="$(< "${AIFAPIM_KEY_PATH}")"
+    [[ -n "${key}" ]] || die "the AI gateway key '${AIFAPIM_KEY_PATH}' is empty"
+
+    # Audit before anything runs: no log line, no agent.
+    logger -t "${PROGRAM_NAME}" -p auth.notice \
+        "agent start: user=${user} host=$(uname -n) agent=${agent} dir=${agent_dir}"
+
+    # The tokens come from the root minter, not an n2c-token session this
+    # account does not have.
+    export N2SN_CREDS_DIR="${AGENT_CREDS_DIR}"
+    local gateway="${AIFAPIM_GATEWAY_HOST}"
+    if [[ -r "${AIFAPIM_HOST_PATH}" ]]; then
+        gateway="$(< "${AIFAPIM_HOST_PATH}")"
+        [[ -n "${gateway}" ]] || die "'${AIFAPIM_HOST_PATH}' is empty"
+    fi
+    export AIFAPIM_HOST="${gateway}"
+    export AIFAPIM_API_KEY="${key}"
+    # The gateway wants an Entra token as well as the key. The path, not the
+    # token: the file is mounted by --n2c-token and the wrapper's plugin reads
+    # it, so a token minted mid-session is picked up without a restart.
+    export AIFAPIM_TOKEN_FILE="${AGENT_CREDS_DIR}/aifapim/token"
+    export PATH="${AGENT_PATH}"
+    export HOME="${agent_home}"
+    export XDG_CACHE_HOME="${caller_dir}/cache"
+
+    cd "${agent_dir}" || die "cannot enter '${agent_dir}'"
+
+    local -a mounts=(--n2c-token all)
+    local profile=""
+    if [[ -d "${home}/${PROFILE_COLLECTION}" ]]; then
+        # Resolved, because on some hosts this is a symlink to shared storage:
+        # the sandbox mounts the target, so the link path is not there inside.
+        profile="$(readlink -f "${home}/${PROFILE_COLLECTION}")"
+        mounts+=(--rw-path "${profile}")
+    else
+        echo "${PROGRAM_NAME}: no profile collection at '${home}/${PROFILE_COLLECTION}'; starting without it" >&2
+    fi
+
+    write_git_config "${agent_home}" "${agent_dir}" "${profile}"
+    write_npm_config "${agent_home}" "${caller_dir}/cache"
+    say_how_to_publish "${profile}"
+
+    exec "${SCRIPT_DIR}/${wrapper}" "${mounts[@]}"
+}
+
+main "$@"
