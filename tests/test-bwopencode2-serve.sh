@@ -45,9 +45,9 @@ for _b in google-chrome chromium xdg-open firefox; do
     chmod +x "${T}/bin/${_b}"
 done
 
-# xdg-mime: prints the default browser registered in the test, if any (the file
-# default-browser holds its name).
-printf '#!/bin/sh\ncat "%s/default-browser" 2>/dev/null\n' "${T}" > "${T}/bin/xdg-mime"
+# xdg-mime: prints the default browser registered for http in the test, if any (the
+# file default-browser holds its name, https-only-browser the one for https only).
+printf '#!/bin/sh\n[ "$3" = x-scheme-handler/http ] && cat "%s/default-browser" 2>/dev/null\n' "${T}" > "${T}/bin/xdg-mime"
 chmod +x "${T}/bin/xdg-mime"
 
 # run [VAR=VALUE ...] -- ARGS...: dry-run the launcher; sets OUT, ERR, RC.  A
@@ -145,6 +145,12 @@ run HARNESS_SERVE_OPEN_CANDIDATES= -- --serve --serve-open
 check 'a registered default browser is reached through xdg-open' contains "${ERR}" "${T}/bin/xdg-open http://127."
 check '... without --app' lacks "${ERR}" '--app='
 rm -f "${T}/default-browser"
+
+# A default browser for https only: the link is http, so it does not count.
+printf '#!/bin/sh\n[ "$3" = x-scheme-handler/https ] && echo firefox.desktop\n' > "${T}/bin/xdg-mime"
+run HARNESS_SERVE_OPEN_CANDIDATES= -- --serve --serve-open
+check 'a default browser for https only is not used for the http link' contains "${ERR}" 'nothing will be opened (no web browser found'
+printf '#!/bin/sh\n[ "$3" = x-scheme-handler/http ] && cat "%s/default-browser" 2>/dev/null\n' "${T}" > "${T}/bin/xdg-mime"
 
 run HARNESS_SERVE_OPEN_CANDIDATES=firefox -- --serve --serve-open
 check 'firefox is used when it is installed' contains "${ERR}" "${T}/bin/firefox http://127."

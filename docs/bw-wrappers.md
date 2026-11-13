@@ -1266,14 +1266,23 @@ bwopencode2 --serve --serve-open
 - **Which browser.** The first of `google-chrome`, `google-chrome-stable`,
   `chromium`, `chromium-browser` on `PATH`, started as `BROWSER
   --app=LINK` (an app window); else `firefox LINK`; else `xdg-open LINK`, but
-  only when a default web browser is registered (`xdg-mime query default
-  x-scheme-handler/https` prints one). Without one `xdg-open` does not fail: on
+  only when a default web browser is registered for `http`, the scheme of the
+  link (`xdg-mime query default x-scheme-handler/http` prints one). Without one `xdg-open` does not fail: on
   GNOME it opens the link in the text editor, which shows "Could Not Open File,
   HTTP Client Error: Unauthorized" and has used up the one-time link (seen on a
   workstation with no browser installed, and the reason for this rule).
   `BWOPENCODE2_SERVE_BROWSER` names another command, which must exist
   (otherwise the launch stops): a name containing `chrom`, `edge` or `brave`
   gets `--app=`, any other (`firefox`, `xdg-open`) gets the plain link.
+- **Holds none of the launcher's descriptors.** The launcher has the database
+  session lock (see Database guard) and the sandbox's own descriptors open when
+  the helper starts. A browser that inherited them would keep the lock for as
+  long as its window stays open, and the next `bwopencode2` on the same data
+  directory would be refused. The helper closes every descriptor above 2 before
+  it starts the browser (found in Copilot's review of PR #43, reproduced: the
+  browser held descriptor 200, the lock, until its window closed; the test
+  fails without the fix). Bash keeps descriptor 255, its handle on the script
+  file, to itself; it holds no lock.
 - **No desktop session.** If neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, or
   no browser is found, the launch continues and the launcher says that nothing
   will be opened and why; the ssh instructions then apply.
@@ -1314,7 +1323,7 @@ a backslash; a new code on Enter through a pseudo-terminal; no spinning at end
 of input; a failed pairing) and the host helper against a stub browser (the
 `--app=` link, the plain link, the login page when no link came, a launcher
 that has gone, a helper that survives the launcher's `exec`, nothing on
-`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 40 checks through
+`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 41 checks through
 `--dry-run` (arguments, browser choice, no display). Not checked, because it
 needs a real launch and a browser: that Chrome opens an app window signed in,
 Enter at a terminal inside `bwrap --new-session`, and the helper's output on a

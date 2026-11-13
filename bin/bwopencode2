@@ -914,13 +914,14 @@ serve_print_info() {
 # default browser through xdg-open (see serve_open_default_browser).
 SERVE_OPEN_CANDIDATES=(google-chrome google-chrome-stable chromium chromium-browser firefox)
 
-# True when a default web browser is registered.  Without one, xdg-open does not
-# fail: it hands the link to whatever opens a URL as a file (on GNOME, the text
-# editor), which would also use up the one-time link.
+# True when a default web browser is registered for http, the scheme of the link
+# (it is on 127.H1.H2.1, without TLS).  Without one, xdg-open does not fail: it
+# hands the link to whatever opens a URL as a file (on GNOME, the text editor),
+# which would also use up the one-time link.
 serve_open_default_browser() {
     local _h
     command -v xdg-mime > /dev/null 2>&1 || return 1
-    _h="$(xdg-mime query default x-scheme-handler/https 2> /dev/null)" || return 1
+    _h="$(xdg-mime query default x-scheme-handler/http 2> /dev/null)" || return 1
     [[ -n "${_h}" ]]
 }
 
@@ -1017,11 +1018,28 @@ serve_open_run() {
     printf 'bwopencode2: --serve-open: started %s on this host.\n' "${SERVE_OPEN_BIN}" >&2
 }
 
+# Close every descriptor above 2 (not 255, which bash reads this script through
+# and keeps to itself; it holds no lock).
+# The launcher holds the database session lock and the sandbox's own descriptors
+# open; a browser that inherited them would keep the lock for as long as its
+# window lives, and refuse the next launch.
+serve_open_close_fds() {
+    local _f _n
+    for _f in /proc/self/fd/*; do
+        _n="${_f##*/}"
+        [[ "${_n}" =~ ^[0-9]+$ ]] || continue
+        ((_n > 2 && _n != 255)) || continue
+        eval "exec ${_n}>&-" 2> /dev/null || true
+    done
+}
+
 # The helper as a background job: it ignores the terminal's signals (the
-# server's Ctrl-C is not its own) and reads nothing.
+# server's Ctrl-C is not its own), reads nothing and holds none of the
+# launcher's descriptors.
 serve_open_detached() {
     trap '' INT QUIT HUP
     exec < /dev/null
+    serve_open_close_fds
     serve_open_run "$@"
 }
 

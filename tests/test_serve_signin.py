@@ -353,6 +353,47 @@ exec sleep 4
             [f"--app=http://127.0.0.1:{self.port}/auth/connect/code1"],
         )
 
+    def test_the_browser_does_not_inherit_the_launchers_descriptors(self):
+        # The launcher holds the database session lock on a descriptor; a browser
+        # that kept it would hold the lock for as long as its window lives and
+        # refuse the next launch.  The stub keeps running while the lock is tried.
+        self.start_server()
+        lock = Path(self.tmp.name) / "session.lock"
+        fds = Path(self.tmp.name) / "browser-fds"
+        slow = Path(self.tmp.name) / "slow-browser"
+        slow.write_text(f"#!/bin/sh\nls /proc/$$/fd > {fds}\nsleep 8\n")
+        slow.chmod(0o700)
+        script = f"""
+set -euo pipefail
+source "{WRAPPER}"
+SERVE_ADDR=127.0.0.1
+SERVE_PORT={self.port}
+SERVE_PASSWORD='{PASSWORD}'
+SERVE_OPEN=1
+SERVE_OPEN_BIN="{slow}"
+SERVE_OPEN_APP=1
+DRY_RUN=0
+exec 200>> "{lock}"
+flock -n 200
+serve_open_start
+exec sleep 3
+"""
+        subprocess.run(
+            ["bash", "-c", script],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": self.tmp.name},
+            check=True,
+            timeout=30,
+        )
+        for _ in range(60):
+            if fds.exists() and fds.read_text().endswith("\n"):
+                break
+            time.sleep(0.1)
+        self.assertNotIn("200", fds.read_text().split())
+        # The launcher (the sleep that holds the lock, like the sandbox) has ended and
+        # the browser still runs: the lock must be free.
+        free = subprocess.run(["flock", "-n", str(lock), "true"])
+        self.assertEqual(free.returncode, 0, "the browser still holds the launcher's lock")
+
     def test_dry_run_starts_nothing(self):
         self.start_server()
         script = f"""
