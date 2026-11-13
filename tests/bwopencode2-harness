@@ -20,4 +20,10 @@ serve_port_is_free() {
 }
 # shellcheck disable=SC2034  # read by bwopencode2's functions
 [[ -z "${HARNESS_OC2_BIN:-}" ]] || OC2_INSTALL_BIN="${HARNESS_OC2_BIN}"
+# The browsers --serve-open looks for, so a test does not depend on the host's
+# (HARNESS_SERVE_OPEN_CANDIDATES set to nothing means none).
+# shellcheck disable=SC2034  # read by bwopencode2's functions
+if [[ -n "${HARNESS_SERVE_OPEN_CANDIDATES+x}" ]]; then
+	read -r -a SERVE_OPEN_CANDIDATES <<<"${HARNESS_SERVE_OPEN_CANDIDATES}"
+fi
 main "$@"
