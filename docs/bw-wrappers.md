@@ -18,13 +18,14 @@ option list; the tables below summarise the common surface.
 - `bubblewrap` (`bwrap`) >= 0.4.0
   - binary masking is verified on RHEL 8.10 (`bubblewrap-0.4.0-3.el8_10`) and EL9 (0.6.3)
 - For the private network namespace, one of: `pasta` (package `passt`,
-  RHEL 9 and later), or `slirp4netns` >= 0.4.0 with libslirp >= 4.3.0
-  (package `slirp4netns`, RHEL 8 AppStream) and util-linux `unshare`; plus
-  `/dev/net/tun` and unprivileged user namespaces on the host. Without them
-  the wrappers stop (exit status 3) unless run with `--share-net` (see
-  [Network](#network)). `ss` (iproute) is used to find busy ports for
-  `--publish`; with slirp4netns, `--publish` also needs `python3` (or RHEL 8's
-  `/usr/libexec/platform-python`).
+  RHEL 9 and later) **with bwrap >= 0.4.1** (see
+  [Implementation notes: pasta](#implementation-notes-pasta)), or
+  `slirp4netns` >= 0.4.0 with libslirp >= 4.3.0 (package `slirp4netns`,
+  RHEL 8 AppStream) and `python3` (or RHEL 8's
+  `/usr/libexec/platform-python`); plus `/dev/net/tun` and unprivileged user
+  namespaces on the host. Without them the wrappers stop (exit status 3)
+  unless run with `--share-net` (see [Network](#network)). `ss` (iproute) is
+  used to find busy ports for `--publish`.
 - For the [network log](#network-log): `systemd-cat` (systemd) with a running
   journal, or `logger` (util-linux) with `/dev/log`. Without either the
   wrappers warn and run without the log. Python 3.6+ (standard library) to
@@ -541,6 +542,13 @@ field, for example the domains an agent reached:
 - pasta maps you to uid 0 in its user namespace, so bwrap runs the agent in a
   nested user namespace as your real uid and gid (`--unshare-user --uid
   --gid`); file ownership looks as before and the agent has no capabilities.
+- **pasta needs bwrap 0.4.1 or later** and the launcher checks before using
+  it. In 0.4.0 `drop_privs()` tests `geteuid() == 0` instead of "installed
+  setuid root", so inside pasta's namespace — where uid 0 is the only mapped
+  id — it calls `setuid(<your uid>)` on an unmapped id and dies with
+  `unable to drop root uid: Invalid argument`. 0.4.1 changed the guard to
+  `is_privileged`. RHEL 8 ships 0.4.0, but also has no pasta, so in practice
+  this only bites a hand-built pasta or a backported one.
 - pasta renames the host to `pasta-<name>`; bwrap's `--unshare-uts
   --hostname` restores the real name.
 - `--no-pidns` is passed when the installed pasta supports it (2026-09 and
@@ -558,28 +566,69 @@ foreground, so the terminal, job control, the exit status and
 ```text
 launcher ─┬─ helper (background): waits for the namespace, starts slirp4netns,
           │    adds the --publish forwards, then releases the sandbox
-          └─ exec env -i ... unshare --user --map-root-user --net --
+          └─ exec env -i ... python -I -c <_NET_NS_IDENTITY>
                bash <descriptor relay> -- bwrap --unshare-user --uid --gid
                --info-fd --block-fd --sync-fd ... -- <tool>
 ```
 
 - **The tool does not start before the network is ready**: bwrap waits on
   `--block-fd` until the helper writes to it.
-- **`unshare`, not bwrap's `--unshare-net`, creates the namespaces.** Because
-  bwrap mounts `/dev`, it nests the sandbox in a second user namespace inside
-  the one that owns the network namespace. slirp4netns joins the user
+- **The launcher, not bwrap's `--unshare-net`, creates the namespaces.**
+  Because bwrap mounts `/dev`, it nests the sandbox in a second user namespace
+  inside the one that owns the network namespace. slirp4netns joins the user
   namespace of the process it is given, so it would have no rights over the
-  network. With `unshare` the launcher process itself holds a single user
-  namespace that owns the network namespace, and slirp4netns attaches to it.
-  `unshare` maps you to uid 0 there, so bwrap runs the agent as your real uid
-  and gid, as with pasta.
+  network. Unsharing in the launcher leaves its own process holding a single
+  user namespace that owns the network namespace, and slirp4netns attaches to
+  it.
+- **The ids are mapped to themselves, not to root.** The launcher unshares and
+  writes the maps itself, in about fifteen lines of Python
+  (`_NET_NS_IDENTITY`), rather than calling `unshare --user --map-root-user
+  --net`, for two reasons:
+  - RHEL 8 is the only platform this backend exists for, and its bwrap is
+    0.4.0, which cannot start under a root-only map at all (see the pasta
+    notes above). An identity map leaves your uid mapped, so bwrap's
+    `--uid`/`--gid` name an id that exists.
+  - Nothing in the sandbox runs as uid 0, not even for the moment before bwrap
+    switches back.
+
+  util-linux grew `--map-user`/`--map-current-user` in 2.38 and could do this
+  directly, but RHEL 8 has 2.32, whose `unshare` offers only
+  `--map-root-user`. Writing a single-line map of your own id needs no
+  privilege, so this needs neither `newuidmap`/`newgidmap` nor `/etc/subuid`
+  entries — unlike rootless podman, which uses both to build a much wider map
+  and then runs the payload as uid 0 inside it. slirp4netns still gets full
+  capabilities when it joins, because the namespace is owned by your uid,
+  which is the uid it runs as.
+- Python (`python3`, or RHEL 8's `/usr/libexec/platform-python`) is therefore
+  required for this backend, not only for `--publish`. Standard library only,
+  3.6 or later.
 - slirp4netns options: `--disable-host-loopback` (otherwise the gateway
   address `192.168.254.2` reaches the host's `127.0.0.1` on every port),
   `--cidr=192.168.254.0/24` (slirp's default, `10.0.2.0/24`, lies inside
   BNL's 10/8), the built-in DNS at `.3` (forwards port 53 only, with libslirp
   4.3.0 and later, which the launcher checks), `--mtu=65520`, and
-  `--enable-sandbox --enable-seccomp` when `/etc/resolv.conf` resolves inside
-  `/etc` or `/run`.
+  `--enable-seccomp` when `/etc/resolv.conf` resolves inside `/etc` or
+  `/run`.
+- **`--enable-sandbox` is not passed**, and this is the cost of the identity
+  map. After joining the launcher's namespace, slirp4netns does
+  `setegid(0)`/`seteuid(0)` (`main.c`); with no uid 0 mapped that fails and
+  the launch stops with `setegid(0)` / `parent failed`. An unprivileged
+  process may write only one line into `uid_map` — the line mapping its own
+  id — so the namespace can map uid 0 *or* your uid, not both:
+
+  | map | slirp4netns `--enable-sandbox` | bwrap 0.4.0 |
+  | --- | --- | --- |
+  | uid 0 only | works | dies, unless the agent runs as uid 0 |
+  | your uid (what we do) | cannot `setegid(0)` | works, agent keeps its uid |
+
+  Your uid wins: it is what the agent runs as and what every file it writes
+  is owned by, whereas `--enable-sandbox` only hardens slirp4netns itself (a
+  mount namespace pivot-rooted into an empty directory, plus dropping
+  capabilities). `--enable-seccomp`, which bounds what a compromised libslirp
+  can call, is a separate flag with no id requirement and is still passed.
+  Mapping both ids needs a multi-line map, which takes `newuidmap`/`newgidmap`
+  and an `/etc/subuid` entry — the way rootless podman does it, and the way to
+  restore `--enable-sandbox` if it is wanted.
 - slirp4netns runs in its own session (Ctrl-C does not reach it) with a
   scrubbed environment (no API keys). It exits when bwrap does: its
   `--exit-fd` is the other end of bwrap's `--sync-fd`.
@@ -593,8 +642,8 @@ launcher ─┬─ helper (background): waits for the namespace, starts slirp4ne
   the tool never runs, and then bwrap. The exit status is then 137, not 3.
   The helper signals a process only after checking that it is the launcher
   (the helper's own parent) or a child of the launcher. If the launcher is
-  already gone (`unshare` or the descriptor relay failed and printed why), the
-  helper notices within a poll interval, signals nothing, and exits.
+  already gone (the unshare or the descriptor relay failed and printed why),
+  the helper notices within a poll interval, signals nothing, and exits.
 
 ### Runtime directory
 
@@ -624,7 +673,7 @@ credentials and config (`bwclaude`, `bwcopilot`, `bwcodex`), `--ro-bind-data`
 for generated files (the context file, `/etc/resolv.conf`, `/etc/hosts`).
 pasta closes every inherited descriptor above 2, so the launcher does not open
 them itself. It reserves their numbers; a short fixed bash script (the relay,
-`_BWRAP_FD_RELAY_SHIM`) runs as the command of pasta or `unshare`, opens each descriptor at its
+`_BWRAP_FD_RELAY_SHIM`) runs as the command of pasta or of the unshare step, opens each descriptor at its
 number, from the host file or from generated text carried in an environment
 variable that it then unsets, and execs bwrap. Nothing is staged on the host.
 

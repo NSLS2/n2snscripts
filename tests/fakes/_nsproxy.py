@@ -15,6 +15,7 @@ import ctypes
 import json
 import os
 import socket
+import struct
 import subprocess
 import threading
 
@@ -24,6 +25,32 @@ PR_SET_PDEATHSIG = 1
 def _die_with_parent():
     libc = ctypes.CDLL(None, use_errno=True)
     libc.prctl(PR_SET_PDEATHSIG, 9, 0, 0, 0)
+
+
+def _keep_caps_across_exec():
+    """Make the capabilities this process holds survive execve.
+
+    After joining a user namespace we own, this process has every capability
+    in it.  The real slirp4netns configures the interface right there, with
+    ioctls in the same process.  The fake execs `ip` instead, and execve
+    clears the capability sets unless the process is uid 0 in the namespace:
+    true when the launcher mapped the caller to root, false with the identity
+    map the slirp4netns launch uses (_NET_NS_IDENTITY).  Raising each
+    permitted capability into the ambient set keeps them across the exec, so
+    the fake can do what the real program does.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    header = ctypes.create_string_buffer(struct.pack("II", 0x20080522, 0))  # v3, this thread
+    data = ctypes.create_string_buffer(24)  # 2 x {effective, permitted, inheritable}
+    if libc.capget(header, data) != 0:
+        return
+    e0, p0, i0, e1, p1, i1 = struct.unpack("6I", data.raw)
+    data = ctypes.create_string_buffer(struct.pack("6I", e0, p0, p0, e1, p1, p1))
+    if libc.capset(header, data) != 0:
+        return
+    for cap in range(64):
+        if (p0 | (p1 << 32)) >> cap & 1:
+            libc.prctl(47, 2, cap, 0, 0)  # PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE
 
 
 class NsProxy:
@@ -37,6 +64,7 @@ class NsProxy:
                 fd = os.open("/proc/%d/ns/%s" % (pid, ns), os.O_RDONLY)
                 os.setns(fd, flag)
                 os.close(fd)
+            _keep_caps_across_exec()
             self._serve(b)
             os._exit(0)
         b.close()

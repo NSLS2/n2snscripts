@@ -36,7 +36,7 @@
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   Binary masking is verified on RHEL 8.10 (bubblewrap-0.4.0-3.el8_10) and EL9 (0.6.3).
 # Network: a private network namespace from pasta (package passt, RHEL 9+),
-#   else slirp4netns (RHEL 8) with util-linux unshare; both need /dev/net/tun
+#   else slirp4netns (RHEL 8) with python3; both need /dev/net/tun
 #   and unprivileged user namespaces.  Without either the launch stops
 #   (exit 3) unless --share-net is given (see "Network isolation").
 
@@ -222,6 +222,37 @@ _version_ge() {
     [[ "${a}" == "${b}" ]] && return 0
     # If the lexicographically-smallest version (per sort -V) is B, then A > B.
     [[ "$(printf '%s\n%s\n' "${a}" "${b}" | sort -V | head -n1)" == "${b}" ]]
+}
+
+# Lowest bwrap usable under a user namespace that maps the caller to uid 0 and
+# maps nothing else (what pasta builds, and what util-linux `unshare
+# --map-root-user` writes).  bubblewrap 0.4.0's drop_privs() is
+#
+#     if (geteuid () == 0 && setuid (opt_sandbox_uid) < 0)
+#       die_with_error ("unable to drop root uid");
+#
+# which mistakes "root in a user namespace" for "installed setuid root": it
+# calls setuid(<your uid>) on an id that namespace does not map, gets EINVAL
+# and dies with "unable to drop root uid: Invalid argument" before the sandbox
+# starts.  0.4.1 changed the guard to is_privileged.  RHEL 8 ships 0.4.0, one
+# patch release short, so this has to be checked and not assumed.
+_BWRAP_MIN_VERSION_MAPROOT=0.4.1
+
+# _bwrap_version
+#   Print the version of the bwrap that will be used ("0.4.0"), nothing and
+#   return 1 if it cannot be determined.  Cached: bwrap is resolved and run
+#   once per launch.
+_BWRAP_VERSION=""
+_bwrap_version() {
+    local _bin _out
+    if [[ -z "${_BWRAP_VERSION}" ]]; then
+        _bin="$(resolve_bwrap_bin)" || return 1
+        [[ -n "${_bin}" && -x "${_bin}" ]] || return 1
+        _out="$("${_bin}" --version 2> /dev/null)" || return 1
+        [[ "${_out}" =~ bubblewrap\ ([0-9][0-9.]*) ]] || return 1
+        _BWRAP_VERSION="${BASH_REMATCH[1]}"
+    fi
+    printf '%s' "${_BWRAP_VERSION}"
 }
 
 # Detect kernel-level security features that affect bwrap argument choice.
@@ -2473,11 +2504,25 @@ detect_net_capabilities() {
 #   assumed to work.
 _NET_TRY_REASON=""
 _net_try_pasta() {
-    local _out _rc
+    local _out _rc _bver
     _NET_TRY_REASON=""
     _PASTA_BIN="$(command -v pasta 2> /dev/null || true)"
     if [[ -z "${_PASTA_BIN}" || ! -x "${_PASTA_BIN}" ]]; then
         _NET_TRY_REASON="not found on PATH (package passt)"
+        return 1
+    fi
+    # pasta builds the user namespace itself and maps the caller to uid 0 in
+    # it, so bwrap has to switch back to the real uid: see
+    # _BWRAP_MIN_VERSION_MAPROOT.  Unlike the slirp4netns backend, which maps
+    # the ids itself, there is nothing to work around here, so refuse the
+    # backend rather than fail at exec with bwrap's obscure message.
+    _bver="$(_bwrap_version 2> /dev/null || true)"
+    if [[ -z "${_bver}" ]]; then
+        _NET_TRY_REASON="the bwrap version could not be read ('bwrap --version'; ${_BWRAP_MIN_VERSION_MAPROOT} or later is needed)"
+        return 1
+    fi
+    if ! _version_ge "${_bver}" "${_BWRAP_MIN_VERSION_MAPROOT}"; then
+        _NET_TRY_REASON="bwrap ${_bver} cannot run in pasta's root-mapped user namespace (${_BWRAP_MIN_VERSION_MAPROOT} or later is needed)"
         return 1
     fi
     # --no-pidns (2026-09) is not in RHEL 9 / EPEL builds; without it pasta
@@ -2956,7 +3001,7 @@ _net_log_print_dry_run() {
 #             │    namespace, starts `setsid slirp4netns ... $$ tap0`, waits
 #             │    for it to be ready, adds the --publish forwards through its
 #             │    API socket, then releases the sandbox (--block-fd) and exits
-#             └─ exec env -i ... unshare --user --map-root-user --net --
+#             └─ exec env -i ... python -I -c <_NET_NS_IDENTITY>
 #                  bash <fd relay> -- bwrap --unshare-user --uid U --gid G
 #                  --info-fd 90 --block-fd 91 --sync-fd 92 ... -- tool
 #
@@ -2965,14 +3010,14 @@ _net_log_print_dry_run() {
 # user's shell, so killing bwrap alone would leave the sandbox, which the
 # closed --block-fd would then release.
 #
-# The namespaces come from unshare (util-linux), not from bwrap's
-# --unshare-net: bwrap mounting /dev (devpts) puts the sandbox in a second
-# user namespace nested in the one that owns the network namespace, and
-# slirp4netns, which joins the target process's user namespace, would then
-# have no rights over the network.  With unshare the launcher's own process
-# holds a single-level user namespace that owns the network namespace.  It is
-# mapped to uid 0 (as with pasta), so bwrap runs the sandbox as the real
-# user with --unshare-user --uid/--gid.
+# The namespaces come from the launcher itself (_NET_NS_IDENTITY), not from
+# bwrap's --unshare-net: bwrap mounting /dev (devpts) puts the sandbox in a
+# second user namespace nested in the one that owns the network namespace,
+# and slirp4netns, which joins the target process's user namespace, would
+# then have no rights over the network.  Unsharing in the launcher leaves its
+# own process holding a single-level user namespace that owns the network
+# namespace.  The real uid and gid are mapped to themselves there, so bwrap's
+# --unshare-user --uid/--gid are the ids the sandbox already has.
 #
 # The tool does not start before the network is ready.  slirp4netns runs in
 # its own session (Ctrl-C does not reach it) with a scrubbed environment, and
@@ -2985,14 +3030,16 @@ _net_log_print_dry_run() {
 #                            resolver such as systemd-resolved keeps working.
 #   --cidr                   192.168.254.0/24 (BNL uses 10/8, slirp's default
 #                            range); sandbox .100, gateway .2, DNS .3.
-#   --enable-sandbox/--enable-seccomp  as podman does, when /etc/resolv.conf
-#                            resolves inside /etc or /run (required by it).
+#   --enable-seccomp         as podman does, when /etc/resolv.conf resolves
+#                            inside /etc or /run (required by --enable-sandbox,
+#                            which the resolv.conf test was written for).
+#   --enable-sandbox         only when the namespace maps uid 0, which this
+#                            launcher's does not; see _NET_NS_ROOT_MAPPED.
 # --publish works through the API socket (add_hostfwd, IPv4 TCP, one port per
 # request); --host-port has no slirp4netns equivalent.
 
 _SLIRP_BIN=""
 _SLIRP_ARGS=()
-_UNSHARE_BIN=""
 _NET_SLIRP_NET="192.168.254"
 _NET_SLIRP_CIDR="${_NET_SLIRP_NET}.0/24"
 _NET_SLIRP_DNS="${_NET_SLIRP_NET}.3"
@@ -3042,6 +3089,76 @@ for spec in sys.argv[2:]:
         sys.exit("%s:%s -> sandbox port %s: %s" % (addr, hport, gport, reply.get("error", reply)))
 '
 
+# Whether the namespace the launcher builds maps uid and gid 0.
+#
+# It does not, and the two backends cannot both have what they want, because
+# an unprivileged process may write only ONE line into uid_map -- the line
+# mapping its own id:
+#
+#   map 0 only          slirp4netns --enable-sandbox works; bwrap 0.4.0 dies
+#                       with "unable to drop root uid" unless the agent is
+#                       left running as uid 0 (see _BWRAP_MIN_VERSION_MAPROOT)
+#   map the real id     bwrap works and the agent keeps its own uid;
+#                       slirp4netns --enable-sandbox cannot setegid(0)
+#
+# The real id wins: it is what the sandbox runs as, and the agent's uid is a
+# property of every file it writes, whereas --enable-sandbox only hardens
+# slirp4netns itself (a mount namespace pivot_rooted into an empty directory,
+# plus dropping capabilities).  --enable-seccomp is kept; it is a separate
+# flag with no id requirement, and it is the filter that bounds what a
+# compromised libslirp could call.
+#
+# Mapping both would need a multi-line map, which takes the setuid helpers
+# newuidmap/newgidmap and an /etc/subuid entry -- how rootless podman does it.
+# That is the way to restore --enable-sandbox if it is wanted; it needs the
+# helper to write the map for the launcher's pid between the unshare and the
+# exec, so it is a real change, not a flag.
+_NET_NS_ROOT_MAPPED=0
+
+# The identity mapper, which replaces `unshare --user --map-root-user --net`:
+# unshare a user and a network namespace, map the real uid and gid to
+# themselves, then exec the rest of the argument list.
+#
+# It does not fork, so the launcher keeps its pid: $$ is what the helper waits
+# for and what slirp4netns is pointed at.
+#
+# An identity map, rather than util-linux's root map, for two reasons:
+#   - bwrap 0.4.0 (RHEL 8, the only platform this backend exists for) cannot
+#     start under a root-only map at all; see _BWRAP_MIN_VERSION_MAPROOT.
+#   - the sandbox keeps the real uid without bwrap having to switch back to
+#     it, so nothing in it runs as uid 0 even for the moment before bwrap
+#     drops privileges.
+# util-linux grew --map-user/--map-current-user in 2.38 and could do this
+# directly; RHEL 8 has 2.32, whose unshare offers only --map-root-user.
+#
+# A process may always write a single-line map of its own id without any
+# helper, so this needs neither newuidmap/newgidmap nor /etc/subuid entries
+# (which is how rootless podman builds a much wider map).  slirp4netns still
+# gets full capabilities when it joins: the namespace is owned by the real
+# uid, which is the uid it runs as.
+#
+# Both ids must be read before the unshare; afterwards the process is the
+# overflow id (65534) and a map naming that id is refused with EPERM.
+_NET_NS_IDENTITY='
+import ctypes, os, sys
+CLONE_NEWUSER, CLONE_NEWNET = 0x10000000, 0x40000000
+cmd = sys.argv[1:]
+uid, gid = os.getuid(), os.getgid()
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0:
+    sys.exit("netns: unshare failed: %s" % os.strerror(ctypes.get_errno()))
+try:
+    with open("/proc/self/setgroups", "w") as f:
+        f.write("deny")
+    with open("/proc/self/uid_map", "w") as f:
+        f.write("%d %d 1" % (uid, uid))
+    with open("/proc/self/gid_map", "w") as f:
+        f.write("%d %d 1" % (gid, gid))
+except OSError as e:
+    sys.exit("netns: writing the id maps failed: %s" % e)
+os.execvp(cmd[0], cmd)
+'
+
 # _net_python
 #   Print the Python used by the network helpers (RHEL 8's platform-python,
 #   else python3), nothing when there is none.  They need the standard
@@ -3057,8 +3174,8 @@ _net_python() {
 }
 
 # _net_try_slirp
-#   Return 0 when slirp4netns can be used (set _SLIRP_BIN, _SLIRP_ARGS and,
-#   for --publish, _NET_PY_BIN), else 1 with the reason in _NET_TRY_REASON.
+#   Return 0 when slirp4netns can be used (set _SLIRP_BIN, _SLIRP_ARGS and
+#   _NET_PY_BIN), else 1 with the reason in _NET_TRY_REASON.
 #   There is no test run (it would need a second sandbox); a failure at
 #   launch stops the sandbox before the tool starts (see _net_slirp_helper).
 _net_try_slirp() {
@@ -3069,10 +3186,11 @@ _net_try_slirp() {
         _NET_TRY_REASON="not found on PATH (package slirp4netns)"
         return 1
     fi
-    _UNSHARE_BIN="$(command -v unshare 2> /dev/null || true)"
-    if [[ -z "${_UNSHARE_BIN}" || ! -x "${_UNSHARE_BIN}" ]] ||
-        ! "${_UNSHARE_BIN}" --help 2>&1 | grep -q -e '--map-root-user'; then
-        _NET_TRY_REASON="needs unshare (util-linux) with --map-root-user"
+    # Python creates the namespaces (_NET_NS_IDENTITY) and, for --publish,
+    # drives the API socket.  Needed for every launch, not only --publish.
+    _NET_PY_BIN="$(_net_python)"
+    if [[ -z "${_NET_PY_BIN}" ]]; then
+        _NET_TRY_REASON="needs python3 (or /usr/libexec/platform-python) to create the namespaces"
         return 1
     fi
     if ! _out="$("${_SLIRP_BIN}" --version 2>&1)"; then
@@ -3102,14 +3220,6 @@ _net_try_slirp() {
             return 1
         fi
     fi
-    _NET_PY_BIN=""
-    if [[ ${#NET_PUBLISH[@]} -gt 0 ]]; then
-        _NET_PY_BIN="$(_net_python)"
-        if [[ -z "${_NET_PY_BIN}" ]]; then
-            _NET_TRY_REASON="--publish needs python3 (or /usr/libexec/platform-python) to configure it"
-            return 1
-        fi
-    fi
     _SLIRP_ARGS=(
         --configure
         --mtu=65520
@@ -3118,7 +3228,11 @@ _net_try_slirp() {
     )
     _resolv="$(readlink -f /etc/resolv.conf 2> /dev/null || true)"
     if [[ "${_resolv}" == /etc/* || "${_resolv}" == /run/* ]]; then
-        _SLIRP_ARGS+=(--enable-sandbox --enable-seccomp)
+        _SLIRP_ARGS+=(--enable-seccomp)
+        # --enable-sandbox only with a namespace that maps uid 0; see
+        # _NET_NS_ROOT_MAPPED.  --enable-seccomp has no such requirement
+        # (slirp4netns.c: create_sandbox and enable_seccomp are independent).
+        [[ "${_NET_NS_ROOT_MAPPED}" -ne 1 ]] || _SLIRP_ARGS+=(--enable-sandbox)
     fi
     return 0
 }
@@ -3797,9 +3911,9 @@ build_net_isolation() {
             --hostname "$(uname -n)"
         )
     else
-        # unshare creates the namespaces (mapping the caller to uid 0) and
-        # slirp4netns attaches to them; the launch descriptors are opened by
-        # _net_slirp_start.
+        # _NET_NS_IDENTITY creates the namespaces (mapping the real ids to
+        # themselves) and slirp4netns attaches to them; the launch
+        # descriptors are opened by _net_slirp_start.
         _dns="${_NET_SLIRP_DNS}"
         BWRAP_ARGS+=(
             --unshare-user
@@ -5531,7 +5645,7 @@ print_dry_run() {
     # Mirror the exact invocation used by launch_sandbox:
     #   exec <env_bin> -i <base vars> <SANDBOX_ENV> <relay data>
     #     [<pasta_bin> <PASTA_ARGS> --]      (pasta backend only)
-    #     [<unshare> --user --map-root-user --net --]  (slirp4netns only)
+    #     [<python> -I -c <_NET_NS_IDENTITY>]          (slirp4netns only)
     #     <bash_bin> -c <relay> bwrap-fd-relay <relay entries> --
     #     <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
     # Values of secret-looking variables (_is_secret_env_name) are printed as
@@ -5573,7 +5687,7 @@ print_dry_run() {
     done
     [[ "${_NET_BACKEND}" != pasta ]] || printf "    -- \\\\\n"
     if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
-        printf "  %s --user --map-root-user --net -- \\\\\n" "${_UNSHARE_BIN}"
+        printf "  %s -I -c '<_NET_NS_IDENTITY from bwrap_sandbox_lib.sh>' \\\\\n" "${_NET_PY_BIN}"
     fi
     printf "  %s -c '<_BWRAP_FD_RELAY_SHIM from bwrap_sandbox_lib.sh>' bwrap-fd-relay \\\\\n" "${_BASH_BIN}"
     local _r=0
@@ -5660,7 +5774,7 @@ launch_sandbox() {
     if [[ "${_NET_BACKEND}" == pasta ]]; then
         _net_prefix=("${_PASTA_BIN}" "${PASTA_ARGS[@]}" --)
     elif [[ "${_NET_BACKEND}" == slirp4netns ]]; then
-        _net_prefix=("${_UNSHARE_BIN}" --user --map-root-user --net --)
+        _net_prefix=("${_NET_PY_BIN}" -I -c "${_NET_NS_IDENTITY}")
     fi
     _bwrap_fd_data_numbers
     for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
