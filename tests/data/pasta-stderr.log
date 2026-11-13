@@ -1,0 +1,81 @@
+0.0064: Template interface: wlp0s20f3 (IPv4), wlp0s20f3 (IPv6)
+0.0065: Namespace interface: wlp0s20f3
+0.0065: MAC:
+0.0065:     host: 9a:55:9a:55:9a:55
+0.0065:     NAT to host 127.0.0.1: 198.51.100.1
+0.0065: DHCP:
+0.0065:     assign: 198.51.100.47
+0.0065:     mask: 255.255.255.0
+0.0065:     router: 198.51.100.1
+0.0065: DNS:
+0.0065:     198.51.100.1
+0.0065: DNS search list:
+0.0065:     example.net
+0.0065:     localdomain
+0.0065:     NAT to host ::1: fe80::1
+0.0065: NDP/DHCPv6:
+0.0065:     assign: 2001:db8::7
+0.0065:     router: fe80::1
+0.0065:     our link-local: fe80::1
+0.0065: DNS search list:
+0.0065:     example.net
+0.0065:     localdomain
+0.0065: Inbound forwarding rules (HOST):
+0.0065:     TCP [*]:1-32767  =>  1-32767  (best effort) (auto-scan)
+0.0065:     TCP [*]:61000-65535  =>  61000-65535  (best effort) (auto-scan)
+0.0065:     UDP [*]:1-32767  =>  1-32767  (best effort) (auto-scan)
+0.0065:     UDP [*]:61000-65535  =>  61000-65535  (best effort) (auto-scan)
+0.0065: Outbound forwarding rules (SPLICE):
+0.0065:     TCP [*]%lo:1-32767  =>  1-32767  (best effort) (auto-scan)
+0.0065:     TCP [*]%lo:61000-65535  =>  61000-65535  (best effort) (auto-scan)
+0.0065:     UDP [*]%lo:1-32767  =>  1-32767  (best effort) (auto-scan)
+0.0065:     UDP [*]%lo:61000-65535  =>  61000-65535  (best effort) (auto-scan)
+0.0168: Sending initial ARP request for guest MAC address
+0.0169: Sending initial NDP NS request for guest MAC address
+0.0256: Using UDP timeout parameters, timeout: 30, stream_timeout: 120
+0.0257: Using TCP RTO parameters, syn_retries: 6, syn_linear_timeouts: 4, rto_max: 120
+0.0273: SO_PEEK_OFF supported
+0.0273: TCP_INFO tcpi_snd_wnd field supported
+0.0273: TCP_INFO tcpi_bytes_acked field supported
+0.0273: TCP_INFO tcpi_min_rtt field supported
+0.0278: ARP announcement for 198.51.100.246 / 02:00:00:00:00:01
+0.0291: NDP: received NS, sending NA
+0.0686: Flow 0 (NEW): FREE -> NEW
+0.0687: Flow 0 (INI): NEW -> INI
+0.0687: Flow 0 (INI):     TAP [2001:db8::7]:40506 -> [2001:db8:1::2]:443 => ?
+0.0687: Flow 0 (TGT): INI -> TGT
+0.0687: Flow 0 (TGT):     TAP [2001:db8::7]:40506 -> [2001:db8:1::2]:443 => HOST [::]:0 -> [2001:db8:1::2]:443
+0.0687: Flow 0 (TCP connection): TGT -> TYPED
+0.0687: Flow 0 (TCP connection):     TAP [2001:db8::7]:40506 -> [2001:db8:1::2]:443 => HOST [::]:0 -> [2001:db8:1::2]:443
+0.0688: Flow 0 (TCP connection): TAP_SYN_RCVD: CLOSED -> SYN_SENT
+0.0688: Flow 0 (TCP connection): Side 0 hash table insert: bucket: 76114
+0.0691: Flow 0 (TCP connection): TYPED -> ACTIVE
+0.0691: Flow 0 (TCP connection):     TAP [2001:db8::7]:40506 -> [2001:db8:1::2]:443 => HOST [::]:0 -> [2001:db8:1::2]:443
+0.1663: Flow 0 (TCP connection): TAP_SYN_ACK_SENT: SYN_SENT -> SYN_RCVD
+0.1663: Flow 0 (TCP connection): ACK_FROM_TAP_DUE
+0.1664: Flow 0 (TCP connection): timer expires in 1.000s
+0.1665: Flow 0 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.1665: Flow 0 (TCP connection): ESTABLISHED: SYN_RCVD -> ESTABLISHED
+0.1694: Flow 0 (TCP connection): ACK_TO_TAP_DUE
+0.2696: Flow 0 (TCP connection): ACK_FROM_TAP_DUE
+0.2697: Flow 0 (TCP connection): STALLED
+0.2698: Flow 0 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.2698: Flow 0 (TCP connection): ACK_TO_TAP_DUE dropped
+0.2698: Flow 0 (TCP connection): STALLED dropped
+0.2725: Flow 0 (TCP connection): ACK_TO_TAP_DUE
+0.3737: Flow 0 (TCP connection): ACK_FROM_TAP_DUE
+0.3738: Flow 0 (TCP connection): STALLED
+0.3935: Flow 0 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.3937: Flow 0 (TCP connection): STALLED dropped
+0.4900: Flow 0 (TCP connection): ACK_FROM_TAP_DUE
+0.4901: Flow 0 (TCP connection): STALLED
+0.4912: Flow 0 (TCP connection): STALLED dropped
+0.4913: Flow 0 (TCP connection): STALLED
+0.4914: Flow 0 (TCP connection): ACK_FROM_TAP_DUE dropped
+0.4915: Flow 0 (TCP connection): ACK_TO_TAP_DUE dropped
+0.4915: Flow 0 (TCP connection): STALLED dropped
+0.4917: Flow 0 (TCP connection): ACK_TO_TAP_DUE
+0.4936: Flow 0 (TCP connection): TAP_FIN_RCVD: ESTABLISHED -> CLOSE_WAIT
+0.4936: Flow 0 (TCP connection): ACTIVE_CLOSE
+0.4937: Flow 0 (TCP connection): SOCK_FIN_SENT
+0.4937: Flow 0 (TCP connection): ACK_TO_TAP_DUE dropped

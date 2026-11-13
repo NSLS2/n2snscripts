@@ -12,7 +12,8 @@
 #     working directory, git config, pixi, ccache, npm, user bin, NSLS-II,
 #     dynamic tool mounts, user-supplied extra paths (--ro-path / --rw-path)
 #   - Environment variable framework (clean env + passthrough)
-#   - Launch logic (dry-run printing and bwrap exec)
+#   - Private network namespace via pasta, with opt-in port forwards
+#   - Launch logic (dry-run printing and pasta + fd relay + bwrap exec)
 #
 # Tool-specific wrapper scripts source this file and provide:
 #   - Argument parsing (parse_wrapper_args) — must handle --ro-path/--rw-path
@@ -21,7 +22,12 @@
 #   - Help text (show_help)
 #   - Tool-specific path resolution, host directory creation, mounts, and env vars
 #   - main() orchestrating the build sequence — must call build_extra_path_mounts
-#     after build_dynamic_tool_mounts
+#     after build_dynamic_tool_mounts, detect_net_capabilities after
+#     detect_kernel_capabilities, and build_net_isolation after build_etc_mounts
+#   - --publish / --publish-addr / --host-port / --share-net / --net-backend in
+#     parse_wrapper_args, through net_add_publish, net_set_publish_addr,
+#     net_add_host_port, net_set_share and net_set_backend; net_print_help in
+#     show_help
 #
 # Usage (in tool wrapper scripts):
 #   SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
@@ -29,6 +35,10 @@
 #
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   Binary masking is verified on RHEL 8.10 (bubblewrap-0.4.0-3.el8_10) and EL9 (0.6.3).
+# Network: a private network namespace from pasta (package passt, RHEL 9+),
+#   else slirp4netns (RHEL 8) with python3; both need /dev/net/tun
+#   and unprivileged user namespaces.  Without either the launch stops
+#   (exit 3) unless --share-net is given (see "Network isolation").
 
 # Guard against double-sourcing.
 [[ -n "${_BWRAP_SANDBOX_LIB_SOURCED:-}" ]] && return 0
@@ -58,6 +68,23 @@ EXTRA_RO_PATHS=()
 # shellcheck disable=SC2034  # used by tool wrappers that source this library
 EXTRA_RW_PATHS=()
 
+# Private network namespace (see "Network isolation").  Filled by the
+# launchers' parse_wrapper_args through net_add_publish, net_add_host_port,
+# net_set_publish_addr and net_set_share; turned into pasta
+# arguments by build_net_isolation.  NET_SHARE=1 (--share-net) keeps the
+# sandbox on the host network; NET_BACKEND_FORCE (--net-backend) restricts the
+# choice to one backend.  NET_PUBLISH and NET_HOST_PORTS hold validated specs
+# "PORTS[:SANDBOXPORTS]" (PORTS is N or LOW-HIGH).
+NET_PUBLISH=()
+NET_PUBLISH_ADDR=""
+# Set (to the option's name) when a launcher fixes NET_PUBLISH_ADDR itself
+# (bwopencode2 --serve): the address must then not move, and errors say why.
+NET_PUBLISH_ADDR_FIXED_BY=""
+NET_HOST_PORTS=()
+NET_SHARE=0
+NET_BACKEND_FORCE=""
+PASTA_ARGS=()
+
 # N2C access tokens requested with --n2c-token (names, or "all").
 # Populated by add_n2c_token; mounted by build_n2c_token_mounts.
 N2C_TOKENS=()
@@ -82,6 +109,14 @@ _TOOL_CMD=()
 BWRAP_ARGS=()
 declare -A _MOUNTED_PREFIXES=()
 _EXTRA_PATH_DIRS=()
+
+# Descriptors that bwrap reads (--file, --ro-bind-data), opened by the fd
+# relay just before bwrap starts (see "File descriptor relay").
+_BWRAP_FD=""
+_BWRAP_FD_NEXT=10
+_BWRAP_FD_RELAY=()
+declare -A _BWRAP_FD_DATA=()
+declare -A _BWRAP_FD_LABEL=()
 
 # Cached result of `npm prefix -g` (resolved at most once per run).
 # _NPM_PREFIX_RESOLVED flips to 1 after the first lookup; _NPM_PREFIX holds
@@ -1059,6 +1094,9 @@ _bwrap_load_blocked_prefixes() {
         "/etc/sudoers"
         "/etc/sudoers.d"
     )
+    # The launcher's network runtime directories (slirp4netns API sockets,
+    # publish claims, network log pipes of every sandbox of this user).
+    mapfile -t -O "${#_literal[@]}" _literal < <(_net_runtime_candidates)
     local _e _r
     _BWRAP_BLOCKED_LIST=()
     for _e in "${_literal[@]}"; do
@@ -1899,9 +1937,13 @@ resolve_common_paths() {
     # npm paths
     NPM_CACHE_DIR="${NPM_CONFIG_CACHE:-${_HOME}/.npm}"
 
+    # prek (pre-commit) cache: hook environments and the toolchains it
+    # downloads to build them (Go, Node).
+    PREK_CACHE_DIR="${PREK_HOME:-${XDG_CACHE_HOME}/prek}"
+
     # ── Safety checks on all user-controllable path roots ────────
     # These variables are set from env vars (XDG_*, PIXI_HOME, CCACHE_DIR,
-    # NPM_CONFIG_CACHE) and control where entire directory trees are mounted
+    # NPM_CONFIG_CACHE, PREK_HOME) and control where entire directory trees are mounted
     # into the sandbox.  Validate each root once here so that every mount
     # derived from it is implicitly covered — no per-mount check needed for
     # sub-paths.  Paths that do not yet exist are checked against the blocked
@@ -1913,6 +1955,7 @@ resolve_common_paths() {
     _check_dir_safe "${CCACHE_CACHE_DIR}" "CCACHE_DIR (cache)"
     _check_dir_safe "${CCACHE_CONFIG_DIR}" "CCACHE_DIR (config)"
     _check_dir_safe "${NPM_CACHE_DIR}"    "NPM_CONFIG_CACHE"
+    _check_dir_safe "${PREK_CACHE_DIR}"   "PREK_HOME"
 }
 
 # ── Sandbox PATH construction ────────────────────────────────────
@@ -2184,10 +2227,9 @@ build_sys_mounts() {
 
 # ── Selective /etc (read-only) ───────────────────────────────────
 # Only expose what is needed for DNS, TLS, user identity, and NSS.
+# /etc/resolv.conf and /etc/hosts are generated by build_net_isolation.
 build_etc_mounts() {
     BWRAP_ARGS+=(
-        --ro-bind-try /etc/resolv.conf /etc/resolv.conf
-        --ro-bind-try /etc/hosts /etc/hosts
         --ro-bind-try /etc/nsswitch.conf /etc/nsswitch.conf
         --ro-bind /etc/passwd /etc/passwd
         --ro-bind /etc/group /etc/group
@@ -2202,6 +2244,1866 @@ build_etc_mounts() {
         --ro-bind-try /etc/localtime /etc/localtime
         --ro-bind-try /etc/gitconfig /etc/gitconfig
     )
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# Network isolation
+# ═══════════════════════════════════════════════════════════════════
+# The sandbox gets its own network namespace from the first usable backend:
+# pasta (package passt), else slirp4netns (see "slirp4netns backend" below).
+#
+#   env -i ... pasta [PASTA_ARGS] -- bash <fd relay> -- bwrap [BWRAP_ARGS] -- tool
+#
+# pasta creates a user and a network namespace (plus mount, UTS and IPC, and
+# a PID namespace unless --no-pidns), gives it one tap interface with the
+# host's address and routes, and carries its traffic through ordinary host
+# sockets.  Outbound connections therefore work and leave from the host's
+# address, while the host's loopback services (127.0.0.1: opencode's server,
+# CUPS, databases, other users' sessions) are out of reach, and the sandbox
+# has its own port space.  Any crossing of that boundary is a per-port,
+# per-launch opt-in:
+#   --publish PORT[:SANDBOXPORT]    sandbox server -> host 127.H1.H2.S:PORT
+#   --host-port PORT[:SANDBOXPORT]  host 127.0.0.1:PORT -> sandbox
+#                                   127.0.0.1:SANDBOXPORT (pasta -T, which
+#                                   always listens on the sandbox's loopback;
+#                                   it takes no listening address)
+# Without a usable backend (neither pasta nor slirp4netns installed, no
+# /dev/net/tun, or no unprivileged user namespaces) the launch stops (exit 3).
+# --net-backend NAME restricts the choice to one backend (for testing).
+# Only --share-net makes the sandbox share the host network as before: no
+# backend, the host's resolv.conf and hosts mounted, and no forwarding
+# options (exit 1 with them).
+#
+# Points that are easy to get wrong:
+#   - --no-map-gw: pasta's default maps the gateway address to the host's
+#     loopback, which would re-expose every loopback service.
+#   - -T none / -U none: pasta's default ("auto") forwards ports bound on the
+#     host loopback INTO the namespace, a second path to the same services.
+#   - pasta maps the caller to uid 0 in its user namespace.  bwrap therefore
+#     gets --unshare-user --uid/--gid with the real ids; without them the
+#     agent would run as root with a full capability set there.
+#   - pasta renames the host (pasta-<name>) in its UTS namespace; bwrap's
+#     --unshare-uts --hostname restores the real name.
+#   - pasta closes inherited descriptors; see "File descriptor relay".
+#   - The host resolver is usually on loopback (127.0.0.53), so DNS goes to
+#     _NET_DNS_FORWARD_ADDR, which pasta forwards to the host's first
+#     nameserver; resolv.conf is generated to match.
+
+_PASTA_BIN=""
+_PASTA_HAS_NO_PIDNS=0
+_NET_CONFIGURED=0
+# _NET_BACKEND is the backend that provides the private network namespace,
+# or none with --share-net; _NET_PRIVATE is 1 unless it is none.
+_NET_PRIVATE=0
+_NET_BACKEND=none
+_NET_SHARED_REASON=""
+_NET_PUBLISH_ADDR_EFFECTIVE=""
+_NET_DNS_FORWARD_ADDR="169.254.1.1"
+# The sandbox's nameserver address with the chosen backend.
+_NET_DNS_EFFECTIVE=""
+# Host loopback ports that --host-port refuses: services that trust loopback
+# clients completely.  CUPS, Docker (plain and TLS), X11, the Tailscale local
+# API, and the OpenCode 2 background service (runs tools outside any sandbox).
+_NET_HOST_PORT_DENY=(631 2375 2376 6000-6063 41112 49374)
+# Human-readable forward descriptions for the launch report and context file.
+_NET_PUBLISH_DESC=()
+_NET_HOST_DESC=()
+# Low and high ends of the listening side of every accepted spec, per
+# direction, for the overlap check, and of the sandbox side of --publish (a
+# --host-port sandbox port is held by pasta, so a server cannot use it).
+_NET_PUB_LO=()
+_NET_PUB_HI=()
+_NET_PUBSBX_LO=()
+_NET_PUBSBX_HI=()
+_NET_HP_LO=()
+_NET_HP_HI=()
+
+# net_print_help
+#   Print the network options for a launcher's --help.
+net_print_help() {
+    cat << 'NET_HELP_EOF'
+Network: the sandbox has its own network namespace (pasta, package passt,
+or else slirp4netns).
+Outbound connections work as on the host; services on the host's loopback
+(127.0.0.1) are NOT reachable, and nothing the agent listens on is reachable
+from the host, unless opened below.  If no private network namespace can be
+set up, the launch stops (exit 3) unless --share-net is given.  Every session
+(and with pasta every connection) is recorded in the host's system log, tag
+bwrap-net (journalctl -t bwrap-net); this cannot be turned off.  Ports must be
+in 1024-65535; N or LOW-HIGH ranges are accepted.
+  --share-net     Share the host network instead (the behaviour before
+                  private namespaces): host loopback services are reachable
+                  from the sandbox and its listeners are reachable on the
+                  host.  Cannot be combined with the options below.
+  --net-backend pasta|slirp4netns
+                  Use only this backend for the private namespace (normally
+                  pasta, else slirp4netns).  slirp4netns supports --publish
+                  but not --host-port.
+  --publish PORT[:SANDBOXPORT]
+                  Make a server inside the sandbox (port SANDBOXPORT, default
+                  PORT) reachable on the host at http://127.H1.H2.S:PORT/, an
+                  address derived from your uid and a free session index S
+                  (printed at launch).  The server must bind 0.0.0.0, not
+                  127.0.0.1.  May be repeated.  Any local user can connect to
+                  it: this is not access control.
+  --publish-addr ADDR
+                  Use ADDR (in 127.0.0.0/8) instead of the derived address, for
+                  example 127.0.0.1 for OAuth redirect URIs that require it.
+  --host-port PORT[:SANDBOXPORT]
+                  Make the host's 127.0.0.1:PORT reachable in the sandbox at
+                  127.0.0.1:SANDBOXPORT (default PORT; pasta only).  That port
+                  of the sandbox is then taken: use SANDBOXPORT to keep PORT
+                  free for a server of the agent.  The host service sees a
+                  loopback client and may trust it.  May be repeated.
+                  Refused: 631 (CUPS), 2375-2376 (Docker), 6000-6063 (X11),
+                  41112 (Tailscale), 49374 (OpenCode 2 service).
+
+NET_HELP_EOF
+}
+
+# _net_baseline_args
+#   Set PASTA_ARGS to the flags used with no forwards.
+_net_baseline_args() {
+    PASTA_ARGS=(
+        --config-net
+        --no-map-gw
+        --dns-forward "${_NET_DNS_FORWARD_ADDR}"
+        --search none
+        -t none
+        -u none
+        -T none
+        -U none
+        --quiet
+    )
+    if [[ "${_PASTA_HAS_NO_PIDNS}" -eq 1 ]]; then
+        PASTA_ARGS+=(--no-pidns)
+    fi
+}
+
+# net_set_backend NAME
+#   --net-backend: use only backend NAME (pasta or slirp4netns).
+net_set_backend() {
+    case "$1" in
+        pasta | slirp4netns) NET_BACKEND_FORCE="$1" ;;
+        *)
+            echo "Error: --net-backend: '$1' is not a backend (pasta or slirp4netns)." >&2
+            exit 1
+            ;;
+    esac
+}
+
+# net_set_share
+#   --share-net: share the host network, without a private namespace.
+net_set_share() {
+    NET_SHARE=1
+}
+
+# _net_forward_options
+#   Print the forward options given (--publish, --publish-addr, --host-port,
+#   as a space-separated list), nothing when none.
+_net_forward_options() {
+    local -a _opts=()
+    [[ ${#NET_PUBLISH[@]} -eq 0 ]] || _opts+=(--publish)
+    [[ -z "${NET_PUBLISH_ADDR}" ]] || _opts+=(--publish-addr)
+    [[ ${#NET_HOST_PORTS[@]} -eq 0 ]] || _opts+=(--host-port)
+    printf '%s' "${_opts[*]}"
+}
+
+# detect_net_capabilities
+#   Choose the network for the sandbox and set _NET_BACKEND: none with
+#   --share-net (the forwarding options are then an error, exit 1); otherwise
+#   the first usable backend.  With none usable, stop (exit 3): the sandbox
+#   never shares the host network unless --share-net asks for it.
+detect_net_capabilities() {
+    local _fwd _want="${NET_BACKEND_FORCE}" _pasta_reason _slirp_reason
+    _NET_PRIVATE=0
+    _NET_BACKEND=none
+    _NET_SHARED_REASON=""
+    _fwd="$(_net_forward_options)"
+    if [[ "${NET_SHARE}" -eq 1 ]]; then
+        if [[ -n "${_fwd}" ]]; then
+            echo "Error: --share-net cannot be combined with the forwarding options (${_fwd}): they need the private network namespace." >&2
+            exit 1
+        fi
+        if [[ -n "${_want}" ]]; then
+            echo "Error: --share-net cannot be combined with --net-backend." >&2
+            exit 1
+        fi
+        _NET_SHARED_REASON="--share-net was given"
+        return 0
+    fi
+
+    _pasta_reason="not tried (--net-backend ${_want})"
+    if [[ -z "${_want}" || "${_want}" == pasta ]]; then
+        if _net_try_pasta; then
+            _NET_BACKEND=pasta
+            _NET_PRIVATE=1
+            return 0
+        fi
+        _pasta_reason="${_NET_TRY_REASON}"
+        _PASTA_BIN=""
+        PASTA_ARGS=()
+    fi
+
+    _slirp_reason="not tried (--net-backend ${_want})"
+    if [[ -z "${_want}" || "${_want}" == slirp4netns ]]; then
+        if [[ ${#NET_HOST_PORTS[@]} -gt 0 ]]; then
+            _slirp_reason="does not support --host-port (pasta only)"
+        elif _net_try_slirp; then
+            _NET_BACKEND=slirp4netns
+            _NET_PRIVATE=1
+            return 0
+        else
+            _slirp_reason="${_NET_TRY_REASON}"
+        fi
+    fi
+
+    printf 'Error: %s: no private network namespace is available, and the sandbox does not share\n' "${0##*/}" >&2
+    printf '       the host network unless asked to.\n' >&2
+    printf '         pasta:       %s\n' "${_pasta_reason}" >&2
+    printf '         slirp4netns: %s\n' "${_slirp_reason}" >&2
+    printf '       Install passt (RHEL 9 and later) or slirp4netns (RHEL 8), or run with --share-net\n' >&2
+    printf '       to share the host network (services on the host loopback are then reachable).\n' >&2
+    exit 3
+}
+
+# _net_try_pasta
+#   Return 0 when pasta can be used (set _PASTA_BIN and PASTA_ARGS), else 1
+#   with the reason in _NET_TRY_REASON.  Under --dry-run an installed pasta is
+#   assumed to work.
+_NET_TRY_REASON=""
+_net_try_pasta() {
+    local _out _rc
+    _NET_TRY_REASON=""
+    _PASTA_BIN="$(command -v pasta 2> /dev/null || true)"
+    if [[ -z "${_PASTA_BIN}" || ! -x "${_PASTA_BIN}" ]]; then
+        _NET_TRY_REASON="not found on PATH (package passt)"
+        return 1
+    fi
+    # --no-pidns (2026-09) is not in RHEL 9 / EPEL builds; without it pasta
+    # adds a PID namespace, inside which bwrap nests its own.
+    if _out="$(timeout --signal=TERM --kill-after=2s 5s "${_PASTA_BIN}" --help 2>&1)"; then
+        [[ "${_out}" != *--no-pidns* ]] || _PASTA_HAS_NO_PIDNS=1
+    else
+        _rc=$?
+        if [[ ${_rc} -eq 124 || ${_rc} -eq 137 ]]; then
+            _NET_TRY_REASON="'pasta --help' timed out after 5 seconds"
+            return 1
+        fi
+    fi
+    _net_baseline_args
+    [[ "${DRY_RUN}" -eq 0 ]] || return 0
+    if [[ ! -c /dev/net/tun ]]; then
+        _NET_TRY_REASON="/dev/net/tun is missing on the host"
+        return 1
+    fi
+    if _out="$(timeout --signal=TERM --kill-after=2s 10s \
+        "${_PASTA_BIN}" "${PASTA_ARGS[@]}" -- /usr/bin/true 2>&1)"; then
+        return 0
+    else
+        _rc=$?
+        if [[ ${_rc} -eq 124 || ${_rc} -eq 137 ]]; then
+            _NET_TRY_REASON="the test run timed out after 10 seconds"
+        else
+            _out="${_out%%$'\n'*}"
+            _NET_TRY_REASON="a test run failed${_out:+: ${_out}} (are unprivileged user namespaces disabled?)"
+        fi
+        return 1
+    fi
+}
+
+# ── Per-user runtime directory ───────────────────────────────────
+# The launcher keeps its network files (slirp4netns pipes and API socket, the
+# claims of publish addresses, the network log pipe) in one directory per
+# user, outside every sandbox:
+#
+#   $XDG_RUNTIME_DIR/bwrap-net/   (else /tmp/bwrap-net-UID)    0700
+#   ├── session.XXXXXXXX/          one per launch (mktemp -d)
+#   └── ...
+#
+# Each launch works in its own session directory, so concurrent launches of
+# one user do not meet there.  Only the launcher (outside the sandbox) uses
+# the directory, and it is in _BWRAP_BLOCKED_LIST, so no sandbox can mount it
+# (by working directory, --ro-path or --rw-path) and reach another sandbox's
+# files.  TMPDIR is never used: its parent may be writable by other users, who
+# could then swap the directory during the launch.
+
+_NET_RUNTIME_BASE=""
+_NET_SESSION_DIR=""
+
+# _net_runtime_candidates
+#   Print the base directory candidates, best first, one per line:
+#   $XDG_RUNTIME_DIR/bwrap-net (when XDG_RUNTIME_DIR is set) and
+#   /tmp/bwrap-net-UID.  Used by _net_runtime_base and the blocked list.
+_net_runtime_candidates() {
+    [[ -z "${XDG_RUNTIME_DIR:-}" ]] || printf '%s/bwrap-net\n' "${XDG_RUNTIME_DIR%/}"
+    printf '/tmp/bwrap-net-%s\n' "$(id -u)"
+}
+
+# _net_dir_is_trusted_parent DIR
+#   True when no other user can rename or replace entries of DIR: a real
+#   directory (not a symlink) owned by this user or root, and either not
+#   writable by group or others, or sticky (as /tmp is).
+_net_dir_is_trusted_parent() {
+    local _d="$1" _st _owner _mode
+    [[ -d "${_d}" && ! -L "${_d}" ]] || return 1
+    _st="$(stat -c '%u %a' -- "${_d}" 2> /dev/null)" || return 1
+    _owner="${_st% *}"
+    _mode=$((8#${_st#* }))
+    [[ "${_owner}" == "$(id -u)" || "${_owner}" == 0 ]] || return 1
+    ((!(_mode & 8#022) || (_mode & 8#1000)))
+}
+
+# _net_runtime_base
+#   Set _NET_RUNTIME_BASE to this user's runtime directory, creating it
+#   (mode 0700).  The first candidate whose parent is trusted is used, and
+#   it must then be a real directory owned by this user with mode 0700.
+#   Exit 3 when there is none.
+_net_runtime_base() {
+    [[ -z "${_NET_RUNTIME_BASE}" ]] || return 0
+    local _c _st _why=""
+    while IFS= read -r _c; do
+        if ! _net_dir_is_trusted_parent "${_c%/*}"; then
+            _why+="${_why:+; }${_c%/*} is not a private or sticky directory of this user or root"
+            continue
+        fi
+        mkdir -m 0700 -- "${_c}" 2> /dev/null || true
+        _st="$(stat -c '%u %a' -- "${_c}" 2> /dev/null || true)"
+        if [[ -d "${_c}" && ! -L "${_c}" && "${_st}" == "$(id -u) 700" ]]; then
+            _NET_RUNTIME_BASE="${_c}"
+            return 0
+        fi
+        _why+="${_why:+; }${_c} exists but is not a directory of this user with mode 0700"
+    done < <(_net_runtime_candidates)
+    echo "Error: no private runtime directory for the network setup: ${_why}." >&2
+    exit 3
+}
+
+# _net_session_dir
+#   Set _NET_SESSION_DIR to a new private directory for this launch.
+_net_session_dir() {
+    [[ -z "${_NET_SESSION_DIR}" ]] || return 0
+    _net_runtime_base
+    if ! _NET_SESSION_DIR="$(mktemp -d "${_NET_RUNTIME_BASE}/session.XXXXXXXX")"; then
+        echo "Error: cannot create a session directory in ${_NET_RUNTIME_BASE}." >&2
+        exit 3
+    fi
+}
+
+# ── Network log (system journal / syslog) ───────────────────────
+# Every launch records its network session in the host's system log, and
+# with pasta every connection too.  It is always on: there is no option to
+# turn it off.  When no logging tool works, the launch warns and continues
+# without the log.
+#
+#   tag (SYSLOG_IDENTIFIER)  bwrap-net
+#   start record             event=start session=ID launcher=... backend=...
+#   each pasta line          session=ID <pasta debug line>
+#   end record               event=end session=ID ...
+#
+# `journalctl -t bwrap-net` shows them; `journalctl -t bwrap-net -g ID` one
+# session.  BWRAP_SESSION in the sandbox is the same ID.  The tool is
+# systemd-cat when the journal's stream socket exists, else logger (util-
+# linux; /dev/log, so journald or rsyslog).  The launch writes the start
+# record itself, synchronously, which also checks that the tool works.
+#
+# pasta at debug level never uses syslog: without --log-file it writes every
+# line, timestamped, to its stderr (log.c vlogmsg).  So with pasta:
+#
+#   launcher ─┬─ condenser (bwrap_netlog.py condense, background, outside the
+#             │    sandbox): reads the netlog FIFO, writes one record per
+#             │    connection to the tool; once the launcher (pasta) has gone
+#             │    writes the end record and removes the session directory.
+#             │    Without Python: _net_log_supervisor, which copies pasta's
+#             │    lines as they are.
+#             └─ exec env -i ... pasta --debug ... 2>>FIFO
+#                  -- relay (prints a marker, reopens its stderr) -- bwrap ...
+#
+#   - pasta's stderr is the FIFO, opened by the launcher write-only, append.
+#     pasta is not given --log-file: it opens that read-write (to rotate it),
+#     and on SELinux hosts (Fedora, RHEL) pasta runs as pasta_t, which passt's
+#     policy lets only append to user_tmp_t FIFOs, so the open is denied and
+#     pasta exits.  An inherited append-only descriptor is allowed; a read-
+#     write one (2<>) would be silently replaced with /dev/null at the exec
+#     into pasta_t, and so would any other read-write descriptor on the FIFO
+#     left open across the exec: the launcher closes its hold before it.
+#   - The reader opens the FIFO first (the launcher waits for its "ready"),
+#     so the launcher's write-only open does not block, and the reader
+#     ignores end-of-file: it stops only when the launcher process is gone,
+#     after draining what is left.  pasta keeps descriptors 0-2 across its
+#     own sandboxing (it closes from 3 up).
+#   - It never blocks pasta: if the tool dies it goes on reading and drops the
+#     lines.
+#   - pasta's startup lines would otherwise print on the terminal; the relay
+#     prints a marker on the FIFO and then reopens the user's stderr by path
+#     (a terminal or a file), or through a second FIFO that the supervisor
+#     copies to it (a pipe).  If pasta exits before the marker (a failed
+#     start), the reader prints its lines on the terminal, so its errors are
+#     not lost.
+# slirp4netns has no flow log, so with it the records are the start, the end
+# and the DNS relay's lookups -- which are then the only account of what the
+# sandbox reached for, and the reason the relay is not left to pasta.  The
+# FIFO, the reader and the marker work as above, with the identity mapper
+# (_NET_NS_IDENTITY) in pasta's place as the launcher's exec and as the
+# writer of whatever is said before the marker.  With --share-net there is
+# no namespace to relay in: only start and end are written and the
+# supervisor just waits for the end.
+
+_NET_LOG_TAG="bwrap-net"
+# Condenser and DNS relay (lib/bwrap_netlog.py), and the relay's address in
+# the sandbox's network namespace.
+_NET_LOG_HELPER="${BASH_SOURCE[0]%/*}/bwrap_netlog.py"
+_NET_LOG_PY=""
+_NET_DNS_RELAY=0
+_NET_DNS_RELAY_ADDR="127.53.0.1"
+_NET_DNS_RELAY_PORT=53
+# The DNS relay's sockets when they must be bound before the exec chain (see
+# _NET_NS_IDENTITY).  Fixed numbers just below the slirp4netns launch
+# descriptors; _bwrap_fd_* allocates below them.
+_NET_FD_DNS_UDP=88
+_NET_FD_DNS_TCP=89
+# 1 when the log needs the FIFO, the supervisor and the condenser: pasta's
+# flow log, the DNS relay, or both.
+_NET_LOG_PIPE=0
+_NET_LOG_TOOL=""
+_NET_LOG_TOOLS=()
+_NET_LOG_SESSION=""
+_NET_LOG_FLOWS=0
+_NET_LOG_FIFO=""
+_NET_LOG_ERR_FIFO=""
+_NET_LOG_MARKER=""
+_NET_LOG_PASTA_VERSION=""
+
+# _net_log_detect
+#   List the usable logging tools, best first (_NET_LOG_TOOLS: systemd-cat
+#   when the journal's stream socket exists, logger when /dev/log does), set
+#   _NET_LOG_TOOL to the first (empty when none), choose
+#   the session id, and export BWRAP_SESSION.  Called by build_net_isolation.
+_net_log_detect() {
+    _NET_LOG_SESSION="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+    _NET_LOG_TOOLS=()
+    # A real launch also tries each tool without logging anything:
+    # systemd-cat connects to the journal before running `true`, and logger
+    # opens /dev/log before reading its (empty) input.
+    if command -v systemd-cat > /dev/null 2>&1 && [[ -S /run/systemd/journal/stdout ]] &&
+        { [[ "${DRY_RUN}" -eq 1 ]] || systemd-cat -t "${_NET_LOG_TAG}" true > /dev/null 2>&1; }; then
+        _NET_LOG_TOOLS+=(systemd-cat)
+    fi
+    if command -v logger > /dev/null 2>&1 && [[ -S /dev/log ]] &&
+        { [[ "${DRY_RUN}" -eq 1 ]] || logger --socket-errors=on -t "${_NET_LOG_TAG}" < /dev/null > /dev/null 2>&1; }; then
+        _NET_LOG_TOOLS+=(logger)
+    fi
+    _NET_LOG_TOOL="${_NET_LOG_TOOLS[0]:-}"
+    _NET_LOG_FLOWS=0
+    [[ -z "${_NET_LOG_TOOL}" || "${_NET_BACKEND}" != pasta ]] || _NET_LOG_FLOWS=1
+    # With Python the flow log is condensed (one line per open and close)
+    # and the DNS relay names the destinations; without it pasta's lines go
+    # to the log as they are.  The relay runs inside the sandbox's network
+    # namespace and forwards to whatever DNS the backend provides, so it is
+    # not pasta-only: with slirp4netns, which has no flow log, the lookups
+    # are the only record of what the sandbox reached for.
+    _NET_LOG_PY=""
+    _NET_DNS_RELAY=0
+    if [[ -n "${_NET_LOG_TOOL}" && "${_NET_PRIVATE}" -eq 1 && -r "${_NET_LOG_HELPER}" ]]; then
+        _NET_LOG_PY="$(_net_python)"
+        [[ -z "${_NET_LOG_PY}" ]] || _NET_DNS_RELAY=1
+    fi
+    _NET_LOG_PIPE=0
+    [[ "${_NET_LOG_FLOWS}" -eq 0 && "${_NET_DNS_RELAY}" -eq 0 ]] || _NET_LOG_PIPE=1
+    SANDBOX_ENV+=("BWRAP_SESSION=${_NET_LOG_SESSION}")
+}
+
+# _net_log_cmd
+#   Fill the array _NET_LOG_CMD with the command that writes its standard
+#   input to the system log, one record per line.
+_NET_LOG_CMD=()
+_net_log_cmd() {
+    case "${_NET_LOG_TOOL}" in
+        systemd-cat) _NET_LOG_CMD=(systemd-cat -t "${_NET_LOG_TAG}" -p info) ;;
+        logger) _NET_LOG_CMD=(logger --socket-errors=on -t "${_NET_LOG_TAG}" -p user.info --id="$$") ;;
+        *) _NET_LOG_CMD=() ;;
+    esac
+}
+
+# _net_log_record EVENT
+#   Print the session record for EVENT (start or end).
+_net_log_record() {
+    local _r _i _hp=""
+    _r="event=$1 session=${_NET_LOG_SESSION} launcher=${0##*/} user=${_USER:-$(id -un)} uid=$(id -u)"
+    _r+=" pid=$$ backend=${_NET_BACKEND}"
+    if [[ "$1" == start ]]; then
+        if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+            _r+=" flows=logged"
+        else
+            _r+=" flows=unavailable"
+        fi
+        if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+            _r+=" dns=logged"
+        else
+            _r+=" dns=unavailable"
+        fi
+        [[ -z "${_NET_LOG_PASTA_VERSION}" ]] || _r+=" pasta=${_NET_LOG_PASTA_VERSION}"
+        [[ -z "${_NET_PUBLISH_ADDR_EFFECTIVE}" ]] || _r+=" publish=${_NET_PUBLISH_ADDR_EFFECTIVE}:$(_net_join ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"})"
+        for _i in ${NET_HOST_PORTS[@]+"${NET_HOST_PORTS[@]}"}; do _hp+="${_hp:+,}${_i}"; done
+        [[ -z "${_hp}" ]] || _r+=" host_ports=${_hp}"
+        _r+=" dir=${PWD}"
+    fi
+    printf '%s\n' "${_r}"
+}
+
+# _net_log_start
+#   Called by launch_sandbox just before it execs: write the start record
+#   (which checks the tool; without one, warn and log nothing), then with
+#   pasta add --debug and the stderr hand-over, and start the reader (the
+#   condenser, or without Python the supervisor), waiting until it has the
+#   FIFO open.
+_net_log_start() {
+    local _err _launcher="${0##*/}" _t _ready _rfd
+    local -a _relay_orig=()
+    _NET_LOG_TOOL=""
+    if [[ "${_NET_BACKEND}" == pasta ]]; then
+        _NET_LOG_PASTA_VERSION="$("${_PASTA_BIN}" --version 2> /dev/null | awk 'NR == 1 { print $2 }' || true)"
+    fi
+    for _t in ${_NET_LOG_TOOLS[@]+"${_NET_LOG_TOOLS[@]}"}; do
+        _NET_LOG_TOOL="${_t}"
+        _net_log_cmd
+        if _net_log_record start | "${_NET_LOG_CMD[@]}" > /dev/null 2>&1; then
+            break
+        fi
+        _NET_LOG_TOOL=""
+    done
+    if [[ -z "${_NET_LOG_TOOL}" ]]; then
+        _NET_DNS_RELAY=0
+        printf 'Warning: %s: neither systemd-cat (journal) nor logger (/dev/log) can write to the system log;\n' "${_launcher}" >&2
+        printf '         this network session is not logged.\n' >&2
+        _NET_LOG_TOOL=""
+        _NET_LOG_FLOWS=0
+        _NET_LOG_PY=""
+        return 0
+    fi
+    if [[ -t 2 ]]; then
+        printf '%s: network log: %s, tag %s, session %s\n' "${_launcher}" \
+            "$([[ "${_NET_LOG_TOOL}" == systemd-cat ]] && echo journal || echo syslog)" \
+            "${_NET_LOG_TAG}" "${_NET_LOG_SESSION}" >&2
+    fi
+
+    if [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
+        _net_session_dir
+        _NET_LOG_FIFO="${_NET_SESSION_DIR}/netlog"
+        mkfifo -m 0600 "${_NET_LOG_FIFO}"
+        _NET_LOG_MARKER="bwrap-net relay started ${_NET_LOG_SESSION}"
+        if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+            local _i
+            for _i in "${!PASTA_ARGS[@]}"; do
+                [[ "${PASTA_ARGS[${_i}]}" != --quiet ]] || unset 'PASTA_ARGS[_i]'
+            done
+            PASTA_ARGS=("${PASTA_ARGS[@]}" --debug)
+        fi
+        # The relay restores the user's stderr: by path when it is a terminal
+        # or a file, else through a FIFO the reader copies.
+        _err="$(readlink "/proc/$$/fd/2" 2> /dev/null || true)"
+        if [[ "${_err}" != /* || "${_err}" == *" (deleted)" ]] ||
+            { [[ ! -c "${_err}" && ! -f "${_err}" ]]; }; then
+            _NET_LOG_ERR_FIFO="${_NET_SESSION_DIR}/stderr"
+            mkfifo -m 0600 "${_NET_LOG_ERR_FIFO}"
+            _err="${_NET_LOG_ERR_FIFO}"
+        fi
+        # Kept so that a reader that fails to start can undo the hand-over.
+        _relay_orig=(${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
+        local -a _pre=(2 note "${_NET_LOG_MARKER}")
+        if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+            # The DNS relay, started by the descriptor relay in the sandbox's
+            # network namespace (outside bwrap), logs on the same FIFO and
+            # forwards to the backend's own DNS address.  Under pasta it
+            # binds port 53 itself; under slirp4netns the exec chain has no
+            # capabilities, so it takes the sockets _NET_NS_IDENTITY bound.
+            local _udp=- _tcp=-
+            if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+                _udp="${_NET_FD_DNS_UDP}"
+                _tcp="${_NET_FD_DNS_TCP}"
+            fi
+            _pre+=(2 spawn "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}" "${_udp}" "${_tcp}")
+        fi
+        _BWRAP_FD_RELAY=("${_pre[@]}" 2 append "${_err}" ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"})
+    fi
+
+    if [[ "${_NET_LOG_PIPE}" -eq 1 && -n "${_NET_LOG_PY}" ]]; then
+        # The condenser reads the FIFO: pasta's flows, the DNS relay's
+        # lookups, or both.  It says "ready" on descriptor 3 once it has it
+        # open, so that nothing written to it is lost; its stderr is the
+        # user's, for what the backend said if the start fails.
+        local -a _cond=("${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense
+            --session "${_NET_LOG_SESSION}" --dns-forward "${_NET_DNS_FORWARD_ADDR}"
+            --fifo "${_NET_LOG_FIFO}" --parent "$$" --marker "${_NET_LOG_MARKER}"
+            --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}"
+            --backend "${_NET_BACKEND}")
+        [[ -z "${_NET_LOG_ERR_FIFO}" ]] || _cond+=(--stderr-fifo "${_NET_LOG_ERR_FIFO}")
+        exec {_rfd}< <(exec setsid "${_cond[@]}" -- "${_NET_LOG_CMD[@]}" 3>&1 > /dev/null < /dev/null)
+        IFS= read -r -t 10 _ready <&"${_rfd}" || _ready=""
+        exec {_rfd}<&-
+        if [[ "${_ready}" != ready ]]; then
+            printf 'Warning: %s: the network log condenser did not start; connections and\n' "${_launcher}" >&2
+            printf '         lookups are not logged for this session.\n' >&2
+            # Keep the backend's stderr off a FIFO no one reads, and take
+            # back the relay's hand-over: with no FIFO its marker, and the
+            # DNS relay's lines, would land on the user's terminal.
+            _NET_LOG_FIFO=""
+            _NET_LOG_FLOWS=0
+            _NET_DNS_RELAY=0
+            _NET_LOG_PIPE=0
+            _BWRAP_FD_RELAY=(${_relay_orig[@]+"${_relay_orig[@]}"})
+            # No reader is left to remove the session directory, and its
+            # FIFOs would make it look owned (see _net_slirp_start): remove
+            # it now; slirp4netns makes a fresh one if it needs one.
+            rm -rf -- "${_NET_SESSION_DIR}"
+            _NET_SESSION_DIR=""
+            _NET_LOG_ERR_FIFO=""
+        fi
+        return 0
+    fi
+    _net_log_supervisor &
+}
+
+# _net_log_supervisor
+#   The background half of the network log without Python (see "Network
+#   log"): copies pasta's lines as they are, prefixed with the session, or
+#   without pasta just waits for the end.  Runs in a subshell; $$ is still
+#   the launcher, which is pasta (or bwrap) by then.
+_net_log_supervisor() {
+    local _sink _prefix _fifo _line="" _part="" _rc _started=0 _dead=0 _bridge="" _i
+    local -a _early=()
+    set +e
+    # Signals meant for the session (Ctrl-C, a hangup, `kill` of its process
+    # group) must not cost the end record: the supervisor ends by itself once
+    # the launcher has gone.
+    trap '' INT QUIT TSTP HUP TERM PIPE
+    exec < /dev/null > /dev/null
+    exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
+    _prefix="session=${_NET_LOG_SESSION} "
+
+    if [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
+        # Read-write, so end-of-file is never seen before pasta writes.  This
+        # descriptor is the supervisor's alone; the launcher's own hold on
+        # the FIFO is closed before it execs pasta (see launch_sandbox).
+        # Without Python there is no DNS relay, so here the FIFO only ever
+        # carries pasta's flows.
+        exec {_fifo}<> "${_NET_LOG_FIFO}"
+        if [[ -n "${_NET_LOG_ERR_FIFO}" ]]; then
+            cat < "${_NET_LOG_ERR_FIFO}" >&2 &
+            _bridge=$!
+        fi
+        while :; do
+            # Poll faster until the sandbox has started, so a failed pasta
+            # start is reported promptly.
+            IFS= read -r -t "$([[ "${_started}" -eq 1 ]] && echo 1 || echo 0.1)" _line <&"${_fifo}"
+            _rc=$?
+            if ((_rc > 128)); then
+                # Timeout; a partial line stays in _line.
+                _part+="${_line}"
+                _net_launcher_alive || break
+                continue
+            fi
+            _line="${_part}${_line}"
+            _part=""
+            if [[ "${_started}" -eq 0 ]]; then
+                if [[ "${_line}" == "${_NET_LOG_MARKER}" ]]; then
+                    _started=1
+                    _early=()
+                    continue
+                fi
+                [[ ${#_early[@]} -ge 200 ]] || _early+=("${_line}")
+            fi
+            if [[ "${_dead}" -eq 0 ]] &&
+                ! printf '%s%s\n' "${_prefix}" "${_line}" 1>&"${_sink}" 2> /dev/null; then
+                _dead=1
+            fi
+        done
+        # pasta has exited: drain what it left in the pipe.
+        while IFS= read -r -t 0.2 _line <&"${_fifo}"; do
+            [[ "${_dead}" -eq 1 ]] ||
+                printf '%s%s\n' "${_prefix}" "${_part}${_line}" 1>&"${_sink}" 2> /dev/null || _dead=1
+            _part=""
+        done
+        exec {_fifo}<&-
+        if [[ "${_started}" -eq 0 ]]; then
+            # The namespace stopped before starting the sandbox: show what it
+            # said (pasta's own messages, or the descriptor relay's).
+            for _line in ${_early[@]+"${_early[@]}"}; do
+                printf '%s: %s: %s\n' "${0##*/}" "${_NET_BACKEND}" "${_line}" >&2
+            done
+        fi
+        if [[ -n "${_bridge}" ]]; then
+            for ((_i = 0; _i < 50; _i++)); do
+                kill -0 "${_bridge}" 2> /dev/null || break
+                sleep 0.1
+            done
+            kill "${_bridge}" 2> /dev/null
+        fi
+    else
+        while _net_launcher_alive; do
+            sleep 1
+        done
+    fi
+    if [[ "${_dead}" -eq 0 ]]; then
+        _net_log_record end 1>&"${_sink}" 2> /dev/null
+    fi
+    exec {_sink}>&-
+    [[ -z "${_NET_SESSION_DIR}" ]] || rm -rf "${_NET_SESSION_DIR}"
+    exit 0
+}
+
+# _net_log_context_text
+#   Set _NET_LOG_CTX to the context file's paragraph about the network log,
+#   empty when no logging tool is available.
+_NET_LOG_CTX=""
+_net_log_context_text() {
+    _NET_LOG_CTX=""
+    [[ -n "${_NET_LOG_TOOL}" ]] || return 0
+    _NET_LOG_CTX="The host records this network session in its system log (tag \`${_NET_LOG_TAG}\`, session \`${_NET_LOG_SESSION}\`, also in \`BWRAP_SESSION\`)"
+    if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        _NET_LOG_CTX+=", with every connection pasta makes for it"
+        [[ "${_NET_DNS_RELAY}" -ne 1 ]] || _NET_LOG_CTX+=" and every name it looks up"
+    elif [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+        _NET_LOG_CTX+=", with every name it looks up (${_NET_BACKEND} has no flow log, so connections are not recorded)"
+    fi
+    _NET_LOG_CTX+=". The sandbox cannot read or change that log."$'\n\n'
+}
+
+# _net_log_print_dry_run
+#   Describe the network log as comments for --dry-run.
+_net_log_print_dry_run() {
+    _net_log_cmd
+    printf '\n# Network log: '
+    if [[ -z "${_NET_LOG_TOOL}" ]]; then
+        printf 'neither systemd-cat (journal) nor logger (/dev/log) is available;\n'
+        printf '# a real launch warns and logs nothing.\n'
+        return 0
+    fi
+    printf 'the launcher writes the start record (session %s) with\n#   %s\n' \
+        "${_NET_LOG_SESSION}" "${_NET_LOG_CMD[*]}"
+    if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        printf '# and pasta gets --debug (not --quiet) with its stderr on <session dir>/netlog,\n'
+        printf '# a FIFO; the relay first reopens your stderr.  The end record is written when\n'
+        printf '# pasta exits.\n'
+    elif [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
+        printf '# and the launcher'"'"'s stderr goes to <session dir>/netlog, a FIFO, until the\n'
+        printf '# relay reopens yours (%s has no flow log: the FIFO carries the DNS relay'"'"'s\n' "${_NET_BACKEND}"
+        printf '# lines).  The end record is written when the sandbox exits.\n'
+    else
+        printf '# and a supervisor writes the end record when the sandbox exits (no flow log\n'
+        printf '# with %s).\n' "${_NET_BACKEND}"
+    fi
+    if [[ "${_NET_LOG_PIPE}" -eq 1 && -n "${_NET_LOG_PY}" ]]; then
+        printf '# The FIFO is read, and the lines condensed (one per connection opened and\n'
+        printf '# closed, one per lookup), by\n'
+        printf '#   %s -I %s condense --fifo <session dir>/netlog ...\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}"
+    elif [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
+        printf '# A supervisor copies each line to the log as it is.\n'
+    fi
+    if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+        printf '# The descriptor relay starts the DNS relay on %s:%s in the namespace:\n' \
+            "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_RELAY_PORT}"
+        if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+            printf '#   %s -I %s dns %s %s <relay pid> %s %s\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
+                "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}" "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
+            printf '# on the sockets descriptors %s and %s already hold: the namespace maps your own\n' \
+                "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
+            printf '# uid, so nothing after the exec can bind port %s and they are bound before it.\n' "${_NET_DNS_RELAY_PORT}"
+        else
+            printf '#   %s -I %s dns %s %s <relay pid> - -\n' "${_NET_LOG_PY}" "${_NET_LOG_HELPER}" \
+                "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_EFFECTIVE}"
+        fi
+    fi
+}
+
+# ── slirp4netns backend ──────────────────────────────────────────
+# Used when pasta is not usable (RHEL 8 has slirp4netns but no passt).
+# slirp4netns cannot start the command itself; it attaches to an existing
+# network namespace.  The launch therefore has two steps, while the launcher
+# still execs in the foreground (so the tty, job control, exit status and
+# --die-with-parent are unchanged):
+#
+#   launcher ─┬─ helper (background subshell, _net_slirp_helper)
+#             │    waits until the launcher's pid ($$) is in its new network
+#             │    namespace, starts `setsid slirp4netns ... $$ tap0`, waits
+#             │    for it to be ready, adds the --publish forwards through its
+#             │    API socket, then releases the sandbox (--block-fd) and exits
+#             └─ exec env -i ... python -I -c <_NET_NS_IDENTITY>
+#                  [--dns 127.53.0.1 53 88 89] --
+#                  bash <fd relay> -- bwrap --unshare-user --uid U --gid G
+#                  --info-fd 90 --block-fd 91 --sync-fd 92 ... -- tool
+#
+# With the network log's DNS relay the mapper also raises loopback and binds
+# the relay's sockets on descriptors 88 and 89 before it execs, because after
+# the exec nothing holds the capability to bind port 53 (see
+# _NET_NS_IDENTITY); the descriptor relay then starts the relay on them.
+#
+# On a failure the helper kills the still-blocked sandbox (its pid comes
+# from --info-fd) and then bwrap: bwrap's --die-with-parent refers to the
+# user's shell, so killing bwrap alone would leave the sandbox, which the
+# closed --block-fd would then release.
+#
+# The namespaces come from the launcher itself (_NET_NS_IDENTITY), not from
+# bwrap's --unshare-net: bwrap mounting /dev (devpts) puts the sandbox in a
+# second user namespace nested in the one that owns the network namespace,
+# and slirp4netns, which joins the target process's user namespace, would
+# then have no rights over the network.  Unsharing in the launcher leaves its
+# own process holding a single-level user namespace that owns the network
+# namespace.  The real uid and gid are mapped to themselves there, so bwrap's
+# --unshare-user --uid/--gid are the ids the sandbox already has.
+#
+# The tool does not start before the network is ready.  slirp4netns runs in
+# its own session (Ctrl-C does not reach it) with a scrubbed environment, and
+# its --exit-fd is the read end of bwrap's --sync-fd pipe, so it exits with
+# the sandbox.  Settings:
+#   --disable-host-loopback  mandatory: otherwise the gateway (.2) reaches the
+#                            host's 127.0.0.1 on every port.
+#   built-in DNS (.3)        forwarded to the host's first nameserver, port 53
+#                            only (libslirp >= 4.3.0, checked), so a loopback
+#                            resolver such as systemd-resolved keeps working.
+#   --cidr                   192.168.254.0/24 (BNL uses 10/8, slirp's default
+#                            range); sandbox .100, gateway .2, DNS .3.
+#   --enable-seccomp         as podman does, when /etc/resolv.conf resolves
+#                            inside /etc or /run (the condition this launcher
+#                            set for --enable-sandbox and --enable-seccomp
+#                            together, kept as it was).
+#   --enable-sandbox         only when the namespace maps uid 0, which this
+#                            launcher's does not; see _NET_NS_ROOT_MAPPED.
+# --publish works through the API socket (add_hostfwd, IPv4 TCP, one port per
+# request); --host-port has no slirp4netns equivalent.
+
+_SLIRP_BIN=""
+_SLIRP_ARGS=()
+_NET_SLIRP_NET="192.168.254"
+_NET_SLIRP_CIDR="${_NET_SLIRP_NET}.0/24"
+_NET_SLIRP_DNS="${_NET_SLIRP_NET}.3"
+# "HOSTADDR,HOSTPORT,SANDBOXPORT" for each published port; at most
+# _NET_SLIRP_MAX_FWDS (one API request each).
+_NET_SLIRP_FWDS=()
+_NET_SLIRP_MAX_FWDS=64
+_NET_SLIRP_DIR=""
+_NET_PY_BIN=""
+# Descriptors of the two-step launch.  bwrap gets 90-92; the helper keeps
+# 93-99.  The descriptor relay's numbers stay below 90.
+_NET_FD_INFO_W=90
+_NET_FD_BLOCK_R=91
+_NET_FD_SYNC_W=92
+_NET_FD_INFO_R=93
+_NET_FD_BLOCK_W=94
+_NET_FD_SYNC_R=95
+_NET_FD_READY_W=96
+_NET_FD_READY_R=97
+_NET_FD_LOG_W=98
+_NET_FD_LOG_R=99
+
+# The API client: one add_hostfwd request per argument "ADDR,HOSTPORT,PORT".
+_NET_SLIRP_API_CLIENT='
+import json, socket, sys
+path = sys.argv[1]
+for spec in sys.argv[2:]:
+    addr, hport, gport = spec.split(",")
+    req = {"execute": "add_hostfwd", "arguments": {"proto": "tcp",
+           "host_addr": addr, "host_port": int(hport), "guest_port": int(gport)}}
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(path)
+    s.sendall(json.dumps(req).encode())
+    s.shutdown(socket.SHUT_WR)
+    data = b""
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    try:
+        reply = json.loads(data.decode() or "{}")
+    except ValueError:
+        reply = {"error": data.decode(errors="replace")}
+    if "return" not in reply:
+        sys.exit("%s:%s -> sandbox port %s: %s" % (addr, hport, gport, reply.get("error", reply)))
+'
+
+# Whether the namespace the launcher builds maps uid and gid 0.  It does not:
+# it maps the real uid and gid to themselves (_NET_NS_IDENTITY).  Without
+# privilege a process may write a single line to uid_map, mapping its own
+# effective uid (user_namespaces(7)), so the map holds uid 0 or the real uid,
+# not both.  Seen on RHEL 8.10 (bubblewrap 0.4.0, slirp4netns 1.2.3):
+#
+#   map 0 only          bwrap --unshare-user --uid <real uid> stops with
+#                       "unable to drop root uid: Invalid argument" (0.4.0's
+#                       drop_privs() calls setuid() when geteuid() == 0, and
+#                       the real uid is not mapped: EINVAL)
+#   map the real id     bwrap starts and the sandbox runs as the real uid;
+#                       slirp4netns --enable-sandbox stops at setegid(0)
+#                       ("parent failed"), so it is not passed
+#
+# --enable-sandbox is what slirp4netns describes as "create a new mount
+# namespace (and drop all caps except CAP_NET_BIND_SERVICE if running as the
+# root)".  --enable-seccomp is a separate option (slirp4netns.c applies the two
+# independently) and is still passed; launches with it work under this map.
+_NET_NS_ROOT_MAPPED=0
+
+# The identity mapper, which replaces `unshare --user --map-root-user --net`:
+# unshare a user and a network namespace, map the real uid and gid to
+# themselves, then exec the rest of the argument list.  Writing a single-line
+# map of one's own id needs no helper (no newuidmap, no /etc/subuid).  The
+# unshare on these hosts documents --map-root-user and no option that maps
+# one's own uid (its man page), so the launcher does this itself.
+#
+# It does not fork, so the launcher keeps its pid: $$ is what the helper waits
+# for and what slirp4netns is pointed at.  slirp4netns joins this namespace
+# and configures tap0 in it (seen: "sent tapfd=5 for tap0" after --configure).
+#
+# Both ids must be read before the unshare; afterwards the process is the
+# overflow id (65534) and a map naming that id is refused with EPERM.
+#
+# With "--dns ADDR PORT UDPFD TCPFD" it also brings the namespace's loopback
+# up and binds the DNS relay's sockets, leaving them at UDPFD and TCPFD for
+# the relay that the descriptor relay spawns later.  That work has to happen
+# HERE, in this process, between the unshare and the exec:
+#
+#   - after the unshare this process has a full capability set in the
+#     namespace, including CAP_NET_ADMIN (loopback up) and
+#     CAP_NET_BIND_SERVICE (port 53);
+#   - after an execve the set was empty under this map (CapEff 0, bind to
+#     port 53 refused), while under a map of uid 0 it was kept.  pasta writes
+#     a map of uid 0 ("0 <uid> 1", pasta_start_ns), and there the relay binds
+#     for itself.
+#
+# A new network namespace starts with lo down.  slirp4netns brings lo up too
+# (configure_network), but only once it has started, after this exec.
+_NET_NS_IDENTITY='
+import ctypes, fcntl, os, socket, struct, sys
+CLONE_NEWUSER, CLONE_NEWNET = 0x10000000, 0x40000000
+SIOCSIFFLAGS, IFF_UP, IFF_RUNNING = 0x8914, 0x1, 0x40
+argv = sys.argv[1:]
+dns = None
+if argv[:1] == ["--dns"]:
+    dns, argv = (argv[1], int(argv[2]), int(argv[3]), int(argv[4])), argv[5:]
+cmd = argv[1:] if argv[:1] == ["--"] else argv
+uid, gid = os.getuid(), os.getgid()
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.unshare(CLONE_NEWUSER | CLONE_NEWNET) != 0:
+    sys.exit("netns: unshare failed: %s" % os.strerror(ctypes.get_errno()))
+try:
+    with open("/proc/self/setgroups", "w") as f:
+        f.write("deny")
+    with open("/proc/self/uid_map", "w") as f:
+        f.write("%d %d 1" % (uid, uid))
+    with open("/proc/self/gid_map", "w") as f:
+        f.write("%d %d 1" % (gid, gid))
+except OSError as e:
+    sys.exit("netns: writing the id maps failed: %s" % e)
+if dns is not None:
+    addr, port, udp_fd, tcp_fd = dns
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as c:
+            fcntl.ioctl(c, SIOCSIFFLAGS, struct.pack("16sh22x", b"lo", IFF_UP | IFF_RUNNING))
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.bind((addr, port))
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp.bind((addr, port))
+        tcp.listen(16)
+        os.dup2(udp.fileno(), udp_fd)  # dup2 inherits across the exec
+        os.dup2(tcp.fileno(), tcp_fd)
+    except OSError as e:
+        sys.exit("netns: DNS relay sockets (%s:%d) failed: %s" % (addr, port, e))
+os.execvp(cmd[0], cmd)
+'
+
+# _net_python
+#   Print the Python used by the network helpers (RHEL 8's platform-python,
+#   else python3), nothing when there is none.  They need the standard
+#   library of Python 3.6 or later only.
+_net_python() {
+    local _p
+    for _p in /usr/libexec/platform-python "$(command -v python3 2> /dev/null || true)"; do
+        if [[ -n "${_p}" && -x "${_p}" ]]; then
+            printf '%s' "${_p}"
+            return 0
+        fi
+    done
+}
+
+# _net_try_slirp
+#   Return 0 when slirp4netns can be used (set _SLIRP_BIN, _SLIRP_ARGS and
+#   _NET_PY_BIN), else 1 with the reason in _NET_TRY_REASON.
+#   There is no test run (it would need a second sandbox); a failure at
+#   launch stops the sandbox before the tool starts (see _net_slirp_helper).
+_net_try_slirp() {
+    local _out _sver="" _lver="" _resolv _n
+    _NET_TRY_REASON=""
+    _SLIRP_BIN="$(command -v slirp4netns 2> /dev/null || true)"
+    if [[ -z "${_SLIRP_BIN}" || ! -x "${_SLIRP_BIN}" ]]; then
+        _NET_TRY_REASON="not found on PATH (package slirp4netns)"
+        return 1
+    fi
+    # Python creates the namespaces (_NET_NS_IDENTITY) and, for --publish,
+    # drives the API socket.  Needed for every launch, not only --publish.
+    _NET_PY_BIN="$(_net_python)"
+    if [[ -z "${_NET_PY_BIN}" ]]; then
+        _NET_TRY_REASON="needs python3 (or /usr/libexec/platform-python) to create the namespaces"
+        return 1
+    fi
+    if ! _out="$("${_SLIRP_BIN}" --version 2>&1)"; then
+        _NET_TRY_REASON="'slirp4netns --version' failed"
+        return 1
+    fi
+    [[ ! "${_out}" =~ slirp4netns\ version\ ([0-9][0-9.]*) ]] || _sver="${BASH_REMATCH[1]}"
+    [[ ! "${_out}" =~ libslirp:\ ([0-9][0-9.]*) ]] || _lver="${BASH_REMATCH[1]}"
+    if [[ -z "${_sver}" ]] || ! _version_ge "${_sver}" 0.4.0; then
+        _NET_TRY_REASON="version ${_sver:-unknown} is too old (0.4.0 or later is needed)"
+        return 1
+    fi
+    # Before libslirp 4.3.0 the DNS address forwarded every port to the host's
+    # resolver address, which is often on loopback.
+    if [[ -z "${_lver}" ]] || ! _version_ge "${_lver}" 4.3.0; then
+        _NET_TRY_REASON="libslirp ${_lver:-version unknown} is too old (4.3.0 or later is needed)"
+        return 1
+    fi
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        if [[ ! -c /dev/net/tun ]]; then
+            _NET_TRY_REASON="/dev/net/tun is missing on the host"
+            return 1
+        fi
+        _n="$(cat /proc/sys/user/max_user_namespaces 2> /dev/null || echo 1)"
+        if [[ "${_n}" == 0 ]]; then
+            _NET_TRY_REASON="unprivileged user namespaces are disabled (user.max_user_namespaces = 0)"
+            return 1
+        fi
+    fi
+    _SLIRP_ARGS=(
+        --configure
+        --mtu=65520
+        --disable-host-loopback
+        --cidr="${_NET_SLIRP_CIDR}"
+    )
+    _resolv="$(readlink -f /etc/resolv.conf 2> /dev/null || true)"
+    if [[ "${_resolv}" == /etc/* || "${_resolv}" == /run/* ]]; then
+        _SLIRP_ARGS+=(--enable-seccomp)
+        # --enable-sandbox only with a namespace that maps uid 0; see
+        # _NET_NS_ROOT_MAPPED.  --enable-seccomp has no such requirement
+        # (slirp4netns.c: create_sandbox and enable_seccomp are independent).
+        [[ "${_NET_NS_ROOT_MAPPED}" -ne 1 ]] || _SLIRP_ARGS+=(--enable-sandbox)
+    fi
+    return 0
+}
+
+# _net_slirp_publish_fwds
+#   Fill _NET_SLIRP_FWDS from NET_PUBLISH and the publish address, one entry
+#   per port.  Exit 1 above _NET_SLIRP_MAX_FWDS ports.
+_net_slirp_publish_fwds() {
+    local _spec _h _g _hlo _hhi _glo _p
+    _NET_SLIRP_FWDS=()
+    for _spec in ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"}; do
+        _h="${_spec%%:*}"
+        _g="${_spec#*:}"
+        _hlo="${_h%-*}"
+        _hhi="${_h#*-}"
+        _glo="${_g%-*}"
+        for ((_p = _hlo; _p <= _hhi; _p++)); do
+            if [[ ${#_NET_SLIRP_FWDS[@]} -ge ${_NET_SLIRP_MAX_FWDS} ]]; then
+                echo "Error: --publish: at most ${_NET_SLIRP_MAX_FWDS} ports can be published with slirp4netns." >&2
+                exit 1
+            fi
+            _NET_SLIRP_FWDS+=("${_NET_PUBLISH_ADDR_EFFECTIVE},${_p},$((_glo + _p - _hlo))")
+        done
+    done
+}
+
+# _net_slirp_start
+#   Called by launch_sandbox just before it execs bwrap: create the pipes
+#   (FIFOs in a private session directory, removed once open), start the
+#   helper in the background and close the helper's descriptors in the
+#   launcher.
+_net_slirp_start() {
+    local _f
+    _net_session_dir
+    if [[ -n "${_NET_LOG_FIFO}" ]]; then
+        # The network log owns the session directory (its FIFOs are there,
+        # and its reader removes the directory when the session ends), so
+        # the pipes get a directory of their own: the rmdir below and the
+        # helper's rm -rf must not take the log's FIFOs with them.
+        _NET_SLIRP_DIR="${_NET_SESSION_DIR}/slirp"
+        mkdir -m 0700 -- "${_NET_SLIRP_DIR}"
+    else
+        _NET_SLIRP_DIR="${_NET_SESSION_DIR}"
+    fi
+    for _f in info block sync ready; do
+        mkfifo -m 0600 "${_NET_SLIRP_DIR}/${_f}"
+    done
+    # Each FIFO is opened read-write first, so the read-only open after it
+    # does not block.
+    exec 90<> "${_NET_SLIRP_DIR}/info"
+    exec 93< "${_NET_SLIRP_DIR}/info"
+    exec 94<> "${_NET_SLIRP_DIR}/block"
+    exec 91< "${_NET_SLIRP_DIR}/block"
+    exec 92<> "${_NET_SLIRP_DIR}/sync"
+    exec 95< "${_NET_SLIRP_DIR}/sync"
+    exec 96<> "${_NET_SLIRP_DIR}/ready"
+    exec 97< "${_NET_SLIRP_DIR}/ready"
+    # noclobber: the log is a new file, never an existing one.
+    set -o noclobber
+    exec 98> "${_NET_SLIRP_DIR}/log"
+    set +o noclobber
+    exec 99< "${_NET_SLIRP_DIR}/log"
+    rm -f "${_NET_SLIRP_DIR}/info" "${_NET_SLIRP_DIR}/block" "${_NET_SLIRP_DIR}/sync" \
+        "${_NET_SLIRP_DIR}/ready" "${_NET_SLIRP_DIR}/log"
+    if [[ ${#_NET_SLIRP_FWDS[@]} -eq 0 ]]; then
+        rmdir "${_NET_SLIRP_DIR}"
+    fi
+
+    _net_slirp_helper &
+    exec 93<&- 94>&- 95<&- 96>&- 97<&- 98>&- 99<&-
+}
+
+# _net_slirp_helper
+#   The background half of the two-step launch (see "slirp4netns backend").
+#   Runs in a subshell; $$ is still the launcher, which is bwrap by then.
+#   _ENV_BIN is launch_sandbox's local (bash scoping is dynamic).
+_net_slirp_helper() {
+    local _own _ns="" _map="" _pid="$$" _r="" _rc _out _i
+    local -a _api=()
+    set +e
+    exec 90>&- 91<&- 92>&-
+    trap '' INT QUIT TSTP
+
+    # Wait (up to 10 s) until the launcher process has run unshare: a network
+    # namespace of its own, with the uid map written.
+    _own="$(readlink /proc/self/ns/net)"
+    for ((_i = 0; _i < 500; _i++)); do
+        _net_launcher_alive || _net_slirp_quit
+        _ns="$(readlink "/proc/${_pid}/ns/net" 2> /dev/null)"
+        _map="$(cat "/proc/${_pid}/uid_map" 2> /dev/null)"
+        [[ -z "${_ns}" || "${_ns}" == "${_own}" || -z "${_map}" ]] || break
+        sleep 0.02
+    done
+    if [[ -z "${_ns}" || "${_ns}" == "${_own}" || -z "${_map}" ]]; then
+        _net_slirp_fail "the sandbox did not get its network namespace"
+    fi
+
+    [[ ${#_NET_SLIRP_FWDS[@]} -eq 0 ]] || _api=(--api-socket="${_NET_SLIRP_DIR}/api.sock")
+    _net_slirp_run "${_pid}" ${_api[@]+"${_api[@]}"} > /dev/null 2>&98 93<&- 94>&- 97<&- 99<&- &
+    exec 95<&- 96>&- 98>&-
+
+    # Wait (up to 30 s) for slirp4netns; stop waiting if the launcher is gone.
+    for ((_i = 0; _i < 30; _i++)); do
+        IFS= read -r -t 1 -n 1 _r <&97
+        _rc=$?
+        ((_rc > 128)) || break
+        _net_launcher_alive || _net_slirp_quit
+    done
+    if [[ "${_r}" != 1 ]]; then
+        _net_slirp_fail "slirp4netns did not become ready"
+    fi
+    if [[ ${#_NET_SLIRP_FWDS[@]} -gt 0 ]]; then
+        if ! _out="$("${_NET_PY_BIN}" -I -c "${_NET_SLIRP_API_CLIENT}" \
+            "${_NET_SLIRP_DIR}/api.sock" "${_NET_SLIRP_FWDS[@]}" 2>&1)"; then
+            _net_slirp_fail "publishing a port failed: ${_out##*$'\n'}"
+        fi
+        rm -rf "${_NET_SLIRP_DIR}"
+    fi
+    printf 1 >&94
+    exit 0
+}
+
+# _net_slirp_run PID [--api-socket=PATH]
+#   Exec slirp4netns for the network namespace of PID, in its own session,
+#   with a scrubbed environment and default signal handling.  Run by
+#   _net_slirp_helper in the background.
+_net_slirp_run() {
+    local _pid="$1"
+    shift
+    trap - INT QUIT TSTP
+    exec setsid "${_ENV_BIN}" -i PATH=/usr/bin:/bin \
+        "${_SLIRP_BIN}" "${_SLIRP_ARGS[@]}" \
+        --ready-fd=96 --exit-fd=95 "$@" "${_pid}" tap0
+}
+
+# _net_ppid PID
+#   Print the parent pid of PID (from /proc/PID/stat; empty when PID is gone).
+_net_ppid() {
+    local _st _f
+    IFS= read -r _st 2> /dev/null < "/proc/$1/stat" || return 0
+    # Fields after the command name, which may contain spaces: state ppid ...
+    read -r -a _f <<< "${_st##*) }"
+    printf '%s' "${_f[1]}"
+}
+
+# _net_launcher_alive
+#   True while the calling helper's parent is still the launcher process
+#   ($$; it keeps that pid through exec).  While it is our parent the pid
+#   cannot have been reused, so it is safe to signal.  Once it has gone, we
+#   are re-parented and this is false.
+_net_launcher_alive() {
+    # BASHPID is read here: inside $(...) it would be the substitution's pid.
+    local _me="${BASHPID}"
+    [[ "$(_net_ppid "${_me}")" == "$$" ]]
+}
+
+# _net_slirp_quit
+#   The launcher is gone (unshare or the relay failed and has said why):
+#   clean up and exit without signalling anything.
+_net_slirp_quit() {
+    [[ -z "${_NET_SLIRP_DIR}" ]] || rm -rf "${_NET_SLIRP_DIR}"
+    exit 0
+}
+
+# _net_slirp_fail MESSAGE
+#   Report a failed network setup, kill the still-blocked sandbox (the tool
+#   has not started; its pid is read from bwrap's --info-fd) and then the
+#   launcher process ($$, by now bwrap), and exit the helper while it still
+#   holds the --block-fd pipe.  slirp4netns, if started, exits with bwrap
+#   (--exit-fd).  Only processes whose parent is checked are signalled: the
+#   sandbox must be a child of the launcher, the launcher still ours;
+#   otherwise (the launcher already gone) nothing is signalled.
+_net_slirp_fail() {
+    local _msg="$1" _info="" _line _child
+    _net_launcher_alive || _net_slirp_quit
+    printf '%s: network setup failed (slirp4netns): %s\n' "${0##*/}" "${_msg}" >&2
+    tail -n 5 <&99 2> /dev/null | sed 's/^/    /' >&2
+    printf '    The sandbox was stopped. Run with --share-net to start without network isolation.\n' >&2
+    while IFS= read -r -t 5 _line <&93; do
+        _info+="${_line}"
+        [[ "${_line}" != *"}"* ]] || break
+    done
+    if [[ "${_info}" =~ \"child-pid\":\ *([0-9]+) ]]; then
+        _child="${BASH_REMATCH[1]}"
+        if [[ "$(_net_ppid "${_child}")" == "$$" ]]; then
+            kill -KILL "${_child}" 2> /dev/null
+        fi
+    fi
+    if _net_launcher_alive; then
+        kill -KILL "$$" 2> /dev/null
+    fi
+    [[ -z "${_NET_SLIRP_DIR}" ]] || rm -rf "${_NET_SLIRP_DIR}"
+    exit 1
+}
+
+# _net_slirp_print_dry_run
+#   Describe the helper's part of the launch as comments for --dry-run.
+_net_slirp_print_dry_run() {
+    local _a _b _c _f
+    printf '\n# Network (slirp4netns): before exec, the launcher starts a helper that waits\n'
+    printf '# until the launcher pid is in the network namespace made by unshare, then runs\n'
+    printf '#   setsid env -i PATH=/usr/bin:/bin %s' "${_SLIRP_BIN}"
+    for _a in "${_SLIRP_ARGS[@]}"; do printf ' %s' "${_a}"; done
+    printf ' --ready-fd=%s --exit-fd=%s' "${_NET_FD_READY_W}" "${_NET_FD_SYNC_R}"
+    [[ ${#_NET_SLIRP_FWDS[@]} -eq 0 ]] || printf ' --api-socket=<private dir>/api.sock'
+    printf ' <launcher pid> tap0\n'
+    for _f in ${_NET_SLIRP_FWDS[@]+"${_NET_SLIRP_FWDS[@]}"}; do
+        IFS=, read -r _a _b _c <<< "${_f}"
+        printf '#   add_hostfwd tcp %s:%s -> sandbox port %s\n' "${_a}" "${_b}" "${_c}"
+    done
+    printf '# and writes to descriptor %s (bwrap --block-fd %s) to start the sandbox.\n' "${_NET_FD_BLOCK_W}" "${_NET_FD_BLOCK_R}"
+    printf '# On a failure it kills the sandbox (pid from bwrap --info-fd %s) before it starts.\n' "${_NET_FD_INFO_W}"
+    printf '# slirp4netns exits when bwrap closes descriptor %s (bwrap --sync-fd).\n' "${_NET_FD_SYNC_W}"
+}
+
+# _net_parse_range OPTION TEXT
+#   Parse N or LOW-HIGH (ports 1024-65535) into _NET_LO and _NET_HI.  Exit 1
+#   with a message naming OPTION otherwise.
+_NET_LO=0
+_NET_HI=0
+_net_parse_range() {
+    local _opt="$1" _t="$2"
+    if [[ ! "${_t}" =~ ^([0-9]{1,5})(-([0-9]{1,5}))?$ ]]; then
+        echo "Error: ${_opt}: '${_t}' is not a port or a LOW-HIGH port range." >&2
+        exit 1
+    fi
+    _NET_LO=$((10#${BASH_REMATCH[1]}))
+    _NET_HI="${_NET_LO}"
+    [[ -z "${BASH_REMATCH[3]}" ]] || _NET_HI=$((10#${BASH_REMATCH[3]}))
+    if [[ ${_NET_LO} -lt 1024 ]]; then
+        echo "Error: ${_opt}: port ${_t} is below 1024 (those ports need privileges); use 1024-65535." >&2
+        exit 1
+    fi
+    if [[ ${_NET_HI} -gt 65535 ]]; then
+        echo "Error: ${_opt}: port ${_t} is above 65535." >&2
+        exit 1
+    fi
+    if [[ ${_NET_HI} -lt ${_NET_LO} ]]; then
+        echo "Error: ${_opt}: port range ${_t} is empty (LOW must not exceed HIGH)." >&2
+        exit 1
+    fi
+}
+
+# _net_check_port_spec OPTION SPEC
+#   Validate PORTS[:SANDBOXPORTS].  Set _NET_SPEC to the normalised spec,
+#   _NET_A_LO/_NET_A_HI to the first part and _NET_B_LO/_NET_B_HI to the
+#   second (the same as the first when it is omitted).  Ranges on both sides
+#   must have the same length.
+_NET_SPEC=""
+_net_check_port_spec() {
+    local _opt="$1" _spec="$2" _a _b _na _nb
+    if [[ "${_spec}" == *:*:* ]]; then
+        echo "Error: ${_opt}: '${_spec}' has more than one ':' (expected PORT[:SANDBOXPORT])." >&2
+        exit 1
+    fi
+    _a="${_spec%%:*}"
+    _b="${_a}"
+    [[ "${_spec}" != *:* ]] || _b="${_spec#*:}"
+    _net_parse_range "${_opt}" "${_a}"
+    _NET_A_LO=${_NET_LO}
+    _NET_A_HI=${_NET_HI}
+    _net_parse_range "${_opt}" "${_b}"
+    _NET_B_LO=${_NET_LO}
+    _NET_B_HI=${_NET_HI}
+    if [[ $((_NET_A_HI - _NET_A_LO)) -ne $((_NET_B_HI - _NET_B_LO)) ]]; then
+        echo "Error: ${_opt}: the ranges in '${_spec}' have different lengths." >&2
+        exit 1
+    fi
+    _na="${_NET_A_LO}"
+    [[ ${_NET_A_HI} -eq ${_NET_A_LO} ]] || _na+="-${_NET_A_HI}"
+    _nb="${_NET_B_LO}"
+    [[ ${_NET_B_HI} -eq ${_NET_B_LO} ]] || _nb+="-${_NET_B_HI}"
+    _NET_SPEC="${_na}"
+    [[ "${_na}" == "${_nb}" ]] || _NET_SPEC+=":${_nb}"
+}
+
+# _net_check_overlap OPTION WHAT LO HI LOS_ARRAY HIS_ARRAY
+#   Exit 1 when LO-HI overlaps a range already accepted for OPTION.  WHAT
+#   names the side checked ("host port", "sandbox port").
+_net_check_overlap() {
+    local _opt="$1" _what="$2" _lo="$3" _hi="$4" _i _r="$3"
+    local -n _los="$5" _his="$6"
+    [[ ${_hi} -eq ${_lo} ]] || _r+="-${_hi}"
+    for _i in "${!_los[@]}"; do
+        if [[ ${_lo} -le ${_his[${_i}]} && ${_hi} -ge ${_los[${_i}]} ]]; then
+            echo "Error: ${_opt}: ${_what} ${_r} is given more than once." >&2
+            exit 1
+        fi
+    done
+}
+
+# net_add_publish SPEC
+#   --publish PORT[:SANDBOXPORT]: make sandbox port SANDBOXPORT (default PORT)
+#   reachable on the host at the session's publish address, port PORT.
+net_add_publish() {
+    _net_check_port_spec --publish "$1"
+    _net_check_overlap --publish "host port" "${_NET_A_LO}" "${_NET_A_HI}" _NET_PUB_LO _NET_PUB_HI
+    _net_check_sandbox_ports "${_NET_B_LO}" "${_NET_B_HI}" _NET_HP_LO _NET_HP_HI
+    _NET_PUB_LO+=("${_NET_A_LO}")
+    _NET_PUB_HI+=("${_NET_A_HI}")
+    _NET_PUBSBX_LO+=("${_NET_B_LO}")
+    _NET_PUBSBX_HI+=("${_NET_B_HI}")
+    NET_PUBLISH+=("${_NET_SPEC}")
+}
+
+# _net_check_sandbox_ports LO HI LOS HIS
+#   Exit 1 when sandbox ports LO-HI overlap a range in the arrays LOS/HIS:
+#   one sandbox port cannot both receive --publish and be held by pasta for
+#   --host-port.
+_net_check_sandbox_ports() {
+    local _lo="$1" _hi="$2" _i _r="$1"
+    local -n _los="$3" _his="$4"
+    [[ ${_hi} -eq ${_lo} ]] || _r+="-${_hi}"
+    for _i in "${!_los[@]}"; do
+        if [[ ${_lo} -le ${_his[${_i}]} && ${_hi} -ge ${_los[${_i}]} ]]; then
+            echo "Error: sandbox port ${_r} is used by both --publish and --host-port; give --host-port another sandbox port (PORT:SANDBOXPORT)." >&2
+            exit 1
+        fi
+    done
+}
+
+# net_add_host_port SPEC
+#   --host-port PORT[:SANDBOXPORT]: make the host's 127.0.0.1:PORT reachable in
+#   the sandbox at 127.0.0.1:SANDBOXPORT (default PORT), where pasta then holds
+#   the port.  Ports on the deny list (_NET_HOST_PORT_DENY) are refused.
+net_add_host_port() {
+    local _d _dlo _dhi
+    _net_check_port_spec --host-port "$1"
+    for _d in "${_NET_HOST_PORT_DENY[@]}"; do
+        _dlo="${_d%-*}"
+        _dhi="${_d#*-}"
+        if [[ ${_NET_A_LO} -le ${_dhi} && ${_NET_A_HI} -ge ${_dlo} ]]; then
+            echo "Error: --host-port: host port ${_d} is refused: the service there trusts every local client." >&2
+            exit 1
+        fi
+    done
+    _net_check_overlap --host-port "sandbox port" "${_NET_B_LO}" "${_NET_B_HI}" _NET_HP_LO _NET_HP_HI
+    _net_check_sandbox_ports "${_NET_B_LO}" "${_NET_B_HI}" _NET_PUBSBX_LO _NET_PUBSBX_HI
+    _NET_HP_LO+=("${_NET_B_LO}")
+    _NET_HP_HI+=("${_NET_B_HI}")
+    NET_HOST_PORTS+=("${_NET_SPEC}")
+}
+
+# _net_check_lo_addr OPTION ADDR
+#   Exit 1 unless ADDR is a dotted-quad address in 127.0.0.0/8 (not the
+#   network or broadcast address), written without leading zeros.
+_net_check_lo_addr() {
+    local _opt="$1" _addr="$2" _o='(0|[1-9][0-9]{0,2})' _i
+    if [[ ! "${_addr}" =~ ^127\.${_o}\.${_o}\.${_o}$ ]]; then
+        echo "Error: ${_opt}: '${_addr}' is not an IPv4 loopback address (127.x.y.z)." >&2
+        exit 1
+    fi
+    for _i in 1 2 3; do
+        if [[ ${BASH_REMATCH[${_i}]} -gt 255 ]]; then
+            echo "Error: ${_opt}: '${_addr}' is not a valid address." >&2
+            exit 1
+        fi
+    done
+    if [[ "${_addr}" == 127.0.0.0 || "${_addr}" == 127.255.255.255 ]]; then
+        echo "Error: ${_opt}: '${_addr}' cannot be used." >&2
+        exit 1
+    fi
+}
+
+# net_set_publish_addr ADDR
+#   --publish-addr: use ADDR (in 127.0.0.0/8) on the host instead of the
+#   derived per-user, per-session address, for example 127.0.0.1 for OAuth
+#   redirect URIs that must name it.
+net_set_publish_addr() {
+    _net_check_lo_addr --publish-addr "$1"
+    NET_PUBLISH_ADDR="$1"
+}
+
+# _net_listeners
+#   Fill _NET_LISTEN ("ADDR PORT" lines) from the host's listening TCP sockets
+#   (ss -Hltn).  Wildcard addresses (0.0.0.0, *, ::) are written as `*`, and
+#   IPv4-mapped IPv6 addresses as plain IPv4.  Empty, with a warning, when ss
+#   is missing: pasta's own bind then reports a busy port.
+_NET_LISTEN=()
+_net_listeners() {
+    local _state _rq _sq _local _rest _addr _port
+    _NET_LISTEN=()
+    if ! command -v ss > /dev/null 2>&1; then
+        echo "Warning: ss (iproute) not found: busy publish ports are not detected in advance." >&2
+        return 0
+    fi
+    while read -r _state _rq _sq _local _rest; do
+        [[ -n "${_local}" && "${_local}" == *:* ]] || continue
+        _port="${_local##*:}"
+        _addr="${_local%:*}"
+        _addr="${_addr#[}"
+        _addr="${_addr%]}"
+        _addr="${_addr%%\%*}"
+        _addr="${_addr#::ffff:}"
+        case "${_addr}" in
+            0.0.0.0 | '*' | ::) _addr='*' ;;
+        esac
+        _NET_LISTEN+=("${_addr} ${_port}")
+    done < <(ss -Hltn 2> /dev/null || true)
+}
+
+# ── Publish claims ───────────────────────────────────────────────
+# Choosing a publish address reads the listeners once (ss), and the backend
+# binds the address only later, after the launcher has exec'd.  Two launches
+# of one user at the same moment could therefore pick the same address and
+# port.  So the choice is made under a lock, and each launch records what it
+# chose in a claim file that later launches respect:
+#
+#   <runtime dir>/claims.lock          flock, held only while choosing
+#   <runtime dir>/claims/ADDR.PID      pid=, start=, ports= (host ports)
+#
+# PID is the launcher's pid, which stays the pid of pasta (or of bwrap with
+# slirp4netns) for the whole session; start= is its start time, so a reused
+# pid does not keep a claim alive.  A claim whose process is gone is stale and
+# is removed by the next launch.  Nothing is removed at exit (the launcher has
+# exec'd).  Not covered: a program outside the launchers binding the address
+# first; the backend then fails to bind and the launch stops.
+
+_NET_CLAIMS_DIR=""
+_NET_CLAIMS_LOCK_FD=""
+
+# bwrap_proc_start_time PID
+#   Print the start time of PID (field 22 of /proc/PID/stat, in clock ticks
+#   since boot); empty when PID is gone.
+bwrap_proc_start_time() {
+    local _st _f
+    IFS= read -r _st 2> /dev/null < "/proc/$1/stat" || return 0
+    read -r -a _f <<< "${_st##*) }"
+    printf '%s' "${_f[19]}"
+}
+
+# bwrap_proc_is PID START
+#   True when PID runs and started at START (see bwrap_proc_start_time).
+bwrap_proc_is() {
+    [[ "$1" =~ ^[0-9]+$ && -n "$2" && "$(bwrap_proc_start_time "$1")" == "$2" ]]
+}
+
+# _net_claims_begin
+#   Take the claims lock (waiting up to 10 s) and remove stale claims.
+_net_claims_begin() {
+    local _f _pid _start
+    _net_runtime_base
+    _NET_CLAIMS_DIR="${_NET_RUNTIME_BASE}/claims"
+    [[ -d "${_NET_CLAIMS_DIR}" ]] || mkdir -m 0700 -- "${_NET_CLAIMS_DIR}"
+    if command -v flock > /dev/null 2>&1; then
+        exec {_NET_CLAIMS_LOCK_FD}>> "${_NET_RUNTIME_BASE}/claims.lock"
+        if ! flock -w 10 "${_NET_CLAIMS_LOCK_FD}"; then
+            echo "Error: --publish: another launch holds ${_NET_RUNTIME_BASE}/claims.lock." >&2
+            exit 1
+        fi
+    else
+        echo "Warning: flock (util-linux) not found: two launches at the same moment may pick the same publish address." >&2
+    fi
+    for _f in "${_NET_CLAIMS_DIR}"/*; do
+        [[ -f "${_f}" ]] || continue
+        _pid="$(sed -n 's/^pid=//p' "${_f}" 2> /dev/null)"
+        _start="$(sed -n 's/^start=//p' "${_f}" 2> /dev/null)"
+        bwrap_proc_is "${_pid}" "${_start}" || rm -f -- "${_f}"
+    done
+}
+
+# _net_claimed_port ADDR
+#   Set _NET_BUSY / _NET_BUSY_PID to the first published host port that a
+#   live claim of another launch holds on ADDR (claims are pruned by
+#   _net_claims_begin).  Does nothing outside _net_claims_begin/_end.
+_net_claimed_port() {
+    local _want="$1" _f _pid _ports _r _lo _hi _i
+    [[ -n "${_NET_CLAIMS_DIR}" ]] || return 0
+    for _f in "${_NET_CLAIMS_DIR}/${_want}".*; do
+        [[ -f "${_f}" ]] || continue
+        _pid="$(sed -n 's/^pid=//p' "${_f}" 2> /dev/null)"
+        [[ "${_pid}" != "$$" ]] || continue
+        _ports="$(sed -n 's/^ports=//p' "${_f}" 2> /dev/null)"
+        for _r in ${_ports}; do
+            _lo="${_r%-*}"
+            _hi="${_r#*-}"
+            for _i in "${!_NET_PUB_LO[@]}"; do
+                if ((_lo <= _NET_PUB_HI[_i] && _hi >= _NET_PUB_LO[_i])); then
+                    _NET_BUSY="$((_lo > _NET_PUB_LO[_i] ? _lo : _NET_PUB_LO[_i]))"
+                    _NET_BUSY_PID="${_pid}"
+                    return 0
+                fi
+            done
+        done
+    done
+}
+
+# net_publish_port_claimed ADDR PORT
+#   True when a live claim of another launch holds host PORT on ADDR.  Read
+#   without the lock (for an early choice, such as the --serve port); the
+#   final check is made under the lock by _net_derive_publish_addr.
+net_publish_port_claimed() {
+    local _f _pid _start _ports _r
+    _net_runtime_base
+    for _f in "${_NET_RUNTIME_BASE}/claims/$1".*; do
+        [[ -f "${_f}" ]] || continue
+        _pid="$(sed -n 's/^pid=//p' "${_f}" 2> /dev/null)"
+        _start="$(sed -n 's/^start=//p' "${_f}" 2> /dev/null)"
+        if [[ "${_pid}" == "$$" ]] || ! bwrap_proc_is "${_pid}" "${_start}"; then
+            continue
+        fi
+        _ports="$(sed -n 's/^ports=//p' "${_f}" 2> /dev/null)"
+        for _r in ${_ports}; do
+            ((${_r%-*} <= $2 && $2 <= ${_r#*-})) && return 0
+        done
+    done
+    return 1
+}
+
+# _net_claims_write
+#   Record this launch's claim on _NET_PUBLISH_ADDR_EFFECTIVE.
+_net_claims_write() {
+    local _i _ports=""
+    for _i in "${!_NET_PUB_LO[@]}"; do
+        _ports+="${_ports:+ }${_NET_PUB_LO[${_i}]}-${_NET_PUB_HI[${_i}]}"
+    done
+    printf 'pid=%s\nstart=%s\nports=%s\nlauncher=%s\ndir=%s\n' \
+        "$$" "$(bwrap_proc_start_time "$$")" "${_ports}" "${0##*/}" "${PWD}" \
+        > "${_NET_CLAIMS_DIR}/${_NET_PUBLISH_ADDR_EFFECTIVE}.$$"
+}
+
+# _net_claims_end
+#   Release the claims lock.
+_net_claims_end() {
+    if [[ -n "${_NET_CLAIMS_LOCK_FD}" ]]; then
+        exec {_NET_CLAIMS_LOCK_FD}>&-
+        _NET_CLAIMS_LOCK_FD=""
+    fi
+    _NET_CLAIMS_DIR=""
+}
+
+# _net_busy_port ADDR
+#   Set _NET_BUSY to the first published host port that a listener already
+#   holds on ADDR (or on a wildcard address), or that a live claim of another
+#   launch holds on ADDR; empty when none.  _NET_BUSY_WILD is 1 when that
+#   listener is a wildcard one; _NET_BUSY_PID is the claiming launcher's pid
+#   when it is a claim.
+_NET_BUSY=""
+_NET_BUSY_WILD=0
+_NET_BUSY_PID=""
+_net_busy_port() {
+    local _want="$1" _l _a _p _i
+    _NET_BUSY=""
+    _NET_BUSY_WILD=0
+    _NET_BUSY_PID=""
+    _net_claimed_port "${_want}"
+    [[ -z "${_NET_BUSY}" ]] || return 0
+    for _l in ${_NET_LISTEN[@]+"${_NET_LISTEN[@]}"}; do
+        _a="${_l% *}"
+        _p="${_l##* }"
+        [[ "${_a}" == "${_want}" || "${_a}" == '*' ]] || continue
+        for _i in "${!_NET_PUB_LO[@]}"; do
+            if [[ ${_p} -ge ${_NET_PUB_LO[${_i}]} && ${_p} -le ${_NET_PUB_HI[${_i}]} ]]; then
+                _NET_BUSY="${_p}"
+                [[ "${_a}" != '*' ]] || _NET_BUSY_WILD=1
+                return 0
+            fi
+        done
+    done
+}
+
+# net_publish_prefix
+#   Print this user's publish prefix 127.H1.H2: H1.H2 from a hash of the uid
+#   (H1 in 1-254, so 127.0.x.x, 127.0.0.53 and 127.0.1.1 are never used).
+#   Session S of the user publishes on 127.H1.H2.S; S=1 is the usual one.
+net_publish_prefix() {
+    local _hex _v
+    _hex="$(printf '%s' "$(id -u)" | sha256sum)"
+    _v=$((16#${_hex:0:4}))
+    printf '127.%s.%s' "$((1 + (_v >> 8) % 254))" "$((_v & 255))"
+}
+
+# _net_derive_publish_addr
+#   Set _NET_PUBLISH_ADDR_EFFECTIVE for --publish.  Without --publish-addr the
+#   address is 127.H1.H2.S (see net_publish_prefix), S the lowest session
+#   index in 1-254 whose address has none of the requested ports in use.
+#   With --publish-addr, that address must have them all free.  Exit 1 when
+#   no address can be used.  --dry-run checks nothing and shows S=1.
+_net_derive_publish_addr() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        _net_choose_publish_addr
+        return 0
+    fi
+    _net_claims_begin
+    _net_listeners
+    _net_choose_publish_addr
+    _net_claims_write
+    _net_claims_end
+}
+
+# _net_choose_publish_addr
+#   The choice for _net_derive_publish_addr, against the listeners and (on a
+#   real run) the claims of the user's other launches.
+_net_choose_publish_addr() {
+    local _prefix _s _cand
+    if [[ -n "${NET_PUBLISH_ADDR}" ]]; then
+        _NET_PUBLISH_ADDR_EFFECTIVE="${NET_PUBLISH_ADDR}"
+        [[ "${DRY_RUN}" -eq 0 ]] || return 0
+        _net_busy_port "${NET_PUBLISH_ADDR}"
+        if [[ -n "${_NET_BUSY_PID}" ]]; then
+            echo "Error: --publish: port ${_NET_BUSY} on ${NET_PUBLISH_ADDR} is claimed by another of your sandboxes (launcher pid ${_NET_BUSY_PID})." >&2
+        elif [[ -n "${_NET_BUSY}" ]]; then
+            echo "Error: --publish: port ${_NET_BUSY} is already in use on ${NET_PUBLISH_ADDR} (see: ss -ltnp)." >&2
+        fi
+        if [[ -n "${_NET_BUSY}" ]]; then
+            if [[ -n "${NET_PUBLISH_ADDR_FIXED_BY}" ]]; then
+                echo "       ${NET_PUBLISH_ADDR_FIXED_BY} always publishes on ${NET_PUBLISH_ADDR}; choose other --publish ports, or run again." >&2
+            fi
+            exit 1
+        fi
+        return 0
+    fi
+
+    _prefix="$(net_publish_prefix)"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        _NET_PUBLISH_ADDR_EFFECTIVE="${_prefix}.1"
+        echo "${0##*/}: dry-run: session index 1 shown for the publish address; a real run takes the first free one." >&2
+        return 0
+    fi
+    for ((_s = 1; _s <= 254; _s++)); do
+        _cand="${_prefix}.${_s}"
+        _net_busy_port "${_cand}"
+        if [[ -z "${_NET_BUSY}" ]]; then
+            _NET_PUBLISH_ADDR_EFFECTIVE="${_cand}"
+            return 0
+        fi
+        if [[ "${_NET_BUSY_WILD}" -eq 1 ]]; then
+            echo "Error: --publish: port ${_NET_BUSY} is already in use on all host addresses (see: ss -ltnp); choose another port." >&2
+            exit 1
+        fi
+    done
+    echo "Error: --publish: all 254 publish addresses ${_prefix}.1-254 have a requested port in use." >&2
+    echo "       This usually means leftover sandbox (pasta) processes; see: ss -ltnp 'src ${_prefix}.0/24'" >&2
+    exit 1
+}
+
+# _net_join SPEC...
+#   Print the specs joined with commas.
+_net_join() {
+    local IFS=,
+    printf '%s' "$*"
+}
+
+# build_net_isolation
+#   Finish PASTA_ARGS from the --publish / --host-port options,
+#   add the bwrap namespace options pasta needs, generate /etc/resolv.conf and
+#   /etc/hosts, and export BWRAP_NET_*.  On the host network (see
+#   detect_net_capabilities) only mount the host's resolv.conf and hosts and
+#   set BWRAP_NET_BACKEND=none.  Call after
+#   detect_net_capabilities and build_etc_mounts, and before
+#   build_sandbox_context (the context file describes the forwards).
+build_net_isolation() {
+    local _spec _host _sbx _i _hosts _resolv
+    _NET_CONFIGURED=1
+    _NET_PUBLISH_DESC=()
+    _NET_HOST_DESC=()
+    _NET_PUBLISH_ADDR_EFFECTIVE=""
+    _net_log_detect
+
+    # Host network (--share-net): the previous behaviour.
+    if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
+        BWRAP_ARGS+=(
+            --ro-bind-try /etc/resolv.conf /etc/resolv.conf
+            --ro-bind-try /etc/hosts /etc/hosts
+        )
+        SANDBOX_ENV+=(
+            "BWRAP_NET_BACKEND=none"
+            "BWRAP_NET_PUBLISH="
+            "BWRAP_NET_PUBLISH_ADDR="
+            "BWRAP_NET_HOST_PORTS="
+        )
+        return 0
+    fi
+    local _dns="${_NET_DNS_FORWARD_ADDR}"
+    if [[ "${_NET_BACKEND}" == pasta ]]; then
+        [[ ${#PASTA_ARGS[@]} -gt 0 ]] || _net_baseline_args
+        # pasta maps the caller to uid 0 in its user namespace: run the
+        # sandbox as the real user in a nested one, and undo pasta's hostname
+        # change.
+        BWRAP_ARGS+=(
+            --unshare-user
+            --uid "$(id -u)"
+            --gid "$(id -g)"
+            --unshare-uts
+            --hostname "$(uname -n)"
+        )
+    else
+        # _NET_NS_IDENTITY creates the namespaces (mapping the real ids to
+        # themselves) and slirp4netns attaches to them; the launch
+        # descriptors are opened by _net_slirp_start.
+        _dns="${_NET_SLIRP_DNS}"
+        BWRAP_ARGS+=(
+            --unshare-user
+            --uid "$(id -u)"
+            --gid "$(id -g)"
+            --info-fd "${_NET_FD_INFO_W}"
+            --block-fd "${_NET_FD_BLOCK_R}"
+            --sync-fd "${_NET_FD_SYNC_W}"
+        )
+    fi
+
+    if [[ -n "${NET_PUBLISH_ADDR}" && ${#NET_PUBLISH[@]} -eq 0 ]]; then
+        echo "Warning: --publish-addr has no effect without --publish." >&2
+    fi
+    if [[ ${#NET_PUBLISH[@]} -gt 0 ]]; then
+        _net_derive_publish_addr
+        if [[ "${_NET_BACKEND}" == pasta ]]; then
+            for _i in "${!PASTA_ARGS[@]}"; do
+                if [[ "${PASTA_ARGS[${_i}]}" == -t ]]; then
+                    PASTA_ARGS[_i + 1]="${_NET_PUBLISH_ADDR_EFFECTIVE}/$(_net_join "${NET_PUBLISH[@]}")"
+                fi
+            done
+        else
+            _net_slirp_publish_fwds
+        fi
+        for _spec in "${NET_PUBLISH[@]}"; do
+            _host="${_spec%%:*}"
+            _sbx="${_spec#*:}"
+            if [[ "${_host}" == *-* ]]; then
+                _NET_PUBLISH_DESC+=("${_NET_PUBLISH_ADDR_EFFECTIVE}:${_host}|${_sbx}")
+            else
+                _NET_PUBLISH_DESC+=("http://${_NET_PUBLISH_ADDR_EFFECTIVE}:${_host}/|${_sbx}")
+            fi
+        done
+    fi
+
+    if [[ ${#NET_HOST_PORTS[@]} -gt 0 ]]; then
+        # pasta's -T takes NAMESPACE_PORT:HOST_PORT, the reverse of ours, and
+        # no listening address: it always listens on the namespace's
+        # loopback (127.0.0.1 and ::1).
+        local -a _tspec=()
+        for _spec in "${NET_HOST_PORTS[@]}"; do
+            _host="${_spec%%:*}"
+            _sbx="${_spec#*:}"
+            if [[ "${_host}" == "${_sbx}" ]]; then
+                _tspec+=("${_host}")
+            else
+                _tspec+=("${_sbx}:${_host}")
+            fi
+            _NET_HOST_DESC+=("127.0.0.1:${_host}|127.0.0.1:${_sbx}")
+        done
+        for _i in "${!PASTA_ARGS[@]}"; do
+            if [[ "${PASTA_ARGS[${_i}]}" == -T ]]; then
+                PASTA_ARGS[_i + 1]="$(_net_join "${_tspec[@]}")"
+            fi
+        done
+    fi
+
+    # DNS: pasta forwards queries for _NET_DNS_FORWARD_ADDR, slirp4netns for
+    # _NET_SLIRP_DNS, to the host's first nameserver.  Only IPv4.
+    if [[ -r /etc/resolv.conf ]] &&
+        ! grep -Eq '^[[:space:]]*nameserver[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' /etc/resolv.conf; then
+        echo "Warning: /etc/resolv.conf has no IPv4 nameserver: name resolution will not work in the sandbox." >&2
+    fi
+    _NET_DNS_EFFECTIVE="${_dns}"
+    _resolv="nameserver ${_dns}"$'\n'"options edns0"
+    if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+        # The DNS relay first (logged); the backend's address second, which a
+        # resolver uses at once when the relay is not up (port closed).
+        _resolv="nameserver ${_NET_DNS_RELAY_ADDR}"$'\n'"${_resolv}"
+    fi
+    bwrap_fd_from_data "generated /etc/resolv.conf" "${_resolv}"
+    BWRAP_ARGS+=(--ro-bind-data "${_BWRAP_FD}" /etc/resolv.conf)
+
+    if [[ -r /etc/hosts ]]; then
+        _hosts="$(< /etc/hosts)"
+    else
+        _hosts="127.0.0.1   localhost"$'\n'"::1         localhost"
+    fi
+    bwrap_fd_from_data "generated /etc/hosts" "${_hosts}"
+    BWRAP_ARGS+=(--ro-bind-data "${_BWRAP_FD}" /etc/hosts)
+
+    SANDBOX_ENV+=(
+        "BWRAP_NET_BACKEND=${_NET_BACKEND}"
+        "BWRAP_NET_PUBLISH=$(_net_join ${NET_PUBLISH[@]+"${NET_PUBLISH[@]}"})"
+        "BWRAP_NET_PUBLISH_ADDR=${_NET_PUBLISH_ADDR_EFFECTIVE}"
+        "BWRAP_NET_HOST_PORTS=$(_net_join ${NET_HOST_PORTS[@]+"${NET_HOST_PORTS[@]}"})"
+    )
+}
+
+# _net_print_report
+#   Print the network setup and every forward to stderr, so it stays in the
+#   scrollback above the TUI.  With no forwards only the first line, and only
+#   when stderr is a terminal.  Called by launch_sandbox.
+_net_print_report() {
+    local _launcher="${0##*/}" _spec _line
+    local _n_fwd=$((${#_NET_PUBLISH_DESC[@]} + ${#_NET_HOST_DESC[@]}))
+    if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
+        if [[ "${NET_SHARE}" -eq 1 && -t 2 ]]; then
+            printf '%s: network: shared with the host (--share-net)\n' "${_launcher}" >&2
+        fi
+        return 0
+    fi
+    if [[ ${_n_fwd} -gt 0 || -t 2 ]]; then
+        _line="${_launcher}: network: private namespace (${_NET_BACKEND})"
+        [[ -z "${_NET_PUBLISH_ADDR_EFFECTIVE}" ]] || _line+="; publish address ${_NET_PUBLISH_ADDR_EFFECTIVE}"
+        printf '%s\n' "${_line}" >&2
+    fi
+    for _spec in ${_NET_PUBLISH_DESC[@]+"${_NET_PUBLISH_DESC[@]}"}; do
+        printf '%s: publish    %s  ->  sandbox :%s  (bind 0.0.0.0 inside)\n' \
+            "${_launcher}" "${_spec%%|*}" "${_spec#*|}" >&2
+    done
+    for _spec in ${_NET_HOST_DESC[@]+"${_NET_HOST_DESC[@]}"}; do
+        printf '%s: host-port  host %s  ->  sandbox %s  (host service sees a loopback client)\n' \
+            "${_launcher}" "${_spec%%|*}" "${_spec#*|}" >&2
+    done
+}
+
+# _net_require_configured
+#   Exit 1 unless detect_net_capabilities and build_net_isolation have run, so
+#   the network mode is always a decision, never an accident.
+_net_require_configured() {
+    if [[ "${_NET_CONFIGURED}" -ne 1 ]] ||
+        [[ "${_NET_BACKEND}" == pasta && -z "${_PASTA_BIN}" ]] ||
+        [[ "${_NET_BACKEND}" == slirp4netns && -z "${_SLIRP_BIN}" ]]; then
+        echo "Error: ${0##*/}: network isolation was not set up (detect_net_capabilities / build_net_isolation missing)." >&2
+        exit 1
+    fi
 }
 
 # ── OpenCode config requirement ───────────────────────────────────
@@ -2662,6 +4564,16 @@ build_ccache_mounts() {
     fi
 }
 
+# ── prek cache (read-write) ─────────────────────────────────────
+# Shared with the host, so a sandbox does not set up every hook environment
+# (and download the Go and Node toolchains for them) again.  Like the npm
+# and pixi caches, the agent can change what is in it.
+build_prek_mounts() {
+    if [[ -d "${PREK_CACHE_DIR}" ]]; then
+        BWRAP_ARGS+=(--bind "${PREK_CACHE_DIR}" "${PREK_CACHE_DIR}")
+    fi
+}
+
 # ── npm config (read-only) + cache (read-write) ─────────────────
 build_npm_mounts() {
     if [[ -f "${_HOME}/.npmrc" ]]; then
@@ -2988,6 +4900,7 @@ build_env_vars() {
     pass_through_if_set CCACHE_DIR
     pass_through_if_set PIXI_HOME
     pass_through_if_set NPM_CONFIG_CACHE
+    pass_through_if_set PREK_HOME
 
     # Editor
     pass_through_if_set EDITOR
@@ -3019,8 +4932,9 @@ build_env_vars() {
 # then makes its tool load the file in addition to the user's own
 # instruction files (never in place of them; no user file is touched).
 #
-# The file travels as --ro-bind-data on a file descriptor, so nothing is
-# written to the host.  Variables set inside the sandbox:
+# The file travels as --ro-bind-data on a file descriptor (see "File
+# descriptor relay"), so nothing is written to the host.  Variables set
+# inside the sandbox:
 #   BWRAP_SANDBOX          launcher name (for example bwopencode2)
 #   BWRAP_SANDBOX_CONTEXT  path of the context file
 
@@ -3174,6 +5088,66 @@ _bwrap_context_under_writable() {
     return 1
 }
 
+# _bwrap_context_network
+#   Set _CTX_NET to the "Network" section of the context file, from the
+#   forwards set up by build_net_isolation.
+_CTX_NET=""
+_bwrap_context_network() {
+    local _nl=$'\n' _d _t=""
+    _t+="## Network${_nl}${_nl}"
+    if [[ "${_NET_PRIVATE}" -ne 1 ]]; then
+        _t+="This sandbox shares the host's network (the user chose \`--share-net\`)."
+        _t+=" Services listening on the host's loopback (\`127.0.0.1\`, \`localhost\`) are reachable from here,"
+        _t+=" and they are not yours to use unless the user asks: they may belong to other users."
+        _t+=" Anything you listen on is reachable from the host, and on \`0.0.0.0\` from the network:"
+        _t+=" bind \`127.0.0.1\` unless told otherwise.${_nl}${_nl}"
+        _net_log_context_text
+        _CTX_NET="${_t}${_NET_LOG_CTX}"
+        return 0
+    fi
+    _t+="This sandbox has its own network namespace (${_NET_BACKEND})."
+    _t+=" Outbound connections work and leave from the host's address;"
+    if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+        _t+=" DNS goes to \`${_NET_DNS_RELAY_ADDR}\`, a relay that logs each lookup, and on to \`${_NET_DNS_EFFECTIVE}\`, which is forwarded to the host's resolver."
+    else
+        _t+=" DNS goes to \`${_NET_DNS_EFFECTIVE}\`, which is forwarded to the host's resolver."
+    fi
+    _t+=" Services listening on the host's loopback (\`127.0.0.1\`, \`localhost\`) are not reachable from here,"
+    _t+=" and nothing you listen on here is reachable from the host, except as listed below."
+    _t+=" \`127.0.0.1\` here is the sandbox's own loopback."
+    _t+=" ICMP (\`ping\`) may not work."
+    if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+        _t+=" IPv4 only. Host services cannot be made reachable with this backend (no \`--host-port\`)."
+    fi
+    _t+="${_nl}${_nl}"
+
+    _t+="Published ports (a server you run here, reachable from the host):"
+    if [[ ${#_NET_PUBLISH_DESC[@]} -eq 0 ]]; then
+        _t+=" none.${_nl}${_nl}"
+    else
+        _t+="${_nl}${_nl}"
+        for _d in "${_NET_PUBLISH_DESC[@]}"; do
+            _t+="- \`${_d%%|*}\` on the host reaches port \`${_d#*|}\` here.${_nl}"
+        done
+        _t+="${_nl}**Bind \`0.0.0.0\`, not \`127.0.0.1\`, or the forward will not reach your server.**"
+        _t+=" Tell the user the host address above, not \`localhost\`.${_nl}${_nl}"
+    fi
+
+    _t+="Host services (reachable from here):"
+    if [[ ${#_NET_HOST_DESC[@]} -eq 0 ]]; then
+        _t+=" none.${_nl}${_nl}"
+    else
+        _t+="${_nl}${_nl}"
+        for _d in "${_NET_HOST_DESC[@]}"; do
+            _t+="- \`${_d#*|}\` here reaches the host's \`${_d%%|*}\`.${_nl}"
+        done
+        _t+="${_nl}These ports of this sandbox are taken by the forward: you cannot run your own server on them.${_nl}${_nl}"
+    fi
+    _t+="\`BWRAP_NET_BACKEND\` is \`${_NET_BACKEND}\`; \`BWRAP_NET_PUBLISH\`, \`BWRAP_NET_PUBLISH_ADDR\` and \`BWRAP_NET_HOST_PORTS\` hold the same information.${_nl}${_nl}"
+    _net_log_context_text
+    _CTX_NET="${_t}${_NET_LOG_CTX}"
+}
+
 # _bwrap_context_render TOOL DEST
 #   Build the context file text for launcher TOOL (to be mounted at DEST) in
 #   _SANDBOX_CONTEXT_TEXT, from BWRAP_ARGS, SANDBOX_ENV and the launcher's
@@ -3261,7 +5235,12 @@ _bwrap_context_render() {
     _t+=" and only if the source is mounted read-write below."
     _t+=" \"Read-only file system\" on a mount point is expected.${_nl}"
     _t+="- \`ln -s\` creates ordinary symlinks, in writable locations only.${_nl}"
-    _t+="- The network is shared with the host. Host processes are not visible (private PID namespace)."
+    if [[ "${_NET_CONFIGURED}" -eq 1 && "${_NET_PRIVATE}" -eq 1 ]]; then
+        _t+="- The network is private to this sandbox (see Network below)."
+    else
+        _t+="- The network is shared with the host."
+    fi
+    _t+=" Host processes are not visible (private PID namespace)."
     _t+=" There are no SSH or GPG agents and no sudo.${_nl}${_nl}"
 
     _bwrap_context_mode_at "${_PWD}"
@@ -3285,6 +5264,10 @@ _bwrap_context_render() {
         _t+=" It is not a git repository, so only this directory is mounted."
     fi
     _t+="${_nl}${_nl}"
+
+    _CTX_NET=""
+    [[ "${_NET_CONFIGURED}" -ne 1 ]] || _bwrap_context_network
+    _t+="${_CTX_NET}"
 
     _t+="## Mounts${_nl}${_nl}"
     _t+="\`rw\` is the real host files (often NFS): changes persist and show on the host at once."
@@ -3386,7 +5369,7 @@ _bwrap_context_render() {
 #   SANDBOX_CONTEXT_PATH (and _SANDBOX_CONTEXT_TEXT) when the file is mounted.
 build_sandbox_context() {
     local _tool="$1"
-    local _dir="${_HOME}/.sandbox" _file="${_HOME}/.sandbox/AGENTS.md" _fd
+    local _dir="${_HOME}/.sandbox" _file="${_HOME}/.sandbox/AGENTS.md"
     SANDBOX_CONTEXT_PATH=""
     [[ "${SANDBOX_CONTEXT_ENABLED}" -eq 1 ]] || return 0
 
@@ -3397,17 +5380,16 @@ build_sandbox_context() {
 
     _bwrap_context_render "${_tool}" "${_file}"
 
-    # The descriptor stays open in this shell until launch_sandbox execs
-    # bwrap, which reads it for --ro-bind-data and closes it.
-    exec {_fd}<<< "${_SANDBOX_CONTEXT_TEXT}"
+    bwrap_fd_from_data "sandbox context file, mounted at ${_file}" "${_SANDBOX_CONTEXT_TEXT}"
     BWRAP_ARGS+=(
         --dir "${_dir}"
-        --ro-bind-data "${_fd}" "${_file}"
+        --ro-bind-data "${_BWRAP_FD}" "${_file}"
     )
     SANDBOX_ENV+=(
         "BWRAP_SANDBOX=${_tool}"
         "BWRAP_SANDBOX_CONTEXT=${_file}"
     )
+    # shellcheck disable=SC2034  # read by the launchers' context loaders
     SANDBOX_CONTEXT_PATH="${_file}"
 }
 
@@ -3434,6 +5416,174 @@ _bwrap_toml_string() {
     _s="${_s//$'\t'/\\t}"
     [[ "${_s}" =~ [[:cntrl:]] ]] && return 1
     printf '"%s"' "${_s}"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# File descriptor relay
+# ═══════════════════════════════════════════════════════════════════
+# bwrap reads some files from descriptors: --file FD for writable copies of
+# credentials and config, --ro-bind-data FD for generated files such as the
+# sandbox context.  The launcher does not open them itself, because bwrap is
+# started by pasta (see "Network isolation"), and pasta closes every
+# descriptor above 2 that it inherits.  The launcher only reserves the
+# numbers and records where each one's content comes from.  A short fixed
+# bash script, the relay, runs where bwrap used to (as pasta's command), opens
+# each descriptor at its reserved number and execs bwrap.  Sources:
+#   file PATH  the relay opens PATH read-only.
+#   data       generated text, carried in the environment variable
+#              _BWRAP_FD_DATA_<N>; the relay turns it into a here-string
+#              (which appends one newline) and unsets the variable before
+#              exec'ing bwrap.  Not for secrets: the variable stays in
+#              pasta's environment for the whole session.
+# Two more entries are used by the network log (see "Network log"), before
+# the others:
+#   note TEXT  the relay prints TEXT on the descriptor (a marker on stderr).
+#   append PATH  the relay opens PATH for appending on the descriptor (the
+#              user's stderr again).
+#   spawn PY HELPER LISTEN UPSTREAM UDPFD TCPFD  the relay starts the DNS
+#              relay (`PY -I -S HELPER dns LISTEN UPSTREAM <relay pid> UDPFD
+#              TCPFD`) in the background, its output on the descriptor, and
+#              waits until it listens (it says so on descriptor 3; a Python
+#              start, some tens of milliseconds), at most 0.25 s, so the
+#              first lookups are logged too.  UDPFD and TCPFD are sockets
+#              already bound (slirp4netns) or "-" (pasta: the relay binds);
+#              the relay closes its own copies afterwards.
+# Every walker of _BWRAP_FD_RELAY (_bwrap_fd_data_numbers) must step over
+# exactly as many words per entry as the shim shifts: data 2, spawn 8, the
+# rest 3.
+
+# _bwrap_fd_check_room
+#   Exit 1 when the reserved numbers would reach _NET_FD_DNS_UDP, above which
+#   the DNS relay's pre-bound sockets and then the slirp4netns launch
+#   (_NET_FD_*, 90-99) keep their own descriptors.
+_bwrap_fd_check_room() {
+    if [[ ${_BWRAP_FD_NEXT} -ge ${_NET_FD_DNS_UDP} ]]; then
+        echo "Error: too many files to pass to the sandbox by descriptor." >&2
+        exit 1
+    fi
+}
+
+# bwrap_fd_from_file PATH
+#   Reserve a descriptor that the relay opens on PATH and set _BWRAP_FD to its
+#   number.  Exits 1 when PATH cannot be read now.
+bwrap_fd_from_file() {
+    local _path="$1"
+    if [[ ! -f "${_path}" || ! -r "${_path}" ]]; then
+        echo "Error: cannot read '${_path}'." >&2
+        exit 1
+    fi
+    _bwrap_fd_check_room
+    _BWRAP_FD="${_BWRAP_FD_NEXT}"
+    _BWRAP_FD_NEXT=$((_BWRAP_FD_NEXT + 1))
+    _BWRAP_FD_RELAY+=("${_BWRAP_FD}" file "${_path}")
+}
+
+# bwrap_fd_from_data LABEL TEXT
+#   Reserve a descriptor that the relay fills with TEXT and a newline, and set
+#   _BWRAP_FD to its number.  LABEL describes the content in --dry-run output.
+#   The kernel limits one environment string to 128 KiB, so TEXT must be
+#   shorter than that.
+bwrap_fd_from_data() {
+    local _label="$1" _text="$2"
+    if [[ ${#_text} -gt 120000 ]]; then
+        echo "Error: the ${_label} is too large to pass to the sandbox (${#_text} characters)." >&2
+        exit 1
+    fi
+    _bwrap_fd_check_room
+    _BWRAP_FD="${_BWRAP_FD_NEXT}"
+    _BWRAP_FD_NEXT=$((_BWRAP_FD_NEXT + 1))
+    _BWRAP_FD_RELAY+=("${_BWRAP_FD}" data)
+    _BWRAP_FD_DATA["${_BWRAP_FD}"]="${_text}"
+    _BWRAP_FD_LABEL["${_BWRAP_FD}"]="${_label}"
+}
+
+# The relay, run as
+#   bash -c "${_BWRAP_FD_RELAY_SHIM}" bwrap-fd-relay ENTRY... -- COMMAND ARGS...
+# with each ENTRY either `N file PATH` or `N data`.  N is checked to be a
+# number before it reaches eval; PATH and the data are only expanded there,
+# never pasted into the evaluated text.  bash exports SHLVL to the command it
+# execs, so it is unset; PWD is overridden by bwrap's --setenv.
+# shellcheck disable=SC2016  # expanded by the relay, not here
+_BWRAP_FD_RELAY_SHIM='
+while [[ $# -gt 0 && "$1" != -- ]]; do
+    if [[ ! "$1" =~ ^[0-9]+$ ]]; then
+        echo "$0: bad descriptor number: $1" >&2
+        exit 126
+    fi
+    case "$2" in
+        file)
+            eval "exec $1<\"\$3\"" || { echo "$0: cannot open $3" >&2; exit 126; }
+            shift 3
+            ;;
+        data)
+            _v="_BWRAP_FD_DATA_$1"
+            eval "exec $1<<<\"\${!_v}\"" || { echo "$0: cannot fill descriptor $1" >&2; exit 126; }
+            unset "${_v}"
+            shift 2
+            ;;
+        note)
+            printf "%s\n" "$3" >&"$1"
+            shift 3
+            ;;
+        append)
+            eval "exec $1>>\"\$3\"" || { echo "$0: cannot open $3" >&2; exit 126; }
+            shift 3
+            ;;
+        spawn)
+            coproc _bwrap_dns { exec "$3" -I -S "$4" dns "$5" "$6" "$$" "$7" "$8" 3>&1 1>&"$1" 2>&"$1" < /dev/null; }
+            read -r -t 0.25 _v <&"${_bwrap_dns[0]}"
+            eval "exec ${_bwrap_dns[0]}<&- ${_bwrap_dns[1]}>&-"
+            # Pre-bound sockets: the relay has its own copies, so close ours
+            # rather than leak listening sockets into the sandbox.
+            [[ "$7" == - ]] || eval "exec $7<&- $8<&-"
+            shift 8
+            ;;
+        *)
+            echo "$0: bad relay entry: $2" >&2
+            exit 126
+            ;;
+    esac
+done
+shift
+unset _v SHLVL
+exec "$@"
+'
+
+# resolve_bash_bin
+#   Print the bash that runs the relay: /usr/bin/bash or /bin/bash (labelled
+#   shell_exec_t, so SELinux moves it out of pasta's domain), else the bash
+#   running this script.
+resolve_bash_bin() {
+    local _b
+    for _b in /usr/bin/bash /bin/bash "${BASH}"; do
+        if [[ -n "${_b}" && -x "${_b}" ]]; then
+            echo "${_b}"
+            return 0
+        fi
+    done
+    echo "Error: cannot locate bash for the descriptor relay." >&2
+    exit 1
+}
+
+# _bwrap_fd_data_numbers
+#   Set _BWRAP_FD_DATA_NUMS to the numbers of the data descriptors, in the
+#   order they were reserved.
+_BWRAP_FD_DATA_NUMS=()
+_bwrap_fd_data_numbers() {
+    local _r=0
+    _BWRAP_FD_DATA_NUMS=()
+    while [[ ${_r} -lt ${#_BWRAP_FD_RELAY[@]} ]]; do
+        case "${_BWRAP_FD_RELAY[$((_r + 1))]}" in
+            data)
+                _BWRAP_FD_DATA_NUMS+=("${_BWRAP_FD_RELAY[${_r}]}")
+                _r=$((_r + 2))
+                ;;
+            # Must match the shim's `shift` for spawn (see
+            # _BWRAP_FD_RELAY_SHIM); tests/test_fd_relay.py checks the two.
+            spawn) _r=$((_r + 8)) ;;
+            *) _r=$((_r + 3)) ;;
+        esac
+    done
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3559,14 +5709,22 @@ _is_secret_env_name() {
 
 print_dry_run() {
     verify_n2c_state_not_exposed
-    local _BWRAP_BIN _ENV_BIN
+    _net_require_configured
+    local _BWRAP_BIN _ENV_BIN _BASH_BIN
     _BWRAP_BIN="$(resolve_bwrap_bin)"
     _ENV_BIN="$(resolve_env_bin)"
+    _BASH_BIN="$(resolve_bash_bin)"
 
     # Mirror the exact invocation used by launch_sandbox:
-    #   exec <env_bin> -i <base vars> <SANDBOX_ENV> <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
+    #   exec <env_bin> -i <base vars> <SANDBOX_ENV> <relay data>
+    #     [<pasta_bin> <PASTA_ARGS> --]      (pasta backend only)
+    #     [<python> -I -c <_NET_NS_IDENTITY>]          (slirp4netns only)
+    #     <bash_bin> -c <relay> bwrap-fd-relay <relay entries> --
+    #     <bwrap_bin> <BWRAP_ARGS> -- <_TOOL_CMD> <TOOL_ARGS>
     # Values of secret-looking variables (_is_secret_env_name) are printed as
     # REDACTED, on the env line and in --setenv; only the printed text changes.
+    # The relay script and its data are shown as placeholders, the data in
+    # full after the command.
     printf "exec %s -i \\\\\n" "${_ENV_BIN}"
     printf "  HOME=%q \\\\\n"    "${_HOME}"
     printf "  USER=%q \\\\\n"    "${_USER}"
@@ -3581,6 +5739,46 @@ print_dry_run() {
             printf "  %s=%q \\\\\n" "${_name}" "${_entry#*=}"
         fi
     done
+    local _n
+    _bwrap_fd_data_numbers
+    for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
+        printf "  _BWRAP_FD_DATA_%s='<%s, shown below>' \\\\\n" "${_n}" "${_BWRAP_FD_LABEL["${_n}"]}"
+    done
+    local _p=0
+    [[ "${_NET_BACKEND}" != pasta ]] || printf "  %s \\\\\n" "${_PASTA_BIN}"
+    while [[ "${_NET_BACKEND}" == pasta && ${_p} -lt ${#PASTA_ARGS[@]} ]]; do
+        case "${PASTA_ARGS[${_p}]}" in
+            -t | -u | -T | -U | --dns-forward | --search | --log-file)
+                printf "    %s %q \\\\\n" "${PASTA_ARGS[${_p}]}" "${PASTA_ARGS[$((_p + 1))]}"
+                _p=$((_p + 2))
+                ;;
+            *)
+                printf "    %s \\\\\n" "${PASTA_ARGS[${_p}]}"
+                _p=$((_p + 1))
+                ;;
+        esac
+    done
+    [[ "${_NET_BACKEND}" != pasta ]] || printf "    -- \\\\\n"
+    if [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+        printf "  %s -I -c '<_NET_NS_IDENTITY from bwrap_sandbox_lib.sh>' \\\\\n" "${_NET_PY_BIN}"
+        if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+            printf "    --dns %s %s %s %s \\\\\n" "${_NET_DNS_RELAY_ADDR}" \
+                "${_NET_DNS_RELAY_PORT}" "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}"
+        fi
+        printf "    -- \\\\\n"
+    fi
+    printf "  %s -c '<_BWRAP_FD_RELAY_SHIM from bwrap_sandbox_lib.sh>' bwrap-fd-relay \\\\\n" "${_BASH_BIN}"
+    local _r=0
+    while [[ ${_r} -lt ${#_BWRAP_FD_RELAY[@]} ]]; do
+        if [[ "${_BWRAP_FD_RELAY[$((_r + 1))]}" == file ]]; then
+            printf "    %s file %q \\\\\n" "${_BWRAP_FD_RELAY[${_r}]}" "${_BWRAP_FD_RELAY[$((_r + 2))]}"
+            _r=$((_r + 3))
+        else
+            printf "    %s data \\\\\n" "${_BWRAP_FD_RELAY[${_r}]}"
+            _r=$((_r + 2))
+        fi
+    done
+    printf "    -- \\\\\n"
     printf "  %s \\\\\n" "${_BWRAP_BIN}"
 
     # Print bwrap arguments one flag-plus-values per line.  Each flag's
@@ -3614,11 +5812,12 @@ print_dry_run() {
     local _arg
     for _arg in ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}; do printf " %q" "${_arg}"; done
     printf "\n"
-    if [[ -n "${SANDBOX_CONTEXT_PATH}" ]]; then
-        printf '\n# --ro-bind-data above reads a file descriptor that a real run fills with this\n'
-        printf '# sandbox context file, mounted at %s:\n#\n' "${SANDBOX_CONTEXT_PATH}"
-        printf '%s\n' "${_SANDBOX_CONTEXT_TEXT}" | sed 's/^/# /; s/ *$//'
-    fi
+    [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_print_dry_run
+    _net_log_print_dry_run
+    for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
+        printf '\n# Descriptor %s, filled by the relay with the %s:\n#\n' "${_n}" "${_BWRAP_FD_LABEL["${_n}"]}"
+        printf '%s\n' "${_BWRAP_FD_DATA["${_n}"]}" | sed 's/^/# /; s/ *$//'
+    done
     exit 0
 }
 
@@ -3634,17 +5833,58 @@ print_dry_run() {
 # `env` is resolved via resolve_env_bin (prefers /usr/bin/env) rather than
 # via PATH lookup at exec time — this prevents a user shell script named
 # "env" earlier on PATH from hijacking the launch.  See resolve_env_bin.
+#
+# pasta starts the descriptor relay in the sandbox's network namespace (see
+# "Network isolation"; on the host network the relay is exec'd directly); the
+# relay opens the descriptors that BWRAP_ARGS refers
+# to (see "File descriptor relay") and execs bwrap.
 launch_sandbox() {
     verify_n2c_state_not_exposed
-    local _BWRAP_BIN _ENV_BIN
+    _net_require_configured
+    local _BWRAP_BIN _ENV_BIN _BASH_BIN _n
     _BWRAP_BIN="$(resolve_bwrap_bin)"
     _ENV_BIN="$(resolve_env_bin)"
+    _BASH_BIN="$(resolve_bash_bin)"
 
+    local -a _data_env=() _net_prefix=()
+    _net_print_report
+    _net_log_start
+    if [[ "${_NET_BACKEND}" == pasta ]]; then
+        _net_prefix=("${_PASTA_BIN}" "${PASTA_ARGS[@]}" --)
+    elif [[ "${_NET_BACKEND}" == slirp4netns ]]; then
+        _net_prefix=("${_NET_PY_BIN}" -I -c "${_NET_NS_IDENTITY}")
+        if [[ "${_NET_DNS_RELAY}" -eq 1 ]]; then
+            _net_prefix+=(--dns "${_NET_DNS_RELAY_ADDR}" "${_NET_DNS_RELAY_PORT}"
+                "${_NET_FD_DNS_UDP}" "${_NET_FD_DNS_TCP}")
+        fi
+        _net_prefix+=(--)
+    fi
+    _bwrap_fd_data_numbers
+    for _n in ${_BWRAP_FD_DATA_NUMS[@]+"${_BWRAP_FD_DATA_NUMS[@]}"}; do
+        _data_env+=("_BWRAP_FD_DATA_${_n}=${_BWRAP_FD_DATA["${_n}"]}")
+    done
+
+    [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_start
+    if [[ -n "${_NET_LOG_FIFO}" ]]; then
+        # pasta's stderr goes to the network log (see "Network log"): a
+        # write-only, append descriptor, the only kind SELinux lets pasta
+        # keep.  The hold makes the open return at once even if the reader
+        # is not yet there; it must not survive into pasta, so it is closed
+        # again before the exec.
+        local _hold
+        exec {_hold}<> "${_NET_LOG_FIFO}"
+        exec 2>> "${_NET_LOG_FIFO}"
+        exec {_hold}<&-
+    fi
     exec "${_ENV_BIN}" -i \
         HOME="${_HOME}" \
         USER="${_USER}" \
         LOGNAME="${_USER}" \
         PATH="/usr/bin:/bin" \
         ${SANDBOX_ENV[@]+"${SANDBOX_ENV[@]}"} \
+        ${_data_env[@]+"${_data_env[@]}"} \
+        ${_net_prefix[@]+"${_net_prefix[@]}"} \
+        "${_BASH_BIN}" -c "${_BWRAP_FD_RELAY_SHIM}" bwrap-fd-relay \
+        ${_BWRAP_FD_RELAY[@]+"${_BWRAP_FD_RELAY[@]}"} -- \
         "${_BWRAP_BIN}" "${BWRAP_ARGS[@]}" -- "${_TOOL_CMD[@]}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"}
 }

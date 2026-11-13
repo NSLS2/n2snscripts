@@ -1,0 +1,59 @@
+#!/bin/bash
+# Run a bw* launcher against the fake network backends in tests/fakes.
+#
+#   tests/fake-net-run [--backend pasta|slirp4netns] LAUNCHER [ARGS...]
+#
+# An outer bwrap supplies what the development sandbox lacks: a character
+# device at /dev/net/tun (/dev/null), and plain-file copies of /etc/resolv.conf
+# and /etc/hosts (a file that is itself a bwrap data mount cannot be bound
+# again).  The real pasta is hidden; --backend slirp4netns leaves the fake
+# pasta off PATH too.  The fakes read failure modes from $FAKE_NET_DIR.
+# FAKE_NET_LOG=journal (default), syslog, both or none puts a socket file at
+# /run/systemd/journal/stdout, /dev/log, both or neither (so the launcher
+# picks the fake systemd-cat or logger, which write to
+# $FAKE_NET_DIR/journal.log).
+set -euo pipefail
+here="$(dirname "$(readlink -f "$0")")"
+backend=pasta
+if [[ "${1:-}" == --backend ]]; then
+	backend="$2"
+	shift 2
+fi
+export FAKE_NET_DIR="${FAKE_NET_DIR:-/tmp/opencode/fakenet}"
+mkdir -p "${FAKE_NET_DIR}/etc"
+cat /etc/resolv.conf >"${FAKE_NET_DIR}/etc/resolv.conf"
+cat /etc/hosts >"${FAKE_NET_DIR}/etc/hosts"
+# A fresh /etc: the plain copies, plus every other entry bound as it is.
+etc=(--tmpfs /etc)
+for e in /etc/* /etc/.[!.]*; do
+	[[ -e "${e}" || -L "${e}" ]] || continue
+	case "${e}" in
+	/etc/resolv.conf | /etc/hosts) ;;
+	*) etc+=(--ro-bind "${e}" "${e}") ;;
+	esac
+done
+etc+=(--ro-bind "${FAKE_NET_DIR}/etc/resolv.conf" /etc/resolv.conf)
+etc+=(--ro-bind "${FAKE_NET_DIR}/etc/hosts" /etc/hosts)
+logsock=()
+mksock() {
+	rm -f "$1"
+	python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"
+}
+case "${FAKE_NET_LOG:-journal}" in
+journal | both)
+	mksock "${FAKE_NET_DIR}/journal.sock"
+	logsock+=(--dir /run/systemd/journal --bind "${FAKE_NET_DIR}/journal.sock" /run/systemd/journal/stdout)
+	;;&
+syslog | both)
+	mksock "${FAKE_NET_DIR}/devlog.sock"
+	logsock+=(--bind "${FAKE_NET_DIR}/devlog.sock" /dev/log)
+	;;
+esac
+path="${here}/fakes/bin:${PATH}"
+[[ "${backend}" != pasta ]] || path="${here}/fakes/pasta-bin:${path}"
+exec bwrap --dev-bind / / --dev /dev --dev-bind /dev/null /dev/net/tun \
+	--ro-bind /dev/null /usr/bin/passt \
+	"${etc[@]}" \
+	${logsock[@]+"${logsock[@]}"} \
+	--chdir "${PWD}" \
+	-- env PATH="${path}" "$@"

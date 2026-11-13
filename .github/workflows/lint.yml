@@ -123,6 +123,9 @@ jobs:
               2>&1 | tee /tmp/prek-output.txt
           fi
 
+      - name: Run unit tests
+        run: pixi run -e dev test
+
       - name: Write job summary
         if: always()
         env:
