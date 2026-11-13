@@ -89,7 +89,8 @@
 # --serve-open (with --serve) opens the signed-in web UI on the SAME host: a
 # helper on the host (outside the sandbox) waits for the server, asks it for
 # its own one-time sign-in link and starts google-chrome --app=LINK (or
-# chromium, else xdg-open).  Never started without the option.
+# chromium, else firefox or the registered default browser).  Never started
+# without the option.
 #
 # Usage:
 #   bwopencode2 [bwopencode2-options] [opencode2 arguments...]
@@ -392,10 +393,12 @@ Wrapper options (consumed before opencode2 sees the command line):
                   without this option).  The browser is started outside the sandbox
                   with a one-time link of its own: google-chrome --app=LINK (an
                   app window), else google-chrome-stable, chromium,
-                  chromium-browser, else xdg-open LINK.  BWOPENCODE2_SERVE_BROWSER
-                  names another browser.  Opens nothing, and says so, when neither
-                  DISPLAY nor WAYLAND_DISPLAY is set.  Not for use over ssh from
-                  another machine: use the printed ssh command there.
+                  chromium-browser, else firefox LINK, else xdg-open LINK but only
+                  when a default web browser is registered (xdg-mime).
+                  BWOPENCODE2_SERVE_BROWSER names another browser.  Opens nothing,
+                  and says so, when neither DISPLAY nor WAYLAND_DISPLAY is set or no
+                  browser is found.  Not for use over ssh from another machine: use
+                  the printed ssh command there.
   --serve-ssh-config
                   Print the ssh_config block (one alias, one LocalForward per port
                   of the range, to your address 127.H1.H2.1) for the machine your
@@ -907,6 +910,20 @@ serve_print_info() {
 # after 5 minutes, and the published address already accepts connections from
 # every local user, with the password as the only protection.
 
+# Browsers tried, in order, when BWOPENCODE2_SERVE_BROWSER is not set; then the
+# default browser through xdg-open (see serve_open_default_browser).
+SERVE_OPEN_CANDIDATES=(google-chrome google-chrome-stable chromium chromium-browser firefox)
+
+# True when a default web browser is registered.  Without one, xdg-open does not
+# fail: it hands the link to whatever opens a URL as a file (on GNOME, the text
+# editor), which would also use up the one-time link.
+serve_open_default_browser() {
+    local _h
+    command -v xdg-mime > /dev/null 2>&1 || return 1
+    _h="$(xdg-mime query default x-scheme-handler/https 2> /dev/null)" || return 1
+    [[ -n "${_h}" ]]
+}
+
 # Choose the browser: sets SERVE_OPEN_BIN (empty when nothing will be opened,
 # with SERVE_OPEN_WHY saying why) and SERVE_OPEN_APP (1 for Chromium-based
 # browsers, which take --app=URL).
@@ -926,12 +943,15 @@ serve_open_pick_browser() {
             exit 1
         fi
     else
-        for _cand in google-chrome google-chrome-stable chromium chromium-browser xdg-open; do
+        for _cand in ${SERVE_OPEN_CANDIDATES[@]+"${SERVE_OPEN_CANDIDATES[@]}"}; do
             _b="$(command -v -- "${_cand}" 2> /dev/null)" && break
             _b=""
         done
+        if [[ -z "${_b}" ]] && serve_open_default_browser; then
+            _b="$(command -v -- xdg-open 2> /dev/null)" || _b=""
+        fi
         if [[ -z "${_b}" ]]; then
-            SERVE_OPEN_WHY="none of google-chrome, chromium or xdg-open was found"
+            SERVE_OPEN_WHY="no web browser found: none of ${SERVE_OPEN_CANDIDATES[*]-} is installed and no default browser is registered"
             return 0
         fi
     fi

@@ -1265,7 +1265,12 @@ bwopencode2 --serve --serve-open
   launcher has exited.
 - **Which browser.** The first of `google-chrome`, `google-chrome-stable`,
   `chromium`, `chromium-browser` on `PATH`, started as `BROWSER
-  --app=LINK` (an app window); else `xdg-open LINK` (the default browser).
+  --app=LINK` (an app window); else `firefox LINK`; else `xdg-open LINK`, but
+  only when a default web browser is registered (`xdg-mime query default
+  x-scheme-handler/https` prints one). Without one `xdg-open` does not fail: on
+  GNOME it opens the link in the text editor, which shows "Could Not Open File,
+  HTTP Client Error: Unauthorized" and has used up the one-time link (seen on a
+  workstation with no browser installed, and the reason for this rule).
   `BWOPENCODE2_SERVE_BROWSER` names another command, which must exist
   (otherwise the launch stops): a name containing `chrom`, `edge` or `brave`
   gets `--app=`, any other (`firefox`, `xdg-open`) gets the plain link.
@@ -1302,7 +1307,7 @@ a backslash; a new code on Enter through a pseudo-terminal; no spinning at end
 of input; a failed pairing) and the host helper against a stub browser (the
 `--app=` link, the plain link, the login page when no link came, a launcher
 that has gone, a helper that survives the launcher's `exec`, nothing on
-`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 31 checks through
+`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 40 checks through
 `--dry-run` (arguments, browser choice, no display). Not checked, because it
 needs a real launch and a browser: that Chrome opens an app window signed in,
 whether `/auth/connect/<code>` goes on to the UI after setting the cookie,

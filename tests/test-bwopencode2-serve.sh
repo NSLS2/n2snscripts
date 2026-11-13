@@ -45,6 +45,11 @@ for _b in google-chrome chromium xdg-open firefox; do
     chmod +x "${T}/bin/${_b}"
 done
 
+# xdg-mime: prints the default browser registered in the test, if any (the file
+# default-browser holds its name).
+printf '#!/bin/sh\ncat "%s/default-browser" 2>/dev/null\n' "${T}" > "${T}/bin/xdg-mime"
+chmod +x "${T}/bin/xdg-mime"
+
 # run [VAR=VALUE ...] -- ARGS...: dry-run the launcher; sets OUT, ERR, RC.  A
 # desktop session is assumed (DISPLAY) unless the caller sets DISPLAY= ; PATH
 # has the stub browsers first, so a browser the host has does not matter for
@@ -122,6 +127,31 @@ check '... and names no browser' lacks "${ERR}" '--app='
 
 run DISPLAY= WAYLAND_DISPLAY=wayland-0 -- --serve --serve-open
 check 'WAYLAND_DISPLAY alone counts as a desktop session' contains "${ERR}" 'will be started on this host'
+
+# ── --serve-open: no browser installed (a workstation without one) ──────
+
+# HARNESS_SERVE_OPEN_CANDIDATES= : none of the usual browsers is installed.  The
+# stub xdg-open is on PATH, as the real one is on a GNOME host, but no default
+# browser is registered: xdg-open would hand the link to the text editor.
+rm -f "${T}/default-browser"
+run HARNESS_SERVE_OPEN_CANDIDATES= -- --serve --serve-open
+check 'no browser and no default browser: still a normal launch' rc_is 0
+check '... nothing will be opened, and why' contains "${ERR}" 'nothing will be opened (no web browser found'
+check '... xdg-open is not used' lacks "${ERR}" 'xdg-open'
+check '... and no browser ran' [ ! -e "${T}/ran-xdg-open" ]
+
+echo 'firefox.desktop' > "${T}/default-browser"
+run HARNESS_SERVE_OPEN_CANDIDATES= -- --serve --serve-open
+check 'a registered default browser is reached through xdg-open' contains "${ERR}" "${T}/bin/xdg-open http://127."
+check '... without --app' lacks "${ERR}" '--app='
+rm -f "${T}/default-browser"
+
+run HARNESS_SERVE_OPEN_CANDIDATES=firefox -- --serve --serve-open
+check 'firefox is used when it is installed' contains "${ERR}" "${T}/bin/firefox http://127."
+check '... without --app' lacks "${ERR}" '--app='
+
+run HARNESS_SERVE_OPEN_CANDIDATES="chromium firefox" -- --serve --serve-open
+check 'a Chromium-based browser is tried before firefox' contains "${ERR}" "${T}/bin/chromium --app=http://127."
 
 # ── nothing else changed ─────────────────────────────────────────────────
 
