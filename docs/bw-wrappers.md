@@ -1283,6 +1283,13 @@ bwopencode2 --serve --serve-open
   signed-in session for 30 days (the published address already accepts
   connections from every local user, and the password is the only thing that
   stops them). Do not use `--serve-open` on a host where other people log in.
+- **Only a browser signs in.** The server answers `GET /auth/connect/<code>`
+  with `302` to `/` and the login cookie only when the request asks for HTML
+  (`Accept: text/html`, which every browser sends). Any other client (`curl`,
+  the GNOME text editor through gvfs) gets `200` with a JSON token, no cookie,
+  and the code is used up. Checked with OpenCode 2.2.7: `Accept: text/html`
+  alone gives `302` and the cookie (`Sec-Fetch-*` headers alone do not), and
+  a second use of the same code gives `401`.
 - **Cookie.** The cookie goes into the browser's normal profile, named by the
   port as above. Opening `http://127.H1.H2.1:<port>/` again later stays signed
   in for as long as the session lives.
@@ -1310,9 +1317,11 @@ that has gone, a helper that survives the launcher's `exec`, nothing on
 `--dry-run`); `tests/test-bwopencode2-serve.sh` makes 40 checks through
 `--dry-run` (arguments, browser choice, no display). Not checked, because it
 needs a real launch and a browser: that Chrome opens an app window signed in,
-whether `/auth/connect/<code>` goes on to the UI after setting the cookie,
 Enter at a terminal inside `bwrap --new-session`, and the helper's output on a
-terminal.
+terminal. A real launch on a workstation with no browser, with a stand-in
+browser script, showed the helper starting it once the server answered, with
+the link of its own; that the link redirects to `/` with the cookie was
+checked with `curl` against a throwaway server (see "Only a browser signs in").
 
 ## `bwopenchamber`
 
