@@ -33,7 +33,7 @@ echo "walker: ${_BWRAP_FD_DATA_NUMS[*]}"
 env=()
 for n in "${_BWRAP_FD_DATA_NUMS[@]}"; do env+=("_BWRAP_FD_DATA_${n}=${_BWRAP_FD_DATA[${n}]}"); done
 exec env "${env[@]}" bash -c "${_BWRAP_FD_RELAY_SHIM}" bwrap-fd-relay "${_BWRAP_FD_RELAY[@]}" -- \
-    sh -c 'for n in 10 11 12; do printf "%s=%s\n" "$n" "$(eval "cat <&$n")"; done' 2>/dev/null
+    bash -c 'for n in 10 11 12; do printf "%s=%s\n" "$n" "$(eval "cat <&$n")"; done' 2>/dev/null
 """
 
 DATA = ["10", "data", "11", "data", "12", "data"]
