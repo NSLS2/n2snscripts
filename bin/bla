@@ -19,9 +19,11 @@ set -o pipefail
 
 readonly PROGRAM_NAME="${0##*/}"
 
-# The account the agents run as. Staff run this script as themselves; it
-# re-runs itself through sudo, so nobody has to remember the account name or
-# the sudo line. The sudoers rule still decides who is allowed.
+# The account the agents run as. The caller runs this script as whoever they
+# are -- the sudoers rule names the beamline operator account, so that is
+# normally it -- and it re-runs itself through sudo, so nobody has to remember
+# the account name or the sudo line. The sudoers rule still decides who is
+# allowed.
 readonly AGENT_ACCOUNT=xfagent
 
 # The bw* wrappers sit next to this script, and are run by absolute path: sudo
@@ -271,8 +273,9 @@ main() {
         die "unknown agent '${agent}'. Known agents: $(echo "${!AGENT_WRAPPERS[@]}" | tr ' ' '\n' | sort | tr '\n' ' ')"
     [[ $# -le 1 ]] || die "no options are accepted after the agent name (got: ${*:2})"
 
-    # Staff run this as themselves; set up the agent directory while we still
-    # are them (they own their home), then re-run as the agent account.
+    # Still the caller here, normally the beamline operator account. Set up the
+    # agent directory now, while we are the account that owns the home, because
+    # the agent account cannot create it there. Then re-run as the agent.
     if [[ "$(id -un)" != "${AGENT_ACCOUNT}" ]]; then
         [[ "$(id -un)" != root ]] || die "refusing to run for root"
         ensure_agent_dir "${HOME}" "$(id -un)"
@@ -288,7 +291,7 @@ main() {
     fi
 
     local user="${SUDO_USER:-}"
-    [[ -n "${user}" ]] || die "cannot tell who you are: run ${PROGRAM_NAME} as yourself, not as ${AGENT_ACCOUNT}"
+    [[ -n "${user}" ]] || die "cannot tell who you are: run ${PROGRAM_NAME} from the account you logged in with, not as ${AGENT_ACCOUNT}"
     [[ "${user}" != root ]] || die "refusing to run for root"
 
     local home
