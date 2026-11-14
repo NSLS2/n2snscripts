@@ -135,7 +135,7 @@ class WrapperTest(unittest.TestCase):
         self.server.chmod(0o700)
         self.port = free_port()
 
-    def start(self, password=PASSWORD, stdin=subprocess.DEVNULL, extra_env=None, pw_kind="random"):
+    def start(self, password=PASSWORD, stdin=subprocess.DEVNULL, extra_env=None, pw_kind="random", mode="full", why=""):
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "OPENCODE_PASSWORD": password,
@@ -154,6 +154,8 @@ class WrapperTest(unittest.TestCase):
                 "testhost.example.org",
                 "testhost-oc",
                 pw_kind,
+                mode,
+                why,
             ],
             env=env,
             stdin=stdin,
@@ -197,6 +199,47 @@ class WrapperTest(unittest.TestCase):
         self.assertIn(f"http://127.0.0.1:{self.port}/\n", out)
         self.assertNotIn("/auth/connect/", out)
         self.assertNotIn("Press Enter", out)
+
+    def test_local_mode_is_only_a_link_and_the_password(self):
+        # --serve-open with no browser to start: the link for this machine, why,
+        # and the password for the page's "Use password"; none of the ssh block.
+        self.start(mode="local", why="no web browser found")
+        out = self.reader.until("If the link fails")
+        port = self.port
+        self.assertIn("could not open a browser (no web browser found).", out)
+        self.assertIn(f"Open this on this machine:  http://127.9.9.1:{port}/auth/connect/code1", out)
+        self.assertIn("press Enter for a new link", out)
+        self.assertIn(f'If the link fails, click "Use password": {PASSWORD}', out)
+        for text in ("ssh", "google-chrome", "127.0.0.1", "On this host"):
+            self.assertNotIn(text, out)
+
+    def test_local_mode_with_a_fixed_password_does_not_print_it(self):
+        self.start(mode="local", why="no desktop", pw_kind="fixed")
+        out = self.reader.until("BWOPENCODE2_SERVE_PASSWORD")
+        self.assertIn("/auth/connect/code1", out)
+        self.assertNotIn(PASSWORD, out)
+
+    def test_local_mode_without_a_link_points_at_the_page_and_password(self):
+        self.start(mode="local", why="no desktop", extra_env={"FAKE_PAIR": "fail"})
+        out = self.reader.until("If the link fails")
+        self.assertIn(f'click "Use password":  http://127.9.9.1:{self.port}/', out)
+        self.assertNotIn("/auth/connect/", out)
+        self.assertNotIn("press Enter", out)
+
+    def test_quiet_mode_prints_nothing_until_enter_asks_for_a_link(self):
+        # The host helper reports whether the browser opened; the wrapper stays silent.
+        master, slave = pty.openpty()
+        try:
+            self.start(stdin=slave, mode="quiet")
+            os.close(slave)
+            self.assertEqual(self.reader.pending(3), "")
+            os.write(master, b"\n")
+            out = self.reader.until("If the link fails")
+            self.assertIn(f"Open this on this machine:  http://127.9.9.1:{self.port}/auth/connect/code1", out)
+            self.assertNotIn("could not open a browser", out)
+            self.assertNotIn("ssh", out)
+        finally:
+            os.close(master)
 
     def test_enter_prints_a_new_link(self):
         master, slave = pty.openpty()
@@ -258,14 +301,16 @@ class OpenHelperTest(unittest.TestCase):
         self.addCleanup(lambda: (proc.kill(), proc.wait()))
         return proc
 
-    def run_helper(self, app, pid_expr='"$$"', timeout=30):
+    def run_helper(self, app, pid_expr='"$$"', timeout=30, browser=None, random=1):
         script = f"""
 set -euo pipefail
 source "{WRAPPER}"
 SERVE_ADDR=127.0.0.1
 SERVE_PORT={self.port}
 SERVE_PASSWORD='{PASSWORD}'
-SERVE_OPEN_BIN="{self.browser}"
+SERVE_PASSWORD_RANDOM={random}
+SERVE_OPEN_WAIT_SECONDS=1
+SERVE_OPEN_BIN="{browser or self.browser}"
 SERVE_OPEN_APP={app}
 serve_open_run {pid_expr} "$(bwrap_proc_start_time "$$")"
 """
@@ -291,7 +336,9 @@ serve_open_run {pid_expr} "$(bwrap_proc_start_time "$$")"
             self.argv_log.read_text().split("\n")[:-1],
             [f"--app=http://127.0.0.1:{self.port}/auth/connect/code1"],
         )
-        self.assertIn("started", result.stderr)
+        self.assertIn(f"OpenCode web UI on 127.0.0.1:{self.port}, opened in browser.", result.stderr)
+        self.assertEqual(result.stderr.strip().count("\n"), 0, "one line when the browser opened")
+        self.assertNotIn(PASSWORD, result.stderr)
 
     def test_other_browsers_get_the_plain_link(self):
         self.start_server()
@@ -310,7 +357,53 @@ serve_open_run {pid_expr} "$(bwrap_proc_start_time "$$")"
             self.argv_log.read_text().split("\n")[:-1],
             [f"--app=http://127.0.0.1:{self.port}/"],
         )
-        self.assertIn("could not get a pairing link", result.stderr)
+        self.assertIn("opened in browser.", result.stderr)
+        self.assertIn(f'The server gave no sign-in link: click "Use password": {PASSWORD}', result.stderr)
+
+    def _failing_browser(self, status):
+        stub = Path(self.tmp.name) / f"failing-browser-{status}"
+        stub.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" >> {self.argv_log}.tries\nexit {status}\n")
+        stub.chmod(0o700)
+        return stub
+
+    def test_a_browser_that_fails_gives_a_fresh_link_and_the_password(self):
+        # The failed attempt used code1 (the browser may have fetched it), so the
+        # link to open by hand must be a new one.
+        self.start_server()
+        result = self.run_helper(app=1, browser=self._failing_browser(3))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        err = result.stderr
+        self.assertIn("could not open a browser (failing-browser-3 exited with status 3).", err)
+        self.assertIn(f"Open this on this machine:  http://127.0.0.1:{self.port}/auth/connect/code2", err)
+        self.assertIn("press Enter for a new link", err)
+        self.assertIn(f'If the link fails, click "Use password": {PASSWORD}', err)
+        self.assertNotIn("opened in", err)
+        tries = Path(f"{self.argv_log}.tries").read_text()
+        self.assertIn("/auth/connect/code1", tries)
+
+    def test_a_fixed_password_is_not_printed_in_the_fallback(self):
+        self.start_server()
+        result = self.run_helper(app=1, browser=self._failing_browser(1), random=0)
+        self.assertIn("could not open a browser", result.stderr)
+        self.assertIn("BWOPENCODE2_SERVE_PASSWORD", result.stderr)
+        self.assertNotIn(PASSWORD, result.stderr)
+
+    def test_a_browser_that_exits_cleanly_counts_as_opened(self):
+        # Chrome hands the link to a window that is already open and exits 0.
+        self.start_server()
+        result = self.run_helper(app=1, browser=self._failing_browser(0))
+        self.assertIn("opened in failing-browser-0.", result.stderr)
+        self.assertNotIn("could not open", result.stderr)
+
+    def test_a_browser_still_running_after_the_wait_counts_as_opened(self):
+        self.start_server()
+        slow = Path(self.tmp.name) / "slow-opened-browser"
+        slow.write_text("#!/bin/sh\nsleep 6\n")
+        slow.chmod(0o700)
+        started = time.monotonic()
+        result = self.run_helper(app=1, browser=slow)
+        self.assertLess(time.monotonic() - started, 5, "the helper must not wait for the browser to end")
+        self.assertIn("opened in slow-opened-browser.", result.stderr)
 
     def test_launcher_gone_opens_nothing(self):
         # A pid that cannot be the launcher: the helper must stop without waiting for the server.
@@ -424,6 +517,49 @@ sleep 3
         self.assertNotIn(PASSWORD, self.argv_log.read_text())
         # The pairing code is the only secret the link holds.
         self.assertIsNotNone(re.search(r"/auth/connect/code\d+\n$", self.argv_log.read_text()))
+
+
+class StartMessageTest(unittest.TestCase):
+    """serve_print_info: what the launcher prints before the sandbox starts."""
+
+    def message(self, serve_open, dry_run=0):
+        script = f"""
+set -euo pipefail
+source "{WRAPPER}"
+SERVE_ADDR=127.52.255.1
+SERVE_PORT=24700
+NET_SHARE=1
+SERVE_OPEN={serve_open}
+SERVE_OPEN_BIN=/usr/bin/google-chrome
+SERVE_OPEN_APP=1
+DRY_RUN={dry_run}
+serve_print_info
+"""
+        result = subprocess.run(
+            ["bash", "-c", script],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/nonexistent"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stderr
+
+    def test_serve_open_prints_one_line(self):
+        lines = [x for x in self.message(1).split("\n") if x]
+        self.assertEqual(lines, ["bwopencode2: starting the sandboxed OpenCode 2 web UI on 127.52.255.1:24700"])
+
+    def test_serve_keeps_its_text(self):
+        out = self.message(0)
+        self.assertIn("starting the sandboxed OpenCode 2 web UI on 127.52.255.1:24700 (this host only)", out)
+        self.assertIn(
+            "The ssh command, a one-time sign-in link and the password are printed once the server is up.", out
+        )
+        self.assertNotIn("--serve-open", out)
+
+    def test_serve_open_dry_run_names_the_browser_it_would_start(self):
+        out = self.message(1, dry_run=1)
+        self.assertIn("/usr/bin/google-chrome --app=http://127.52.255.1:24700/auth/connect/CODE will be started", out)
 
 
 if __name__ == "__main__":

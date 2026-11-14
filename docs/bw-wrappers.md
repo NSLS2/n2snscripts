@@ -1262,12 +1262,38 @@ bwopencode2 --serve-open [--serve-port N]
   not change at `exec`, so the helper can tell when the launcher has gone). The
   helper waits up to about a minute for the server to answer on
   `127.H1.H2.1:<port>`, asks it for **a one-time pairing code of its own**
-  (the sandbox prints another for the ssh case, so neither uses the other's),
   and starts the browser detached (`setsid`, output discarded), so ending the
   server does not close the window. The password reaches `curl` on its standard
-  input. The helper prints one line when it starts the browser, and a line when
-  the server never answered; it opens nothing in that case, nor when the
-  launcher has exited.
+  input. It opens nothing when the launcher has exited.
+- **What the terminal shows.** Nothing of the ssh block: `--serve-open` is for
+  the host you are on. The launcher prints one line before the sandbox starts,
+  then either
+
+  ```text
+  bwopencode2: OpenCode web UI on 127.52.255.1:24700, opened in google-chrome.
+  ```
+
+  or, if no browser opened, a link to open by hand and the password:
+
+  ```text
+  bwopencode2: could not open a browser (no web browser found: ...).
+    Open this on this machine:  http://127.52.255.1:24700/auth/connect/<code>
+    (works once, expires in 5 minutes; press Enter for a new link)
+    If the link fails, click "Use password": <password>
+  ```
+
+  The helper decides after starting the browser: one that exits with an error
+  within 8 seconds (`xdg-open` with no handler, a browser that cannot start)
+  counts as not opened, and one still running, or that exited 0 (Chrome handing
+  the link to a window that is already open), counts as opened. A browser that
+  fails later is not noticed. The fallback link is a **new** code, because a
+  failed attempt may already have used the first. The same fallback is printed
+  by the helper when the server never answered, and by the sandbox's wrapper
+  when no browser could be chosen (no desktop session, none installed; the line
+  says why). Enter prints a new link in the same short form. The password is printed only in the
+  fallback (random password; with `BWOPENCODE2_SERVE_PASSWORD` the line names the
+  variable), never when the browser opened. `--serve` prints the full block
+  described above, unchanged.
 - **Which browser.** The first of `google-chrome`, `google-chrome-stable`,
   `chromium`, `chromium-browser` on `PATH`, started as `BROWSER
   --app=LINK` (an app window); else `firefox LINK`; else `xdg-open LINK`, but
@@ -1328,7 +1354,7 @@ a backslash; a new code on Enter through a pseudo-terminal; no spinning at end
 of input; a failed pairing) and the host helper against a stub browser (the
 `--app=` link, the plain link, the login page when no link came, a launcher
 that has gone, a helper that survives the launcher's `exec`, nothing on
-`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 53 checks through
+`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 57 checks through
 `--dry-run` (arguments, browser choice, no display). Not checked, because it
 needs a real launch and a browser: that Chrome opens an app window signed in,
 Enter at a terminal inside `bwrap --new-session`, and the helper's output on a

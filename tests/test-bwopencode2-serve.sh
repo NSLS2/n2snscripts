@@ -84,6 +84,13 @@ check '... and a random password is announced to it as such' contains "${OUT}" '
 check 'the password is passed to the server (hidden)' contains "${OUT}" "OPENCODE_PASSWORD='REDACTED'"
 check 'no browser ran' [ ! -e "${T}/ran-google-chrome" ]
 
+check '--serve runs the wrapper in full mode' contains "${OUT}" 'random full'
+run -- --serve-open
+check '--serve-open with a browser runs the wrapper quietly (the host helper reports)' contains "${OUT}" 'random quiet'
+run DISPLAY= -- --serve-open
+check '--serve-open with no browser runs the wrapper in local mode' contains "${OUT}" 'random local'
+check '... and gives it the reason' contains "${OUT}" 'neither\ DISPLAY\ nor\ WAYLAND_DISPLAY\ is\ set'
+
 run BWOPENCODE2_SERVE_PASSWORD=a-fixed-password-123 -- --serve
 check 'a fixed password is announced to the wrapper as fixed' contains "${OUT}" '-oc fixed'
 check '... and never printed' lacks "${OUT}${ERR}" 'a-fixed-password-123'
@@ -137,7 +144,7 @@ check '... that names the variable' contains "${ERR}" 'BWOPENCODE2_SERVE_BROWSER
 run DISPLAY= -- --serve --serve-open
 check 'no desktop session: still a normal launch' rc_is 0
 check '... says nothing will be opened and why' contains "${ERR}" 'nothing will be opened (neither DISPLAY nor WAYLAND_DISPLAY is set'
-check '... and points at the ssh command' contains "${ERR}" 'ssh command'
+check '... and says the link to open by hand is printed' contains "${ERR}" 'link to open by hand'
 check '... and names no browser' lacks "${ERR}" '--app='
 
 run DISPLAY= WAYLAND_DISPLAY=wayland-0 -- --serve --serve-open

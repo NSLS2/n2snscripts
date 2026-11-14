@@ -728,14 +728,18 @@ serve_make_password() {
 # (the web UI's "Use password" button still works), and print a new link each
 # time Enter is pressed (a link works once and expires after 5 minutes, and
 # setting up an ssh tunnel can take longer than that).  It runs as
-# `bash -c SERVE_WRAPPER bwopencode2-serve BINARY PORT BIND SSHHOST SSHALIAS PWKIND`
-# (PWKIND is `random` or `fixed`).  OPENCODE_PASSWORD is in its environment.  The
+# `bash -c SERVE_WRAPPER bwopencode2-serve BINARY PORT BIND SSHHOST SSHALIAS PWKIND MODE WHY`
+# (PWKIND is `random` or `fixed`; MODE is `full` for --serve, the block with the
+# ssh command, `quiet` for --serve-open when the host helper opens a browser and
+# prints the result itself, and `local` for --serve-open when no browser can be
+# started, then WHY says why).  OPENCODE_PASSWORD is in its environment.  The
 # password reaches curl on stdin (-K -), never on a command line: a process in the
 # sandbox is visible to `ps` on the host.  printf is a builtin, so it does not
 # show either.  Needs only bash and curl.
 read -r -d '' SERVE_WRAPPER << 'SERVE_WRAPPER_EOF' || true
 set -u
 bin=$1 port=$2 bind=$3 ssh_host=${4:-localhost} ssh_alias=${5:-} pw_kind=${6:-random}
+mode=${7:-full} why=${8:-}
 # The server's own address for the requests below, and the host-side address
 # for the printed links (the publish address, or the bound one with --share-net).
 local_addr=$bind
@@ -801,6 +805,38 @@ show() {
     } >&2
 }
 
+# --serve-open: only a link to open on this machine, with the password for the
+# page's "Use password" if the link fails.  $1 is a first line, or empty.
+show_local() {
+    local url="http://${host_addr}:${port}/"
+    [[ -z $code ]] || url="http://${host_addr}:${port}/auth/connect/${code}"
+    {
+        printf '\n'
+        [[ -z $1 ]] || printf 'bwopencode2: %s\n' "$1"
+        if [[ -n $code ]]; then
+            printf '  Open this on this machine:  %s\n' "$url"
+            printf '  (works once, expires in 5 minutes; press Enter for a new link)\n'
+        else
+            printf '  Open this on this machine and click "Use password":  %s\n' "$url"
+        fi
+        if [[ $pw_kind == random ]]; then
+            printf '  If the link fails, click "Use password": %s\n\n' "$OPENCODE_PASSWORD"
+        else
+            printf '  Password: the value of BWOPENCODE2_SERVE_PASSWORD (shared by every session that uses it)\n\n'
+        fi
+    } >&2
+}
+
+# What to print for the current $code, by mode.  In quiet mode the host helper
+# prints the first message, so nothing is printed until Enter asks for a link.
+announce() {
+    case $mode in
+        full) show ;;
+        local) show_local "could not open a browser (${why})." ;;
+        *) [[ $1 == first ]] || show_local "" ;;
+    esac
+}
+
 # Wait up to about 30 s for the server to answer; without credentials /api/info
 # gives 401, which is enough to know it is listening.
 ready=0
@@ -817,8 +853,10 @@ while ((SECONDS < deadline)); do
 done
 
 if [[ $ready -eq 1 ]]; then
-    pair
-    show
+    if [[ $mode != quiet ]]; then
+        pair
+    fi
+    announce first
     # Enter asks for a new link.  The server was started as a background job, so
     # it has no stdin and cannot take the key.  Without a terminal, or at end of
     # input, stop listening for it: the loop must not spin.
@@ -826,7 +864,7 @@ if [[ $ready -eq 1 ]]; then
         while ((!stop)) && kill -0 "$srv" 2> /dev/null; do
             if IFS= read -r -t 1 _; then
                 pair
-                show
+                announce again
             elif (($? <= 128)); then
                 break
             fi
@@ -857,8 +895,16 @@ serve_prepare() {
         # shellcheck disable=SC2034  # read by bwrap_sandbox_lib.sh
         NET_PUBLISH_ADDR_FIXED_BY="--serve"
     fi
+    local _mode=full
+    if [[ "${SERVE_OPEN}" -eq 1 ]]; then
+        # The host helper opens the browser and reports; without one, the wrapper
+        # prints the link to open by hand.
+        _mode=local
+        [[ -z "${SERVE_OPEN_BIN}" ]] || _mode=quiet
+    fi
     _TOOL_CMD=(/usr/bin/bash -c "${SERVE_WRAPPER}" bwopencode2-serve "${_TOOL_BIN}" "${SERVE_PORT}" "${SERVE_BIND}"
-        "$(serve_host_name)" "$(serve_ssh_alias)" "$([[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]] && echo random || echo fixed)")
+        "$(serve_host_name)" "$(serve_ssh_alias)" "$([[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]] && echo random || echo fixed)"
+        "${_mode}" "${SERVE_OPEN_WHY}")
     TOOL_ARGS=()
 }
 # Tell the user what starts (stderr, before the exec).  The ssh command, the
@@ -870,9 +916,17 @@ serve_print_info() {
         echo "Error: --serve: the port was published on ${_NET_PUBLISH_ADDR_EFFECTIVE}, not ${_addr}." >&2
         exit 1
     fi
+    if [[ "${SERVE_OPEN}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
+        # One line: the host helper reports whether the browser opened, and the
+        # link to open by hand if it did not.
+        printf '\nbwopencode2: starting the sandboxed OpenCode 2 web UI on %s:%s\n' "${_addr}" "${SERVE_PORT}" >&2
+        return 0
+    fi
     {
         printf '\nbwopencode2: starting the sandboxed OpenCode 2 web UI on %s:%s (this host only)\n' "${_addr}" "${SERVE_PORT}"
-        printf '  The ssh command, a one-time sign-in link and the password are printed once the server is up.\n'
+        if [[ "${SERVE_OPEN}" -eq 0 ]]; then
+            printf '  The ssh command, a one-time sign-in link and the password are printed once the server is up.\n'
+        fi
         if [[ "${DRY_RUN}" -eq 1 ]]; then
             printf '  Password: (not shown on --dry-run)\n'
         fi
@@ -886,7 +940,7 @@ serve_print_info() {
                         "${SERVE_OPEN_BIN}" "${_addr}" "${SERVE_PORT}"
                 fi
             else
-                printf '  --serve-open: nothing will be opened (%s); use the ssh command printed below.\n' "${SERVE_OPEN_WHY}"
+                printf '  --serve-open: nothing will be opened (%s); the link to open by hand is printed once the server is up.\n' "${SERVE_OPEN_WHY}"
             fi
         fi
         printf '\n'
@@ -974,11 +1028,67 @@ serve_request_code() {
     fi
 }
 
+# How long the helper waits for a browser it started: one that exits with an
+# error within this time (xdg-open with no handler, a browser that cannot start)
+# counts as not opened.  One still running, or that exited 0 (Chrome handing the
+# link to a window that is already open), counts as opened.
+SERVE_OPEN_WAIT_SECONDS=8
+
+# The lines that give a link to open by hand (a fresh one-time link, because a
+# failed attempt may have used the first) and what to do if it fails.  $1: the
+# link, $2: its code (empty when the server gave none).
+serve_open_link_lines() {
+    if [[ -n "$2" ]]; then
+        printf '  Open this on this machine:  %s\n' "$1"
+        printf '  (works once, expires in 5 minutes; press Enter for a new link)\n'
+    else
+        printf '  Open this on this machine and click "Use password":  %s\n' "$1"
+    fi
+    if [[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]]; then
+        printf '  If the link fails, click "Use password": %s\n' "${SERVE_PASSWORD}"
+    else
+        printf '  Password: the value of BWOPENCODE2_SERVE_PASSWORD (shared by every session that uses it)\n'
+    fi
+}
+
+# Say that no browser opened, with the link to open by hand.  $1: why.
+serve_open_fallback() {
+    local _code _url="http://${SERVE_ADDR}:${SERVE_PORT}/"
+    _code="$(serve_request_code)"
+    [[ -z "${_code}" ]] || _url="${_url}auth/connect/${_code}"
+    {
+        printf '\nbwopencode2: could not open a browser (%s).\n' "$1"
+        serve_open_link_lines "${_url}" "${_code}"
+        printf '\n'
+    } >&2
+}
+
+# Start the browser command $@ detached and wait up to SERVE_OPEN_WAIT_SECONDS:
+# returns its exit status if it ended in that time, else 0.
+serve_open_browser() {
+    local _bpid _i _rc=0
+    if command -v setsid > /dev/null 2>&1 && setsid --help 2>&1 | grep -q -- --wait; then
+        setsid -w "$@" < /dev/null > /dev/null 2>&1 &
+    else
+        "$@" < /dev/null > /dev/null 2>&1 &
+    fi
+    _bpid=$!
+    for ((_i = 0; _i < SERVE_OPEN_WAIT_SECONDS * 5; _i++)); do
+        if ! kill -0 "${_bpid}" 2> /dev/null; then
+            wait "${_bpid}" && _rc=0 || _rc=$?
+            break
+        fi
+        sleep 0.2
+    done
+    return "${_rc}"
+}
+
 # The helper body.  $1 and $2: the launcher's pid and start time, to notice that
-# it has gone.  Runs in a background subshell (see serve_open_start).
+# it has gone.  Runs in a background subshell (see serve_open_start).  Prints one
+# line when the browser opened, else the link to open by hand.
 serve_open_run() {
     local _pid="$1" _start="$2" _base="http://${SERVE_ADDR}:${SERVE_PORT}"
-    local _http _ready=0 _deadline _code _url
+    local _http _ready=0 _deadline _code _url _rc=0
     local -a _cmd
     _deadline=$((SECONDS + 60))
     while ((SECONDS < _deadline)); do
@@ -992,7 +1102,7 @@ serve_open_run() {
         sleep 0.5
     done
     if [[ "${_ready}" -eq 0 ]]; then
-        printf 'bwopencode2: --serve-open: the server did not answer on %s:%s; no browser opened.\n' "${SERVE_ADDR}" "${SERVE_PORT}" >&2
+        serve_open_fallback "the server did not answer on ${SERVE_ADDR}:${SERVE_PORT}"
         return 0
     fi
     _code="$(serve_request_code)"
@@ -1000,7 +1110,6 @@ serve_open_run() {
         _url="${_base}/auth/connect/${_code}"
     else
         _url="${_base}/"
-        printf 'bwopencode2: --serve-open: could not get a pairing link; opening the login page, click "Use password".\n' >&2
     fi
     _cmd=("${SERVE_OPEN_BIN}")
     if [[ "${SERVE_OPEN_APP}" -eq 1 ]]; then
@@ -1008,12 +1117,20 @@ serve_open_run() {
     else
         _cmd+=("${_url}")
     fi
-    if command -v setsid > /dev/null 2>&1; then
-        setsid "${_cmd[@]}" < /dev/null > /dev/null 2>&1 &
-    else
-        "${_cmd[@]}" < /dev/null > /dev/null 2>&1 &
+    serve_open_browser "${_cmd[@]}" || _rc=$?
+    if [[ "${_rc}" -ne 0 ]]; then
+        serve_open_fallback "$(basename -- "${SERVE_OPEN_BIN}") exited with status ${_rc}"
+        return 0
     fi
-    printf 'bwopencode2: --serve-open: started %s on this host.\n' "${SERVE_OPEN_BIN}" >&2
+    printf '\nbwopencode2: OpenCode web UI on %s:%s, opened in %s.\n' \
+        "${SERVE_ADDR}" "${SERVE_PORT}" "$(basename -- "${SERVE_OPEN_BIN}")" >&2
+    if [[ -z "${_code}" ]]; then
+        if [[ "${SERVE_PASSWORD_RANDOM}" -eq 1 ]]; then
+            printf '  The server gave no sign-in link: click "Use password": %s\n' "${SERVE_PASSWORD}" >&2
+        else
+            printf '  The server gave no sign-in link: click "Use password" and enter the value of BWOPENCODE2_SERVE_PASSWORD.\n' >&2
+        fi
+    fi
 }
 
 # Close every descriptor above 2 (not 255, which bash reads this script through
