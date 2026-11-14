@@ -1474,7 +1474,11 @@ library is a follow-up.
 - **OpenChamber's data** (settings, projects, chats, worktrees, logs) is
   `~/.local/share/bwopenchamber` on the host, mounted at
   `~/.local/share/openchamber` in the sandbox: apart from any OpenChamber run
-  outside a sandbox, which is never mounted.
+  outside a sandbox, which is never mounted. It is bound whole and read-write,
+  so if it is a symlink the launcher resolves it and refuses a target that
+  contains a blocked path (for example a directory holding `~/.config/gh`), and
+  mounts the resolved path (found in Copilot's review of PR #43; the same check
+  as for the install directory).
 - **`run/` is an empty tmpfs.** OpenChamber writes its pid file and an instance
   file there, and the instance file contains the UI password in plain text (checked
   with 2.7.0), so it must not reach the persistent directory.
@@ -1547,7 +1551,7 @@ the environment alone let the fake run; with a read-only policy file at
 and the server still listened on `0.0.0.0` using `allowNetworkAccess` from the
 file.
 
-**Tests:** `tests/test-bwopenchamber.sh` (81 checks through `--dry-run`: argument
+**Tests:** `tests/test-bwopenchamber.sh` (104 checks through `--dry-run`: argument
 refusals, the environment and mounts built, the generated policy file, hostile
 host variables dropped, password and sign-in key handling, Node and install
 checks, and that a port held by another session does not change the result: the

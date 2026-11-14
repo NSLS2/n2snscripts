@@ -430,7 +430,12 @@ och_check_install() {
 och_resolve_paths() {
     OCH_DATA_SRC="${_HOME}/.local/share/bwopenchamber"
     OCH_DATA_DIR="${XDG_DATA_HOME}/openchamber"
-    _check_dir_safe "${OCH_DATA_SRC}" "OpenChamber data dir"
+    # Bound whole and read-write, so a symlink here must not lead to a directory
+    # that contains a blocked path (~/.config/gh, ~/.ssh): the bind check, not
+    # _check_dir_safe, which only looks at the path itself.  The resolved path is
+    # what is checked, created and mounted.
+    _bwrap_canonicalize_safe "${OCH_DATA_SRC}" "OpenChamber data dir"
+    OCH_DATA_SRC="${_BWRAP_CANON}"
 }
 
 # A random signing key for the browser sign-in cookies, new for each session.
