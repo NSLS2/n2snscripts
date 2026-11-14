@@ -157,6 +157,30 @@ check 'a port held by another session does not change the port the tests expect'
 kill "${busy_pid}" 2> /dev/null
 wait "${busy_pid}" 2> /dev/null
 
+# ── the data directory is bound whole, read-write ───────────────────────
+
+# A symlink as the data directory must not lead to a directory that contains a
+# blocked path (here ~/.config/gh): the whole tree would be bound read-write.
+mkdir -p "${T}/home/.config/gh" "${T}/elsewhere/data" "${T}/home/.local/share"
+echo x > "${T}/home/.config/gh/hosts.yml"
+ln -s "${T}/home/.config" "${T}/home/.local/share/bwopenchamber"
+run --
+check 'a data directory that is a symlink to one containing .config/gh is refused' rc_is 1
+check '... and the blocked path is named' contains "${ERR}" 'contains the blocked path'
+check '... and nothing was mounted' lacks "${OUT}" '/share/openchamber'
+rm "${T}/home/.local/share/bwopenchamber"
+
+ln -s "${T}/elsewhere/data" "${T}/home/.local/share/bwopenchamber"
+run --
+check 'a data directory that is a symlink to a harmless directory works' rc_is 0
+check '... and is mounted by its resolved path' contains "${OUT}" "--bind ${T}/elsewhere/data ${T}/home/.local/share/openchamber"
+rm "${T}/home/.local/share/bwopenchamber"
+rmdir "${T}/home/.local/share" 2> /dev/null || true
+
+run --
+check 'a plain data directory still works' rc_is 0
+check '... and is mounted as before' contains "${OUT}" "--bind ${T}/home/.local/share/bwopenchamber ${T}/home/.local/share/openchamber"
+
 # ── arguments ────────────────────────────────────────────────────────────
 
 for _args in '--host 0.0.0.0' '--lan' 'tunnel start' 'startup enable' 'connect-url --relay' '--ui-password x'; do
