@@ -86,11 +86,11 @@
 # an ssh -L tunnel).  The launcher builds those arguments itself; nothing from
 # the command line reaches `serve`.  See docs/bw-wrappers.md.
 #
-# --serve-open (with --serve) opens the signed-in web UI on the SAME host: a
+# --serve-open is --serve plus opening the signed-in web UI on the SAME host: a
 # helper on the host (outside the sandbox) waits for the server, asks it for
 # its own one-time sign-in link and starts google-chrome --app=LINK (or
 # chromium, else firefox or the registered default browser).  Never started
-# without the option.
+# without the option; --serve on its own opens nothing.
 #
 # Usage:
 #   bwopencode2 [bwopencode2-options] [opencode2 arguments...]
@@ -110,8 +110,8 @@
 #                   TUI and publish its port (see above).  One server per invocation.
 #   --serve-port N  With --serve: use port N (must be in the range) instead of the
 #                   first free one.
-#   --serve-open    With --serve: open the web UI, already signed in, in a browser on
-#                   this host (see above).
+#   --serve-open    Like --serve, and also open the web UI, already signed in, in a
+#                   browser on this host (see above).  --serve alone opens nothing.
 #   --serve-ssh-config
 #                   Print the ssh_config block that forwards the whole port range, then
 #                   exit.
@@ -271,6 +271,7 @@ parse_wrapper_args() {
                 shift
                 ;;
             --serve-open)
+                SERVE=1
                 SERVE_OPEN=1
                 shift
                 ;;
@@ -388,9 +389,10 @@ Wrapper options (consumed before opencode2 sees the command line):
                   with --exec.  One server per invocation.
   --serve-port N  With --serve, use port N (inside the range) instead of the first
                   free one; fails if it is taken.
-  --serve-open    With --serve, on a host with a desktop session: open the web UI,
-                  already signed in, in a browser on this host (never started
-                  without this option).  The browser is started outside the sandbox
+  --serve-open    Everything --serve does (it needs no --serve next to it), and on a
+                  host with a desktop session also open the web UI, already signed
+                  in, in a browser on this host (never started without this option;
+                  --serve alone opens nothing).  The browser is started outside the sandbox
                   with a one-time link of its own: google-chrome --app=LINK (an
                   app window), else google-chrome-stable, chromium,
                   chromium-browser, else firefox LINK, else xdg-open LINK but only
@@ -565,21 +567,17 @@ serve_print_ssh_config() {
 serve_check_args() {
     if [[ "${SERVE}" -eq 0 ]]; then
         if [[ -n "${SERVE_PORT_REQUEST}" ]]; then
-            echo "Error: --serve-port needs --serve." >&2
-            exit 1
-        fi
-        if [[ "${SERVE_OPEN}" -eq 1 ]]; then
-            echo "Error: --serve-open needs --serve." >&2
+            echo "Error: --serve-port needs --serve or --serve-open." >&2
             exit 1
         fi
         return 0
     fi
     if [[ -n "${TEST_CMD}" ]]; then
-        echo "Error: --serve cannot be combined with --exec." >&2
+        echo "Error: --serve and --serve-open cannot be combined with --exec." >&2
         exit 1
     fi
     if [[ ${#TOOL_ARGS[@]} -gt 0 ]]; then
-        echo "Error: --serve takes no opencode2 arguments (got '${TOOL_ARGS[*]}')." >&2
+        echo "Error: --serve and --serve-open take no opencode2 arguments (got '${TOOL_ARGS[*]}')." >&2
         exit 1
     fi
     if [[ -n "${NET_PUBLISH_ADDR}" ]]; then
@@ -791,7 +789,7 @@ show() {
         printf '         google-chrome --app=http://127.0.0.1:%s%s\n' "$port" "$path"
         printf '\n  On this host:\n'
         printf '    http://%s:%s%s\n' "$host_addr" "$port" "$path"
-        printf '    (or start with --serve-open to have a browser opened here)\n'
+        printf '    (or start with --serve-open instead of --serve to have a browser opened here)\n'
         if [[ -n $code ]]; then
             printf '\n  Link used or expired?  Press Enter here for a new one.\n'
         fi

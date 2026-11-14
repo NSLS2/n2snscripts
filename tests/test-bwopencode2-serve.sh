@@ -91,10 +91,25 @@ check '... and never printed' lacks "${OUT}${ERR}" 'a-fixed-password-123'
 # ── --serve-open: arguments ──────────────────────────────────────────────
 
 run -- --serve-open
-check '--serve-open without --serve is refused' rc_is 1
-check '... and says why' contains "${ERR}" '--serve-open needs --serve'
-run -- --serve --serve-open --exec true
+check '--serve-open works by itself, without --serve' rc_is 0
+check '... starts the same server as --serve' contains "${ERR}" 'starting the sandboxed OpenCode 2 web UI on 127.'
+check '... and opens the browser' contains "${ERR}" "${T}/bin/google-chrome --app=http://127."
+check '... with the same sandbox command as --serve' contains "${OUT}" 'bwopencode2-serve'
+check '... and a random password announced to it' contains "${OUT}" '-oc random'
+run -- --serve --serve-open
+check '--serve --serve-open together mean the same' contains "${ERR}" "${T}/bin/google-chrome --app=http://127."
+run -- --serve
+check '--serve by itself opens nothing' lacks "${ERR}" '--serve-open'
+check '... and starts no browser' [ ! -e "${T}/ran-google-chrome" ]
+run -- --serve-open --exec true
 check '--serve-open with --exec is refused (as --serve is)' rc_is 1
+check '... and says why' contains "${ERR}" '--serve and --serve-open cannot be combined with --exec'
+run -- --serve-open --serve-ssh-config
+check '--serve-ssh-config still just prints the block' rc_is 0
+run -- --serve-open extra-argument
+check '--serve-open takes no opencode2 arguments' rc_is 1
+run -- --serve-open --publish-addr 127.9.9.9
+check '--serve-open cannot be combined with --publish-addr' rc_is 1
 
 # ── --serve-open: the browser ────────────────────────────────────────────
 
@@ -109,7 +124,7 @@ run BWOPENCODE2_SERVE_BROWSER=xdg-open -- --serve --serve-open
 check 'xdg-open gets the plain link' contains "${ERR}" "${T}/bin/xdg-open http://127."
 check '... without --app' lacks "${ERR}" '--app='
 
-run BWOPENCODE2_SERVE_BROWSER=firefox -- --serve --serve-open
+run BWOPENCODE2_SERVE_BROWSER=firefox -- --serve-open
 check 'another browser gets the plain link' contains "${ERR}" "${T}/bin/firefox http://127."
 
 run BWOPENCODE2_SERVE_BROWSER=chromium -- --serve --serve-open
@@ -164,7 +179,10 @@ check 'a Chromium-based browser is tried before firefox' contains "${ERR}" "${T}
 run -- --serve --serve-port 24705
 check '--serve-port still works' contains "${ERR}" ':24705 (this host only)'
 run -- --serve-open --serve-port 24705
-check '--serve-open does not make --serve-port valid without --serve' rc_is 1
+check '--serve-port works with --serve-open by itself' contains "${ERR}" ':24705 (this host only)'
+run -- --serve-port 24705
+check '--serve-port without --serve or --serve-open is refused' rc_is 1
+check '... and says why' contains "${ERR}" '--serve-port needs --serve or --serve-open'
 
 printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
 [[ "${FAIL}" -eq 0 ]]
