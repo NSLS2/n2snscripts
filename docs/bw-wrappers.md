@@ -6,8 +6,9 @@ masked privileged binaries, ephemeral auth on shared accounts, and
 filesystem isolation from the rest of the host. See the NSLS-II
 coding-agents documentation for the policy these wrappers implement.
 
-All five wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
-for sandbox construction. Each wrapper's `--help` is the authoritative
+All six wrappers use the shared library `lib/bwrap_sandbox_lib.sh`
+for sandbox construction (`bwopenchamber` through `bwopencode2`, which it
+sources). Each wrapper's `--help` is the authoritative
 option list; the tables below summarise the common surface.
 
 [bwrap]: https://github.com/containers/bubblewrap
@@ -17,6 +18,18 @@ option list; the tables below summarise the common surface.
 - `bash` >= 4.x (the wrappers use `[[ ]]` and arrays)
 - `bubblewrap` (`bwrap`) >= 0.4.0
   - binary masking is verified on RHEL 8.10 (`bubblewrap-0.4.0-3.el8_10`) and EL9 (0.6.3)
+- For the private network namespace, one of: `pasta` (package `passt`,
+  RHEL 9 and later), or
+  `slirp4netns` >= 0.4.0 with libslirp >= 4.3.0 (package `slirp4netns`,
+  RHEL 8 AppStream) and `python3` (or RHEL 8's
+  `/usr/libexec/platform-python`); plus `/dev/net/tun` and unprivileged user
+  namespaces on the host. Without them the wrappers stop (exit status 3)
+  unless run with `--share-net` (see [Network](#network)). `ss` (iproute) is
+  used to find busy ports for `--publish`.
+- For the [network log](#network-log): `systemd-cat` (systemd) with a running
+  journal, or `logger` (util-linux) with `/dev/log`. Without either the
+  wrappers warn and run without the log. Python 3.6+ (standard library) to
+  condense it and to name destinations (DNS relay).
 
 ## Managed system paths
 
@@ -86,7 +99,7 @@ Every `bw*` wrapper accepts these options:
 | Option | Effect |
 | --- | --- |
 | `--help`, `-h` | Show wrapper help, then the underlying tool's help when the tool is installed |
-| `--dry-run` | Print the `bwrap` command without executing it |
+| `--dry-run` | Print the command (the network backend, the descriptor relay and `bwrap`) without executing it |
 | `--exec CMD [ARGS...]` | Run `CMD` inside the sandbox instead of the tool. `CMD` is split on whitespace; following arguments are passed unchanged, e.g. `--exec bash -c 'env \| sort'` |
 | `--init-auth` | Persist auth credentials to the host (first-time setup; not available in `bwopencode2`) |
 | `--new-session` | Force `bwrap --new-session` (stricter isolation; breaks SIGWINCH) |
@@ -95,6 +108,11 @@ Every `bw*` wrapper accepts these options:
 | `--n2c-token NAME` | Mount the N2C access token `NAME` read-only so skills in the sandbox can call NSLS-II APIs. May be repeated; `--n2c-token all` mounts every token present. Off by default. See [N2C access tokens](#n2c-access-tokens) |
 | `--github-tokens` | Forward every `GH_TOKEN_*` environment variable into the sandbox so the agent can authenticate `gh`. Off by default. In `--dry-run` mode, token values are printed as `REDACTED`. Use per-command token selection inside the sandbox: `GH_TOKEN="$GH_TOKEN_NSLS2" gh pr list -R NSLS2/repo` |
 | `--no-sandbox-context` | Do not generate the [sandbox context file](#sandbox-context) that tells the agent what is mounted |
+| `--publish PORT[:SANDBOXPORT]` | Make a server in the sandbox reachable on the host at a per-user, per-session loopback address. May be repeated. See [Network](#network) |
+| `--publish-addr ADDR` | Use `ADDR` (in `127.0.0.0/8`) for `--publish` instead of the derived address, for example `127.0.0.1` for OAuth redirects |
+| `--host-port PORT[:SANDBOXPORT]` | Make the host's `127.0.0.1:PORT` reachable in the sandbox at `127.0.0.1:SANDBOXPORT`, which it then takes. May be repeated (pasta only) |
+| `--share-net` | Share the host network instead of a private namespace (the behaviour before private namespaces); not with the forwarding options |
+| `--net-backend pasta\|slirp4netns` | Use only this backend for the private namespace (normally pasta, else slirp4netns) |
 
 `--ro-path` and `--rw-path` may be nested: a path nested under another
 overrides it, so `--rw-path DIR --ro-path DIR/sub` mounts `DIR` read-write but
@@ -124,7 +142,7 @@ NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
   `--rw-path` refuse it and refuse a directory that contains it. The creds
   directory itself is allowed.
 - **Automatic mounts cannot expose it either.** Directories the launcher mounts
-  whole (the npm and pixi caches, ccache, the tool data and cache directories)
+  whole (the npm, pixi and prek caches, ccache, the tool data and cache directories)
   are only checked for being blocked themselves. So, after all mounts are built,
   the launch stops with an error if any bind mount's source (as written or with
   symlinks resolved) is, contains or lies inside the N2C session directory, for
@@ -224,12 +242,16 @@ and makes the tool load it.
   `bwrap` arguments, so the text always matches the session, including
   `--ro-path` / `--rw-path` mounts and a working directory outside `$HOME`.
 - **Mounted at `~/.sandbox/AGENTS.md`**, read-only, with `--ro-bind-data` on a
-  file descriptor. Nothing is written to the host, and no user file is
+  file descriptor (see [Descriptor relay](#descriptor-relay)). Nothing is
+  written to the host, and no user file is
   overwritten. `BWRAP_SANDBOX` (launcher name) and `BWRAP_SANDBOX_CONTEXT`
   (the path) are set in the sandbox for scripts and skills.
 - **Contents** (about 50 lines): `$HOME` is a tmpfs; same-inode files are bind
   mounts, not hard links, and are edited at their source; the working directory
   (its access taken from the effective mounts) and whether it is a git root; a
+  Network section (private namespace, DNS, the published ports with their host
+  URLs and the "bind `0.0.0.0`" rule, the host services and the sandbox ports
+  they take); a
   table of every mount under `$HOME` marked `rw` / `ro` / `copy` (a writable
   copy of a host file, lost at exit) / `tmpfs`; the system mounts collapsed
   into one line each, with writable exceptions such as `--rw-path /usr/local`
@@ -257,13 +279,467 @@ files:
 `--exec` mounts the file and sets the two variables but adds no loader, since
 the command is not the agent.
 
-`--dry-run` prints the generated file after the command (the
-`--ro-bind-data` descriptor number is only meaningful in a real run).
+`--dry-run` prints the generated file after the command, with the other
+generated files (`/etc/resolv.conf`, `/etc/hosts`).
 `--no-sandbox-context` removes the file, the variables and the loader.
 
 To check by hand, ask the agent a question only the file can answer ("is a
 read-only file under `$HOME` with the same inode as a dotfiles file a hard
 link?"), or for Copilot run `bwcopilot instruction list`.
+
+## Network
+
+Every sandbox runs in its own network namespace, provided by the first usable
+backend:
+
+1. [pasta](https://passt.top) (package `passt`, RHEL 9 and later, Fedora);
+2. else [slirp4netns](https://github.com/rootless-containers/slirp4netns)
+   (package `slirp4netns`, RHEL 8 AppStream);
+3. else the launch **stops** (exit status 3), naming what is missing for each
+   backend, unless `--share-net` is given.
+
+So sandboxes are isolated by default, with one explicit escape hatch.
+
+- **Outbound connections work** (model gateway, package installs, docs). Egress
+  is not filtered.
+- **The host's loopback is unreachable.** Services bound to `127.0.0.1` on the
+  host (OpenCode's own server, language servers, CUPS, local databases, Tiled
+  or queueserver dev instances, other users' sessions) cannot be reached from
+  the sandbox, and `ss -ltn` inside shows only the sandbox's own sockets.
+  `127.0.0.1` inside is the sandbox's private loopback.
+- **Nothing the agent listens on is reachable from the host**, unless
+  published (below).
+- **Not hidden:** host services bound to a non-loopback address (sshd on
+  `0.0.0.0:22`, the Tailscale address) stay reachable, as from any other
+  machine.
+- **`--share-net`** shares the host network instead: the behaviour before
+  private namespaces, for workflows that need the host's loopback services or
+  ports, or hosts where neither backend works. The host's `/etc/resolv.conf`
+  and `/etc/hosts` are mounted, host loopback services are reachable, sandbox
+  listeners are visible on the host, and the
+  [sandbox context file](#sandbox-context) says so. It cannot be combined with
+  the forwarding options or `--net-backend` (exit status 1). Prefer
+  `--host-port` / `--publish` for single ports.
+- **`--net-backend pasta|slirp4netns`** uses only that backend (no
+  fallthrough), for testing the slirp4netns path on a host with pasta, or for
+  diagnosis.
+
+`BWRAP_NET_BACKEND` in the sandbox is `pasta`, `slirp4netns` or `none`
+(`--share-net`).
+
+| | pasta | slirp4netns | `--share-net` |
+| --- | --- | --- | --- |
+| Address in the sandbox | the host's | `192.168.254.100` (IPv4 only) | the host's |
+| Outbound traffic leaves from | the host's address | the host's address | the host |
+| DNS | `169.254.1.1`, forwarded to the host's resolver | `192.168.254.3`, forwarded to the host's resolver | the host's `resolv.conf` |
+| `--publish`, `--publish-addr` | yes | yes (at most 64 ports) | no |
+| `--host-port` | yes | no: the launch stops (exit 3) rather than drop it | no |
+| Speed | close to native | slower (user-mode TCP/IP); fine for API calls | native |
+
+With `--host-port`, a host without a working pasta stops even if slirp4netns
+would work.
+
+DNS: the host's resolver is usually on loopback (`127.0.0.53`), so the sandbox
+gets a generated `/etc/resolv.conf` naming the backend's DNS address, which the
+backend forwards to the first nameserver in the host's `/etc/resolv.conf`
+(port 53 only), so split DNS (VPN, tailnet) keeps working. Only IPv4
+nameservers are supported; the wrapper warns when the host has none. The host's
+search domains are not passed on, so use fully qualified names. `/etc/hosts` is
+the host's file.
+
+### Opening ports
+
+Both directions are off by default, opt-in per port and per launch, and
+limited to loopback on both ends. Ports are `1024-65535`; a `LOW-HIGH` range
+is accepted, and a mapped range must have the same length.
+
+| Option | Direction | Host side | Sandbox side |
+| --- | --- | --- | --- |
+| `--publish PORT[:SANDBOXPORT]` | sandbox server → host | `127.H1.H2.S:PORT` (or `--publish-addr`) | the server on `SANDBOXPORT` (default `PORT`), which must listen on `0.0.0.0` |
+| `--host-port PORT[:SANDBOXPORT]` | host service → sandbox | `127.0.0.1:PORT` | `127.0.0.1:SANDBOXPORT` (default `PORT`), held by pasta; pasta only |
+
+Forwards are printed to stderr at launch, so they stay in the scrollback above
+the TUI, and listed in the [sandbox context file](#sandbox-context). Inside the
+sandbox `BWRAP_NET_PUBLISH`, `BWRAP_NET_PUBLISH_ADDR` and
+`BWRAP_NET_HOST_PORTS` hold the same information.
+
+```text
+bwopencode2: network: private namespace (pasta); publish address 127.65.81.1
+bwopencode2: publish    http://127.65.81.1:8000/  ->  sandbox :8000  (bind 0.0.0.0 inside)
+bwopencode2: host-port  host 127.0.0.1:5432  ->  sandbox 127.0.0.1:5432  (host service sees a loopback client)
+```
+
+**`--publish`.** The host address is `127.H1.H2.S`: `H1.H2` comes from a hash
+of your uid (`H1` is 1-254, so `127.0.0.1`, `127.0.0.53` and `127.0.1.1` are
+never used), and `S` is the lowest session index (1-254) whose address has
+none of the requested ports in use. Two users publishing port 8000 get
+different addresses, a second sandbox of the same user gets the next index,
+and your own dev server on `127.0.0.1:8000` does not collide. The address is
+printed as a URL; there is no host name for it. Every `127/8` address is a
+secure context in browsers. The host port is bound for the whole session,
+whether or not a server runs. The server inside must bind `0.0.0.0` (or the
+interface address): both backends deliver forwarded connections to the namespace's
+interface, not its loopback; the context file tells the agent so. A port that
+something on the host already holds on every address (`0.0.0.0:PORT`) is
+refused at launch.
+
+The backend binds the address only after the launcher has started it, so the
+choice is made under a lock (`flock` on `claims.lock` in the
+[runtime directory](#runtime-directory)), and each launch leaves a claim
+(`claims/ADDR.PID`: launcher pid and its start time, host ports, launcher,
+directory). Sandboxes of one user started at the same moment therefore get
+different addresses. A claim whose process is gone (checked with the start
+time, so a reused pid does not count) is removed by the next launch. A program
+outside the launchers can still take a port first; pasta and slirp4netns then
+fail to bind it and the launch stops.
+
+**`--publish-addr ADDR`** replaces the derived address with `ADDR` (in
+`127.0.0.0/8`). Use `127.0.0.1` for OAuth flows whose registered redirect URI
+names it (some agent logins and MCP servers open a browser on the host that
+calls back into the sandbox). The launch then fails if a requested port is
+already in use or claimed by another of your sandboxes on `ADDR`.
+
+**`--host-port`** makes one host loopback service visible in the sandbox at
+`127.0.0.1:SANDBOXPORT` (and `localhost`), as pasta's `-T` does: pasta listens
+on the sandbox's loopback and connects to the host's `127.0.0.1:PORT`. pasta
+takes no other listening address for `-T`, so there is no separate name for
+the host. That sandbox port is then taken: the agent cannot run its own server
+on it, and a `--publish` to the same sandbox port is refused. To keep `PORT`
+free in the sandbox (to run its own Postgres on 5432 next to the host's),
+map it elsewhere: `--host-port 5432:15432`. The host side is always
+`127.0.0.1`. Nothing checks that the host port is open or who owns it.
+**The host service sees a loopback client and may trust it** (no password for
+local connections, admin APIs): only forward services you would let the agent
+use. These host ports are refused outright: `631` (CUPS), `2375`-`2376`
+(Docker), `6000`-`6063` (X11), `41112` (Tailscale local API) and `49374`
+(OpenCode 2 service, which runs tools outside any sandbox); the list is
+`_NET_HOST_PORT_DENY` in the library.
+
+**Not access control.** Any local user can connect to any `127/8` address, so
+another user can reach your published ports; the per-user addresses prevent
+accidental collisions, not access. Restricting that by uid would need
+root-managed `nftables` rules.
+
+To list the sandbox publications on a host:
+`ss -ltn 'src 127.0.0.0/8' | grep -v ' 127\.0\.'`.
+
+### Network log
+
+Every launch records its network session in the host's system log, and with
+pasta every connection as well. It is **always on**: there is no option to turn
+it off. The records are written outside the sandbox, which can neither read nor
+change them, and they are the data needed for a later egress allowlist.
+
+| Record | Content |
+| --- | --- |
+| start | `event=start session=ID launcher=... user=... uid=... pid=... backend=... flows=logged\|unavailable pasta=VERSION publish=ADDR:PORTS host_ports=... dir=...` |
+| dns | `session=ID dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21`, plus `cname=...` when the answer went through aliases |
+| open | `session=ID flow=7 open proto=tcp dir=out src=ADDR:PORT dst=140.82.112.21:443 domain=github.com t=21.359` |
+| close | `session=ID flow=7 close proto=tcp dir=out dst=140.82.112.21:443 domain=github.com t=33.770 secs=12.411` |
+| fail | `session=ID flow=9 fail ...`: a connection that never became active (refused, unreachable) |
+| end | `event=end session=ID ...`, when the sandbox has exited |
+
+Every line is `key=value` (logfmt), so a log store's logfmt parser can filter
+on any field. See [Reading the network log](#reading-the-network-log) for how
+to fetch the records.
+
+- `dir` is `out` (the sandbox to the network), `publish` (a host client to a
+  `--publish` port) or `host-port` (the sandbox to a `--host-port` service).
+  `via=` is the address on the other side when it differs (the sandbox port
+  for `publish`). `t` is seconds since pasta started; `secs` is the
+  connection's duration. Flows still open when the session ends get a close
+  with `reason=session-end`.
+- `flow` is pasta's flow slot, which it reuses: it identifies a connection
+  only between its open and its close.
+- pasta logs no byte counts.
+- `domain` is the domain of the last lookup, through the DNS relay, that
+  returned the destination address. It is a record, not proof: several
+  domains can share one address (CDNs), and a lookup that bypasses the relay
+  (a query sent to `169.254.1.1` directly, DNS over HTTPS) leaves none.
+
+- **Tag** (`SYSLOG_IDENTIFIER`): `bwrap-net`. `journalctl -t bwrap-net` shows
+  all sessions; `journalctl -t bwrap-net -g ID` one. Inside the sandbox
+  `BWRAP_SESSION` is the same ID, and the context file names it.
+- **Who logged it.** Only the `start` and `end` records name the user
+  (`user=`, `uid=`, `launcher=`, `dir=`). Every other record (dns, open, close,
+  fail) carries only `session=ID`. To list what one user's agents did, first
+  find that user's session IDs from the `start` records, then select the other
+  records by those IDs.
+- **Tool:** `systemd-cat` when the journal's stream socket exists and accepts a
+  connection, else `logger` (util-linux) on `/dev/log` (journald or rsyslog).
+  Both are tried at launch without logging anything; the launcher then writes
+  the start record itself. With neither, the launch warns and continues
+  without the log.
+- **Flows only with pasta; DNS with either.** slirp4netns has no flow log, so
+  with it the records are the start, the end and the DNS relay's lookups —
+  which are then the only account of what the sandbox reached for. With
+  `--share-net` (recorded as `backend=none`) there is no namespace to relay
+  in, so only the start and end records are written. The start record says
+  which is which: `flows=logged|unavailable dns=logged|unavailable`.
+- When the launcher runs on a terminal it prints the tool and the session ID.
+- **How (pasta).** pasta logs flows only at debug level, and at debug level it
+  never uses syslog: without `--log-file` it writes every line, timestamped,
+  to its stderr. So pasta gets `--debug` (and not `--quiet`), with its stderr
+  on a FIFO in the launch's [session directory](#runtime-directory), and a
+  reader started by the launcher (outside the sandbox) turns the lines into
+  log records:
+  - **Why stderr and not `--log-file`.** pasta opens its log file read-write
+    (to rotate it). On SELinux hosts (Fedora, RHEL) pasta runs in its own
+    domain, `pasta_t`, which passt's policy lets only *append* to FIFOs
+    labelled `user_tmp_t`; the open is denied and pasta exits before the
+    sandbox starts. An inherited append-only descriptor is allowed. (A
+    read-write one, or any other descriptor on the FIFO that pasta is not
+    allowed, is silently replaced with `/dev/null` at the exec into
+    `pasta_t`, so the launcher opens its stderr with `>>` and keeps no other
+    descriptor on the FIFO across the exec.)
+  - The reader (`lib/bwrap_netlog.py condense`) opens the FIFO first; the
+    launcher waits for its "ready" before it opens its stderr on it, so the
+    open does not block and nothing is lost. The reader ignores end-of-file
+    and stops only when the launcher process, which is pasta by then, is
+    gone (it is no longer the reader's parent), after draining the pipe. Then
+    it writes the end record and removes the session directory.
+  - If the tool dies, it goes on reading and drops the lines, so pasta never
+    blocks on it.
+  - pasta prints its setup first, and if it fails to start, its error. The
+    descriptor relay (pasta's command) prints a marker on the FIFO and reopens
+    your stderr: by path when it is a terminal or a file, else (a pipe)
+    through a second FIFO that the reader copies. If pasta stops before the
+    marker, the reader prints pasta's lines on your terminal, prefixed
+    `pasta:`, just after the launcher has exited. (With slirp4netns the same
+    FIFO, marker and reader are used for the DNS relay's lines, and a failed
+    start shows the identity mapper's message prefixed `slirp4netns:`.)
+  - **Condensed.** pasta's debug log has about 34 lines per connection (state
+    changes, timers, ACK and buffer bookkeeping) and its setup dump. The reader
+    keeps one line when a connection opens and one when it closes and drops
+    the rest (in a real session, 5000 lines became 280). It writes to
+    `systemd-cat` / `logger` itself. pasta's version is in the start record
+    (`pasta=`), from `pasta --version`.
+  - Without Python a bash supervisor copies pasta's lines to the log as they
+    are.
+- **DNS relay (both backends).** To name destinations, `lib/bwrap_netlog.py dns`
+  listens on `127.53.0.1:53` (UDP and TCP) in the sandbox's network namespace,
+  forwards each lookup to the backend's DNS (`169.254.1.1`, pasta's DNS
+  forward, or `192.168.254.3`, slirp4netns's built-in one; the addresses
+  below are pasta's) and writes one `dns` line per lookup to the log, before
+  it answers, so the name is known when the connection that follows is
+  logged. With slirp4netns the relay cannot bind port 53 itself; see
+  [Implementation notes: slirp4netns](#implementation-notes-slirp4netns). The condenser keeps a map from the answers'
+  addresses to domains. The sandbox's `/etc/resolv.conf` lists the relay first
+  and `169.254.1.1` second, so lookups go on working, at once, if the relay is
+  down (its port is then closed); pasta's own leg of a relayed lookup (UDP to
+  `169.254.1.1:53`) is not logged as a connection.
+  - The relay limits itself to 16 workers and 32 queued requests. On overload,
+    a UDP query gets a logged `SERVFAIL` (allowing the client's next resolver
+    to answer); a new TCP connection is closed. Each TCP query uses its own
+    upstream connection, even if the client keeps its connection open.
+  - The descriptor relay starts it before bwrap, as root of pasta's user
+    namespace, which may bind port 53 there; it then drops every capability.
+    It runs outside bwrap: the agent cannot see it (separate process
+    namespace), and cannot take its port (it has no capabilities).
+  - The descriptor relay waits until it listens (it says so on a pipe) before
+    starting bwrap, at most 0.25 s, so the first lookups are logged too. In
+    practice that is a Python start, some tens of milliseconds.
+  - It exits when bwrap does.
+- Both need Python 3.6 or later, standard library only (RHEL 8's
+  `/usr/libexec/platform-python`, else `python3`). Without it pasta's lines go
+  to the log unfiltered, and DNS goes straight to `169.254.1.1`.
+
+### Reading the network log
+
+**Wire format.** Each record is one syslog line (RFC 5424: priority `<14>`,
+timestamp, host, tag `bwrap-net`, the writer's pid) followed by the logfmt
+fields, for example:
+
+```text
+<14>1 2026-01-01T12:00:00+00:00 HOST bwrap-net 1234 - - session=0123456789ab dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21
+<14>1 2026-01-01T12:00:05+00:00 HOST bwrap-net 1234 - - session=0123456789ab flow=7 open proto=tcp dir=out src=10.0.0.5:44464 dst=140.82.112.21:443 domain=github.com t=21.359
+```
+
+The records are written on the host the launcher runs on, so the first place to
+read them is that host's journal. If you forward syslog to a central log store,
+the records are there too, with the tag and the sending host as the fields your
+pipeline keeps from the syslog header. Which names it gives them depends on the
+pipeline (the journal's `SYSLOG_IDENTIFIER` is not always kept as a label), so
+check the names in your store before writing a selector. The message is the
+whole line above.
+
+**On the host (journal).**
+
+```bash
+journalctl -t bwrap-net --since '-12h'              # every session on this host
+journalctl -t bwrap-net -g 'session=ID'             # one session
+journalctl -t bwrap-net -g 'event=start.*user=NAME' # a user's sessions
+journalctl -t bwrap-net -g ' dns domain='           # DNS lookups only
+```
+
+Inside a sandbox, `BWRAP_SESSION` is the session ID (the context file names it
+too).
+
+**Everything one user's agents looked up.** Records after `start` do not name
+the user, so this takes two steps:
+
+1. List that user's `start` records (`journalctl -t bwrap-net -g
+   'event=start.*user=NAME'`). They give the session IDs, and also the
+   launcher, directory and backend, which say whether flows and DNS were
+   logged.
+2. Select the `dns` records of those sessions, for example
+   `journalctl -t bwrap-net -g 'session=(ID1|ID2) dns domain='`, and count by
+   `domain`.
+
+A and AAAA lookups are separate records (`type=`), so count by `domain` and
+`type` to tell them apart, or divide by about two for the number of names
+looked up.
+
+**What is and is not in the log.**
+
+- Sessions with `dns=unavailable` (`--share-net`, `backend=none`) have a start
+  and an end record only.
+- Sessions with `flows=unavailable` (slirp4netns) have DNS records but no
+  `open`/`close` records. For those, DNS is the only account of what was
+  reached.
+- `domain` on a flow is the last relayed lookup that returned that address, so
+  treat it as a record, not proof (see above).
+- A session that is still running has no `end` record yet.
+
+### Implementation notes: pasta
+
+- pasta runs outside bwrap, as you, and starts the sandbox. Default pasta
+  behaviour is overridden where it would re-expose the host's loopback:
+  `--no-map-gw` (the gateway address would otherwise map to the host's
+  loopback) and `-T none` / `-U none` (`auto` would forward every port bound
+  on the host's loopback into the namespace). `-t none` / `-u none` keep
+  inbound ports closed unless `--publish` is given.
+- pasta maps you to uid 0 in its user namespace, so bwrap runs the agent in a
+  nested user namespace as your real uid and gid (`--unshare-user --uid
+  --gid`); file ownership looks as before and the agent has no capabilities.
+- **Not tested: pasta with bwrap 0.4.0.** pasta maps you to uid 0 alone
+  (its source writes `0 <uid> 1`), and bwrap 0.4.0 run with `--unshare-user
+  --uid <your uid>` in such a namespace stopped with `unable to drop root uid:
+  Invalid argument` on RHEL 8.10 (see
+  [Implementation notes: slirp4netns](#implementation-notes-slirp4netns)).
+  Whether pasta with bwrap 0.4.0 hits the same error has not been tried: the
+  RHEL 8 hosts tested have bwrap 0.4.0 and no pasta. The launcher does not
+  check for it.
+- pasta renames the host to `pasta-<name>`; bwrap's `--unshare-uts
+  --hostname` restores the real name.
+- `--no-pidns` is passed when the installed pasta supports it (2026-09 and
+  later); older pasta adds a PID namespace, inside which bwrap nests its own.
+- `ping` may not work (ICMP depends on the host's `ping_group_range`).
+- Nested namespaces in the sandbox (rootless podman) still do not work.
+
+### Implementation notes: slirp4netns
+
+slirp4netns cannot start the sandbox; it attaches to an existing network
+namespace. The launch has two steps, and the launcher still `exec`s in the
+foreground, so the terminal, job control, the exit status and
+`--die-with-parent` behave as before:
+
+```text
+launcher ─┬─ helper (background): waits for the namespace, starts slirp4netns,
+          │    adds the --publish forwards, then releases the sandbox
+          └─ exec env -i ... python -I -c <_NET_NS_IDENTITY> [--dns ...] --
+               bash <descriptor relay> -- bwrap --unshare-user --uid --gid
+               --info-fd --block-fd --sync-fd ... -- <tool>
+```
+
+- **The tool does not start before the network is ready**: bwrap waits on
+  `--block-fd` until the helper writes to it.
+- **The launcher, not bwrap's `--unshare-net`, creates the namespaces.**
+  Because bwrap mounts `/dev`, it nests the sandbox in a second user namespace
+  inside the one that owns the network namespace. slirp4netns joins the user
+  namespace of the process it is given, so it would have no rights over the
+  network. Unsharing in the launcher leaves its own process holding a single
+  user namespace that owns the network namespace, and slirp4netns attaches to
+  it.
+- **The ids are mapped to themselves, not to root.** The launcher unshares and
+  writes the maps itself, in about fifteen lines of Python
+  (`_NET_NS_IDENTITY`), instead of calling `unshare --user --map-root-user
+  --net`. With that root map, bwrap 0.4.0 (RHEL 8.10) run with `--uid <your
+  uid>` stopped with `unable to drop root uid: Invalid argument`: its
+  `drop_privs()` calls `setuid(<your uid>)` when `geteuid() == 0`, and your
+  uid is not mapped there (`EINVAL`). With your uid mapped to itself, bwrap
+  starts and the agent runs as your uid. slirp4netns joins the namespace and
+  configures `tap0` in it.
+
+  Writing a single-line map of your own id needs no helper (no
+  `newuidmap`, no `/etc/subuid`). The `unshare` on these hosts documents
+  `--map-root-user` and no option that maps your own uid (its man page), so
+  the launcher writes the map itself.
+- Python (`python3`, or RHEL 8's `/usr/libexec/platform-python`) is therefore
+  required for this backend, not only for `--publish`. Standard library only,
+  3.6 or later.
+- slirp4netns options: `--disable-host-loopback` (otherwise the gateway
+  address `192.168.254.2` reaches the host's `127.0.0.1` on every port),
+  `--cidr=192.168.254.0/24` (slirp's default, `10.0.2.0/24`, lies inside
+  BNL's 10/8), the built-in DNS at `.3` (forwards port 53 only, with libslirp
+  4.3.0 and later, which the launcher checks), `--mtu=65520`, and
+  `--enable-seccomp` when `/etc/resolv.conf` resolves inside `/etc` or
+  `/run`.
+- **DNS lookups are logged**, and with no flow log they are the only account
+  of what the sandbox reached for. The relay runs inside the network
+  namespace and forwards to the backend's own DNS, so it is not pasta-only,
+  but here it cannot bind port 53 for itself: under this map, after the
+  mapper's exec and the descriptor relay's, it holds no capabilities (seen:
+  `CapEff` 0, the bind refused). The mapper, which still has them after the
+  unshare, brings loopback up (a new namespace starts with `lo` down) and
+  binds the relay's UDP and TCP sockets before its exec, and leaves them on
+  descriptors 88 and 89 for `DnsRelay.adopt`.
+- **`--enable-sandbox` is not passed.** After joining the launcher's
+  namespace, slirp4netns does `setegid(0)` (`main.c`); with no uid 0 mapped
+  the launch stopped with `setegid(0)` / `parent failed`. Without privilege
+  a process may write a single line to `uid_map`, mapping its own uid
+  (`user_namespaces(7)`), so this namespace maps your uid and not uid 0.
+  slirp4netns describes `--enable-sandbox` as "create a new mount namespace
+  (and drop all caps except CAP_NET_BIND_SERVICE if running as the root)".
+  `--enable-seccomp` is a separate option (slirp4netns applies the two
+  independently) and is still passed; launches with it work under this map.
+- slirp4netns runs in its own session (Ctrl-C does not reach it) with a
+  scrubbed environment (no API keys). It exits when bwrap does: its
+  `--exit-fd` is the other end of bwrap's `--sync-fd`.
+- `--publish` uses slirp4netns's API socket (`add_hostfwd`, one request per
+  port). The socket is in the launch's session directory (see
+  [Runtime directory](#runtime-directory)), removed once the forwards are
+  added, so nothing else can add forwards later.
+- **On a setup failure** (slirp4netns does not start, a port cannot be
+  published) the helper prints the reason and slirp4netns's last messages,
+  kills the still-waiting sandbox (its pid comes from bwrap's `--info-fd`), so
+  the tool never runs, and then bwrap. The exit status is then 137, not 3.
+  The helper signals a process only after checking that it is the launcher
+  (the helper's own parent) or a child of the launcher. If the launcher is
+  already gone (the unshare or the descriptor relay failed and printed why),
+  the helper notices within a poll interval, signals nothing, and exits.
+
+### Runtime directory
+
+The launcher keeps its network files (the slirp4netns pipes and API socket,
+and the claims and logs described elsewhere in this section) in a directory of
+its own, outside every sandbox:
+
+- `$XDG_RUNTIME_DIR/bwrap-net`, else `/tmp/bwrap-net-<uid>`, mode 0700. A
+  candidate is used only if its parent cannot be changed by other users (owned
+  by you or root, and not writable by group or others, or sticky like `/tmp`)
+  and it is then a real directory of yours with mode 0700; otherwise the next
+  one is tried, and with none the launch stops (exit status 3). `TMPDIR` is
+  never used: in a directory other users can write, they could swap the
+  directory during the launch.
+- Each launch works in its own `session.XXXXXXXX` subdirectory (`mktemp -d`), so
+  several sandboxes of one user never share files there, and removes it when
+  it no longer needs it.
+- Both candidates are blocked paths: no sandbox can mount them, or a directory
+  that contains them, as its working directory or with `--ro-path` /
+  `--rw-path`. One sandbox therefore cannot reach the files of another, such as
+  the slirp4netns API socket during its setup.
+
+### Descriptor relay
+
+bwrap reads some files from descriptors: `--file` for writable copies of
+credentials and config (`bwclaude`, `bwcopilot`, `bwcodex`), `--ro-bind-data`
+for generated files (the context file, `/etc/resolv.conf`, `/etc/hosts`).
+pasta closes every inherited descriptor above 2, so the launcher does not open
+them itself. It reserves their numbers; a short fixed bash script (the relay,
+`_BWRAP_FD_RELAY_SHIM`) runs as the command of pasta or of the unshare step, opens each descriptor at its
+number, from the host file or from generated text carried in an environment
+variable that it then unsets, and execs bwrap. Nothing is staged on the host.
 
 ## Account check
 
@@ -437,9 +913,9 @@ Only an allowlist of harmless `OPENCODE_*` behaviour toggles (46 names) is
 forwarded from the host environment into the sandbox. **Behaviour change:**
 any other host `OPENCODE_*` variable is now dropped (previously all were
 passed). Sensitive or location-changing variables are deliberately excluded:
-`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` (the sandbox shares
-the host network, so an agent holding the password could drive an
-unsandboxed opencode server), `OPENCODE_API_KEY`, `OPENCODE_CONSOLE_TOKEN`,
+`OPENCODE_SERVER_PASSWORD` / `OPENCODE_SERVER_USERNAME` (an agent holding the
+password and a route to an unsandboxed opencode server could drive it; the
+private network namespace normally gives no such route), `OPENCODE_API_KEY`, `OPENCODE_CONSOLE_TOKEN`,
 `OPENCODE_CONFIG*` / `OPENCODE_TUI_CONFIG` / `OPENCODE_PERMISSION` (inject
 config or permissions and bypass the managed config), `OPENCODE_AUTH_CONTENT`,
 `OPENCODE_DB` / `OPENCODE_*_DB`, `OPENCODE_MODELS_URL` / `OPENCODE_MODELS_PATH`,
@@ -557,8 +1033,13 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
   host, is using the same data directory, or after the last daily check found
   damage;
 - it holds a shared lock for the life of the sandbox (a file descriptor that
-  the final `exec` passes on to `bwrap`), so sessions on this host and version
-  can run together;
+  the final `exec` passes on to `bwrap`; with a private network see "Where the
+  lock lives" below), so sessions on this host and version can run together. The
+  descriptor is numbered 200 or higher on purpose: the launcher hands the sandbox
+  its files and data on descriptors 10 and up, and the relay opens those over
+  whatever is there. With the lock on bash's own choice (10 or 11) it was closed,
+  and so released, whenever the launcher passed two or more data descriptors, as
+  `bwopenchamber` does (found in review of NSLS2/n2snscripts#43);
 - it starts a daily background backup (`opencode2-db backup --if-due`) and keeps
   the newest 3 compressed copies.
 
@@ -567,6 +1048,30 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
 files are in `~/.local/share/opencode2/opencode-db-guard`, which is not mounted
 in the sandbox. The rules, the recovery steps (`opencode2-db restore` and
 `rebuild`) and the limits are in [opencode2-db.md](opencode2-db.md).
+
+#### Where the lock lives with a private network
+
+The text above describes `--share-net`, where the launcher `exec`s into `bwrap`
+and the descriptor goes with it. With a private network the launcher `exec`s into
+pasta instead, and pasta closes every descriptor above 2 that it inherits (see
+"File descriptor relay"), so neither pasta, `bwrap` nor OpenCode holds the lock.
+Checked on a real launch (`fuser` on the lock file while a `bwopencode2` session
+ran on pasta): the only holders were the network log's helper processes, a forked
+copy of the launcher shell and its `bwrap_netlog.py condense` child. The lock
+was held for the whole session and was gone after it ended (`opencode2-db
+status`: `none held`), so the guard works, but **by inheritance, not by design**:
+the helper was started before the `exec`, so it received the descriptor.
+
+By reading the code (not tested), the lock would not be held when:
+
+- no log tool can write (neither `systemd-cat` nor `logger`), because the launcher
+  then starts no helper ("this network session is not logged"), or
+- the helper is stopped while OpenCode keeps running.
+
+In those cases a second host or OpenCode build could pass the guard while the
+session runs. The same applies to `bwopenchamber`, which goes through the same
+launch. Passing the lock on deliberately is a change to the launch code of
+NSLS2/n2snscripts#37.
 
 ### What is kept out of the sandbox
 
@@ -583,9 +1088,10 @@ in the sandbox. The rules, the recovery steps (`opencode2-db restore` and
   `OPENCODE_DISABLE_FFF`, `OPENCODE_DISABLE_PROJECT_CONFIG`,
   `OPENCODE_LOG_LEVEL`, `OPENCODE_PRINT_LOGS`. The
   variables that matter most are the server passwords (`OPENCODE_PASSWORD`,
-  `OPENCODE_SERVER_PASSWORD`): the sandbox shares the host network, so an agent
-  holding one could connect to an unsandboxed server on port 49374 and run
-  tools outside the sandbox. Others dropped include `OPENCODE_SSH_ASKPASS_*`,
+  `OPENCODE_SERVER_PASSWORD`): an agent holding one, with a route to an
+  unsandboxed server on port 49374, could run tools outside the sandbox. The
+  private network namespace normally gives no such route, and `--host-port`
+  refuses 49374. Others dropped include `OPENCODE_SSH_ASKPASS_*`,
   `OPENCODE_EDITOR_SSE_PORT`, `OPENCODE_PTY_HANDOFF`, `OPENCODE_DB`,
   `OPENCODE_TEST_HOME`, `OPENCODE_CONFIG*`, `OPENCODE_MODELS_PATH`/`_URL`, and
   `OPENCODE_API_KEY`. With `--dry-run`, the names (never the values) of the
@@ -594,15 +1100,18 @@ in the sandbox. The rules, the recovery steps (`opencode2-db restore` and
 ### `--standalone` is enforced
 
 By default OpenCode 2 connects to a shared background service (fixed port
-49374) that survives the CLI and runs tools **outside** any sandbox. The
-sandbox shares the host network, so a CLI started normally would hand tool
-execution to that unsandboxed server. `bwopencode2` therefore:
+49374) that survives the CLI and runs tools **outside** any sandbox. A CLI
+started normally would hand tool execution to that unsandboxed server. The
+sandbox's private network namespace already keeps the host's loopback, and so
+the service, out of reach; as a second line of defence `bwopencode2`:
 
 - adds `--standalone` (a private in-process server inside the sandbox) when
   `opencode2` is started with no subcommand or a directory argument, or with
   `run`, `mini`, `models`, or `stats`;
 - refuses (exit status 1) `--server`, `--standalone=...`, `--no-standalone`,
-  and the `service`, `serve`, `api`, `pair`, and `reload` subcommands;
+  and the `service`, `serve`, `api`, `pair`, and `reload` subcommands (to run
+  a server, use [`--serve`](#--serve-the-web-ui-from-a-browser), which runs it
+  inside the sandbox);
 - passes the other subcommands (`auth`, `debug`, `mcp`, `plugin`, `session`,
   `upgrade`, `uninstall`, `acp`) through unchanged, since they do not accept
   `--standalone`.
@@ -615,6 +1124,480 @@ so `bwopencode2 --exec 'opencode2 --server ...'` is not stopped (the host
 server password is no longer in the sandbox environment, see above). The config directory is
 read-only, so commands that write global config (for example `plugin add`)
 fail; edit config on the host.
+
+### `--serve`: the web UI from a browser
+
+`bwopencode2 --serve` is the one supported way to run `serve`. It runs
+`opencode2 serve` **inside** the sandbox, so tools stay sandboxed (the refusal
+above is about servers that run outside it), and the OpenCode web UI is then
+reachable from a browser.
+
+```text
+bwopencode2 --serve [--serve-port N]
+bwopencode2 --serve-open [--serve-port N]
+bwopencode2 --serve-ssh-config
+```
+
+Two ways to reach it, both signed in with a one-time link and no password to
+type:
+
+- **From your own machine, over ssh** (the usual case). When the server is up
+  the launcher prints one block with the `ssh -L` command (and the `ssh
+  <host>-oc` alias), the sign-in link for `http://127.0.0.1:PORT`, and the same
+  link as a `google-chrome --app=...` command, which opens the UI as an app
+  window without tabs or an address bar. A link works once and expires after 5
+  minutes, and setting up a tunnel can take longer than that, so **press Enter
+  in the server's terminal for a new link** (the block is printed again).
+- **On the same host** (a desktop or remote desktop session), start with
+  `--serve-open` instead of `--serve`: the same server, and the browser opens
+  by itself, already signed in.
+  See [`--serve-open`](#--serve-open-a-browser-on-the-same-host).
+
+- **One server per invocation.** Each `--serve` is its own sandbox with its own
+  server; stop it with Ctrl-C in its terminal.
+- **Published like `--publish`.** The server's port is added to
+  [`--publish`](#opening-ports), so it is reachable on
+  the host only at your first publish address `127.H1.H2.1:PORT` (the
+  launcher prints it), **always**: the session's publish address is fixed to
+  `.1` and never moves to another index, so the `--serve-ssh-config` alias
+  always reaches it. If one of the session's ports is taken there (another
+  of your `--publish` ports), the launch stops and says so instead.
+  `--publish-addr` is refused with `--serve`. Inside the private network
+  namespace the server listens on `0.0.0.0`, because forwarded connections
+  arrive at the namespace's interface; nothing else reaches it. With
+  `--share-net` the server listens on `127.H1.H2.1` itself. Reach it from
+  another machine through an ssh tunnel. Works with both network backends.
+- **Free port from a fixed range**, `24700-24709` by default (ten sessions at
+  once). The range sits below the kernel's ephemeral range (32768-60999 on
+  Linux), so no outgoing connection takes a server port, and clear of 49374
+  (the shared OpenCode service). `BWOPENCODE2_SERVE_PORTS=LO-HI` changes it
+  (at most 100 ports, 1024-65535, never including 49374; a warning is printed
+  if it overlaps the ephemeral range). `--serve-port N` asks for one port in
+  the range and fails if it is taken, so a saved tunnel always matches.
+- **The ssh tunnel.** At start the launcher prints
+  `ssh -L P:127.H1.H2.1:P <host>` with the host from `hostname -f`; then open
+  `http://127.0.0.1:P/` on the machine with the browser. For all ports at
+  once, `bwopencode2 --serve-ssh-config` (run on the host, as the user who runs
+  the sessions: the address depends on the uid) prints a block for
+  `~/.ssh/config` on the machine with the browser (alias `<host>-oc`, one
+  `LocalForward` per port of the range to `127.H1.H2.1`,
+  `ExitOnForwardFailure no` so a busy local port does not stop the others).
+  The port is chosen free on `127.H1.H2.1`, and not claimed there by another
+  of your sandboxes. Keep the same port number
+  at both ends: the browser cookie is named by it (see below). Add `User` and
+  `ProxyJump` to the alias as needed. Each user has their own address, so
+  sessions of different users on one host no longer compete for
+  `127.0.0.1:24700-24709`.
+- **Signing in.** The web UI opens on a "Connect to a server" page that asks
+  for a pairing link and offers **Use password**. Do not run `opencode pair`
+  (the wrapper refuses it, and outside the sandbox it points at the shared
+  service). Instead the sandbox runs a small wrapper, not `opencode2 serve`
+  directly: it starts the server, waits until it answers, asks it for a
+  one-time pairing code and prints one block: the `ssh -L` command and the
+  alias, the link through the tunnel
+  (`http://127.0.0.1:<port>/auth/connect/<code>`), the same as a
+  `google-chrome --app=...` command, the link for this host
+  (`http://127.H1.H2.1:<port>/...`) and the password. Open a link to be signed
+  in, with the 30-day cookie, without typing the password. A link works once
+  and expires after 5 minutes. **Enter** in the terminal asks the server for a
+  new code and prints the block again; it is only read when the wrapper has a
+  terminal, and at end of input the wrapper stops reading and keeps waiting
+  for the server. If the server gives no link, the block shows the plain page
+  and the password and you click **Use password**. The password reaches `curl`
+  on its standard input (`-K -`), never on a command line, because a process in
+  the sandbox is visible to `ps` on the host (a backslash or double quote in a
+  fixed password is escaped for curl's config file). The wrapper stays in the
+  foreground and stops the server on Ctrl-C or when the sandbox ends.
+- **Password.** The server needs one (Basic auth, user `opencode`). The launcher uses a **random password for each
+  session** and prints it with the sign-in block. To use a fixed one, export
+  `BWOPENCODE2_SERVE_PASSWORD` (at least 12 characters, for example from
+  `load-env`); the launcher prints nothing about it. Either way it reaches the
+  server only as `OPENCODE_PASSWORD` in the sandbox environment (the host's
+  own `OPENCODE_PASSWORD` is still dropped) and is never written to a file.
+  Trade-off: a sandboxed agent can read its own environment, so it can read its
+  password. With a random password that only reaches its own session. With a
+  fixed one it reaches every session that shares it, and any sandboxed agent on
+  the host could drive them all. Prefer the random default.
+- **Port claims.** A file `~/.local/state/bwopencode2/serve/<port>.session` (host
+  side, not mounted in the sandbox; the port, launcher pid and its process
+  start time, host, directory and start date, no secret) stops two launchers
+  picking the same port; the port must also be free on the address checked
+  (`127.H1.H2.1`, or `--publish-addr`), and the address is claimed as for any
+  `--publish`.
+  A claim
+  whose process is gone is stale and is removed on the next `--serve`. The
+  launcher ends in `exec`, so it cannot retry or clean up afterwards; the
+  remaining race is another program taking the port in the moment before the
+  server binds it, and then the server fails to start with an error: run it
+  again.
+- **Limits.** `--serve` and `--serve-open` take no opencode2 arguments and cannot be combined with
+  `--exec`; `serve`, `--server`, `pair` and the other refused arguments stay
+  refused. `--dry-run` shows the command (password redacted) and claims
+  nothing, and opens no browser.
+- **Cookie.** The server names its login cookie `opencode_session_<port>` from
+  the port in the address the browser used (checked with 2.2.6 using curl), so
+  sessions on different ports do not log each other out. The cookie holds an
+  expiry (30 days) and a hash made with the server password: with a fixed
+  password a cookie is accepted by any session that shares it, with a random
+  one it stops working when the session ends.
+
+#### `--serve-open`: a browser on the same host
+
+For a session on a workstation or a remote desktop, where the browser runs on
+the host that runs the server:
+
+```text
+bwopencode2 --serve-open [--serve-port N]
+```
+
+- **Its own option, not an add-on.** `--serve-open` is `--serve` plus the
+  browser, so it needs no `--serve` next to it (`--serve --serve-open` means
+  the same). `--serve` alone never opens anything.
+- **Only when asked.** Without `--serve-open` nothing is ever opened, also
+  with a display available (an `ssh -X` session has one, and Chrome should not
+  start over X forwarding by surprise).
+- **Started on the host, outside the sandbox.** The sandbox cannot start a
+  browser and does not try. Before the launcher replaces itself with the
+  sandbox it starts a small helper in the background (the launcher's pid does
+  not change at `exec`, so the helper can tell when the launcher has gone). The
+  helper waits up to about a minute for the server to answer on
+  `127.H1.H2.1:<port>`, asks it for **a one-time pairing code of its own**
+  and starts the browser detached (`setsid`, output discarded), so ending the
+  server does not close the window. The password reaches `curl` on its standard
+  input. It opens nothing when the launcher has exited.
+- **What the terminal shows.** Nothing of the ssh block: `--serve-open` is for
+  the host you are on. The launcher prints one line before the sandbox starts,
+  then either
+
+  ```text
+  bwopencode2: OpenCode web UI on 127.52.255.1:24700, opened in google-chrome.
+  ```
+
+  or, if no browser opened, a link to open by hand and the password:
+
+  ```text
+  bwopencode2: could not open a browser (no web browser found: ...).
+    Open this on this machine:  http://127.52.255.1:24700/auth/connect/<code>
+    (works once, expires in 5 minutes; press Enter for a new link)
+    If the link fails, click "Use password": <password>
+  ```
+
+  The helper decides after starting the browser: one that exits with an error
+  within 8 seconds (`xdg-open` with no handler, a browser that cannot start)
+  counts as not opened, and one still running, or that exited 0 (Chrome handing
+  the link to a window that is already open), counts as opened. A browser that
+  fails later is not noticed. The fallback link is a **new** code, because a
+  failed attempt may already have used the first. The same fallback is printed
+  by the helper when the server never answered, and by the sandbox's wrapper
+  when no browser could be chosen (no desktop session, none installed; the line
+  says why). Enter prints a new link in the same short form. The password is printed only in the
+  fallback (random password; with `BWOPENCODE2_SERVE_PASSWORD` the line names the
+  variable), never when the browser opened. `--serve` prints the full block
+  described above, unchanged.
+- **Which browser.** The first of `google-chrome`, `google-chrome-stable`,
+  `chromium`, `chromium-browser` on `PATH`, started as `BROWSER
+  --app=LINK` (an app window); else `firefox LINK`; else `xdg-open LINK`, but
+  only when a default web browser is registered for `http`, the scheme of the
+  link (`xdg-mime query default x-scheme-handler/http` prints one). Without one `xdg-open` does not fail: on
+  GNOME it opens the link in the text editor, which shows "Could Not Open File,
+  HTTP Client Error: Unauthorized" and has used up the one-time link (seen on a
+  workstation with no browser installed, and the reason for this rule).
+  `BWOPENCODE2_SERVE_BROWSER` names another command, which must exist
+  (otherwise the launch stops): a name containing `chrom`, `edge` or `brave`
+  gets `--app=`, any other (`firefox`, `xdg-open`) gets the plain link.
+- **Holds none of the launcher's descriptors.** The launcher has the database
+  session lock (see Database guard) and the sandbox's own descriptors open when
+  the helper starts. A browser that inherited them would keep the lock for as
+  long as its window stays open, and the next `bwopencode2` on the same data
+  directory would be refused. The helper closes every descriptor above 2 before
+  it starts the browser (found in Copilot's review of PR #43, reproduced: the
+  browser held descriptor 200, the lock, until its window closed; the test
+  fails without the fix). Bash keeps descriptor 255, its handle on the script
+  file, to itself; it holds no lock.
+- **No desktop session.** If neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, or
+  no browser is found, the launch continues and the launcher says that nothing
+  will be opened and why; the ssh instructions then apply.
+- **The link is on the browser's command line.** Another user of the host can
+  read it with `ps` for the moment the browser starts. It works once and
+  expires after 5 minutes, but a local user who gets there first would hold a
+  signed-in session for 30 days (the published address already accepts
+  connections from every local user, and the password is the only thing that
+  stops them). Do not use `--serve-open` on a host where other people log in.
+- **Only a browser signs in.** The server answers `GET /auth/connect/<code>`
+  with `302` to `/` and the login cookie only when the request asks for HTML
+  (`Accept: text/html`, which every browser sends). Any other client (`curl`,
+  the GNOME text editor through gvfs) gets `200` with a JSON token, no cookie,
+  and the code is used up. Checked with OpenCode 2.2.7: `Accept: text/html`
+  alone gives `302` and the cookie (`Sec-Fetch-*` headers alone do not), and
+  a second use of the same code gives `401`.
+- **Cookie.** The cookie goes into the browser's normal profile, named by the
+  port as above. Opening `http://127.H1.H2.1:<port>/` again later stays signed
+  in for as long as the session lives.
+
+Checked against OpenCode 2.2.6 with curl and an isolated data directory: the
+server answers 401 without the password and 200 with it, serves the web UI page
+without a password, and `POST /api/pair` with the password gives a one-time link
+that sets the cookie. The pairing wrapper was run in a sandbox against a
+throwaway server (isolated data directories): it printed a link that signed in
+with `Set-Cookie: opencode_session_<port>` and worked only once, the password
+appeared in no process command line that was sampled, and TERM stopped the
+server. The web UI's "Use password" page was seen in a screenshot. Not checked,
+because it needs a browser or the real launcher: signing in with the link in a
+browser, entering the password, a Ctrl-C from the terminal, and two sessions
+open in one browser. Whether the agent can read `OPENCODE_PASSWORD` in tool
+output (`printenv`) is also unchecked.
+
+The sign-in block, Enter for a new link and `--serve-open` were tested without a
+real OpenCode or browser: `tests/test_serve_signin.py` runs the wrapper against
+a fake server (the right password reaches it through curl, including a quote and
+a backslash; a new code on Enter through a pseudo-terminal; no spinning at end
+of input; a failed pairing) and the host helper against a stub browser (the
+`--app=` link, the plain link, the login page when no link came, a launcher
+that has gone, a helper that survives the launcher's `exec`, nothing on
+`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 57 checks through
+`--dry-run` (arguments, browser choice, no display). Not checked, because it
+needs a real launch and a browser: that Chrome opens an app window signed in,
+Enter at a terminal inside `bwrap --new-session`, and the helper's output on a
+terminal. A real launch on a workstation with no browser, with a stand-in
+browser script, showed the helper starting it once the server answered, with
+the link of its own; that the link redirects to `/` with the cookie was
+checked with `curl` against a throwaway server (see "Only a browser signs in").
+
+## `bwopenchamber`
+
+Launches [OpenChamber](https://openchamber.dev) (npm `@openchamber/web`), a web
+UI for OpenCode, inside a bubblewrap sandbox. OpenChamber is a Node.js server
+that starts its own `opencode serve` and adds a browser terminal, git and
+worktree handling, scheduled tasks and session goals on top of it.
+
+```text
+bwopenchamber [bwopenchamber-options]
+bwopenchamber --ssh-config
+```
+
+**Everything runs in the one sandbox.** The OpenChamber server, its OpenCode,
+the browser terminal's shells, git, worktree commands, project start commands,
+scheduled tasks and every tool call the agent makes are processes of this
+sandbox. Only the browser is outside, on another machine, reached through an
+ssh tunnel. This is deliberate: OpenChamber is not only a screen. An
+OpenChamber that runs outside a sandbox in front of a sandboxed OpenCode
+(`OPENCODE_HOST`, or a Windows or desktop install) would run the terminal, git
+and worktree commands unsandboxed, and gives the agent tools that call back into
+it. Do not connect one to `bwopencode2 --serve`.
+
+It is a launcher of its own, not a mode of `bwopencode2`: it sources
+`bin/bwopencode2` for the OpenCode 2 mounts, environment, [database
+guard](#database-guard) and the [`--serve`](#--serve-the-web-ui-from-a-browser)
+port pool, so a fix made there applies here. Moving that shared code into the
+library is a follow-up.
+
+### What it needs
+
+- **Node.js 24.14 or newer** (OpenChamber's own requirement). The launcher looks
+  for one in this order: `BWOPENCHAMBER_NODE`, if set (only that one, and an error
+  if it is too old); the `node` on `PATH`, if it is new enough; the newest
+  versioned binary (`node-24`, `nodejs24`) in `/usr/bin` and `/usr/local/bin` that
+  is new enough. That finds the RHEL 10 `nodejs24` package, which installs
+  `node-24` next to the default `node` (22). On RHEL 8 and 9 the base role enables
+  the `nodejs:24` module, which puts a new enough `node` on `PATH`. When none
+  qualifies, the error lists what it found with versions and says what to do. To
+  use a Node from elsewhere, for example pixi, set `BWOPENCHAMBER_NODE` to its
+  path: `BWOPENCHAMBER_NODE=$(pixi exec -s nodejs=24 -- sh -c 'command -v node')`.
+- **OpenChamber** in `/opt/nsls2/openchamber` (`node_modules/@openchamber/web`),
+  mounted read-only. `BWOPENCHAMBER_DIR` names another install. The ansible base
+  role does not install it yet.
+- **OpenCode 2** in `/opt/nsls2/opencode2` and an OpenCode config, as for
+  `bwopencode2`.
+- A private network backend (`pasta` or `slirp4netns`), or `--share-net`: see
+  [Network](#network).
+
+### Reaching it
+
+- **Port and address.** The port comes from the same pool as `bwopencode2
+  --serve` (24700-24709, `BWOPENCODE2_SERVE_PORTS=LO-HI`), claimed in the same
+  state directory, so a port is never given to both and **one ssh_config block
+  covers both**: `bwopenchamber --ssh-config` prints the same block as
+  `bwopencode2 --serve-ssh-config`. `--port N` asks for one port. It is published
+  like `--publish`, always on your first publish address `127.H1.H2.1`, and the
+  launcher prints the `ssh -L` command and the URL.
+- **Private network.** The server listens on `0.0.0.0` inside the sandbox's
+  private network, where only the published port reaches it. **The published
+  address is not access control**: any local user can connect to any `127/8`
+  address (see [Opening ports](#opening-ports)), so another user of the host can
+  reach this port, and the UI password is what keeps them out. OpenCode's own
+  port (a random one on `127.0.0.1` inside the sandbox) is not published and the
+  host cannot connect to it (checked). With `--share-net` the server binds your
+  publish address on the host network instead, and OpenCode's port is then on the
+  host's loopback too, behind its own random password; use it only where neither
+  backend works.
+- **Password.** Random for each session, printed once; `BWOPENCODE2_SERVE_PASSWORD`
+  (12 characters or more) sets a fixed one for every session that uses it. It
+  reaches the server as `OPENCHAMBER_UI_PASSWORD` in the sandbox environment,
+  never on a command line.
+- **Sign-in key.** The browser sign-in cookies are signed with a key that is
+  random for each session (`OPENCODE_JWT_SECRET`), so a sign-in ends with the
+  session that issued it. Without it OpenChamber 2.7.0 writes a key to
+  `jwt-secret` in its data directory and reuses it: a browser that signed in once
+  stayed signed in across restarts and after the password changed (12 hours, or 7
+  days on a trusted device), and the agent could read the file. Checked: with a
+  new key a cookie is refused after a restart (401), signing in again works, and
+  no `jwt-secret` file is written. Reload the page after a restart and it asks
+  for the password. The key is still in the environment of the agent's shell
+  (checked: `printenv | grep -c OPENCODE_JWT_SECRET` prints 1), so an agent can
+  still sign a cookie for the current session; the change limits that to the
+  session instead of leaving a reusable key on disk (see the known limit below).
+- **Preview.** A dev server started by the agent is not reachable from your
+  browser by itself. Publish its port with `--publish PORT` (also on your
+  `127.H1.H2.1`) and add a forward for it.
+- **No arguments.** The server is always `serve --foreground`, on the published
+  address. `--host`, `--lan`, `tunnel`, `startup`, `connect-url` and every other
+  OpenChamber argument are refused. `--exec CMD` runs `CMD` in the same sandbox
+  (a shell for diagnostics) without a server, password or port.
+
+### Policy: what is turned off
+
+- **The policy is a read-only file the launcher generates**, mounted from a
+  descriptor at `/etc/openchamber/policy.json` inside the sandbox (the host's
+  file is not visible there and plays no part). It sets enterprise mode (no
+  tunnels (Cloudflare, ngrok, Tailscale), no public relay, no classification
+  service (Jev), no adding model providers in the app, no outside integrations
+  catalogue, no extensions that send data off the machine, generic
+  push-notification titles), `allowNetworkAccess: true` (the server listens on the
+  private network's interface; enterprise mode refuses that by default), the
+  installed OpenCode 2 as `opencodeBinary`, and hides the four built-in
+  third-party skills catalogues. It holds no secret. `OPENCHAMBER_ENTERPRISE_MODE=1`
+  and `OPENCHAMBER_PUSH_RELAY_DISABLED=true` are also set, so that if the file were
+  missing the server would fail closed (enterprise mode refuses a network address
+  without `allowNetworkAccess`) and not run unpinned.
+- **Why a file and not environment variables.** Without a policy file, a saved
+  `opencodeBinary` in OpenChamber's `settings.json` overrides `OPENCODE_BINARY`.
+  That file is in the persistent data directory, which the agent can write, so the
+  agent could name another executable and OpenChamber would start it as
+  "OpenCode" with OpenChamber's environment, bypassing the pin and the database
+  guard's identity check. Only a policy file outranks the saved setting. Copilot
+  review found this; checked with 2.7.0: with the environment alone a fake
+  OpenCode named in `settings.json` ran, and with the read-only policy file
+  OpenChamber started the installed OpenCode and the fake never ran. The first
+  version of this launcher passed the pin as `OPENCODE_BINARY` only and said it was
+  pinned; that was wrong.
+- **The host's own policy** (`/etc/openchamber/policy.json` deployed by ansible)
+  governs an OpenChamber run outside `bwopenchamber`; the launcher's file takes its
+  place inside the sandbox.
+- **Host variables.** The launcher never passes `OPENCODE_HOST`, `OPENCODE_PORT`,
+  `OPENCODE_SKIP_START`, a server password or any other host `OPENCODE_*` or
+  `OPENCHAMBER_*` variable: the sandbox environment starts clean, and
+  `AIFAPIM_*`, the allowlisted `OPENCODE_*` switches and, with
+  `--github-tokens`, the `GH_TOKEN_*` variables are added as for `bwopencode2`.
+- **Which model providers may be used** is decided by OpenCode, not
+  OpenChamber (the managed `/etc/opencode` config is mounted as for
+  `bwopencode2`).
+
+### Data and mounts
+
+- Everything `bwopencode2` mounts (config read-only, OpenCode data and cache,
+  authoring directories, git, pixi, npm, N2C tokens with `--n2c-token`), plus the
+  OpenChamber install read-only and OpenChamber's own data directory.
+- **OpenChamber's data** (settings, projects, chats, worktrees, logs) is
+  `~/.local/share/bwopenchamber` on the host, mounted at
+  `~/.local/share/openchamber` in the sandbox: apart from any OpenChamber run
+  outside a sandbox, which is never mounted. It is bound whole and read-write,
+  so if it is a symlink the launcher resolves it and refuses a target that
+  contains a blocked path (for example a directory holding `~/.config/gh`), and
+  mounts the resolved path (found in Copilot's review of PR #43; the same check
+  as for the install directory).
+- **`run/` is an empty tmpfs.** OpenChamber writes its pid file and an instance
+  file there, and the instance file contains the UI password in plain text (checked
+  with 2.7.0), so it must not reach the persistent directory.
+- **No sign-in key is kept.** `jwt-secret` is not written (see Sign-in key). A
+  file left by an earlier run stays in the data directory but is not used.
+- **Projects.** Only the directory you start in (its git root) is mounted
+  read-write, so a project that OpenChamber opens elsewhere needs `--rw-path`.
+  Starting in a parent directory that is not itself a git repository, such as
+  `~/Projects`, gives it all the repositories below.
+- **Do not sign in to GitHub or add SSH keys in OpenChamber.** Whatever it
+  stores is readable by the agent, and it can merge pull requests and push.
+  Use `--github-tokens` for read-only access. The agent is told this in the
+  sandbox context.
+
+### Connecting from another machine
+
+Forward the port (`ssh -L`, or the alias from `--ssh-config`) and open
+`http://127.0.0.1:PORT/` in a browser or the installed PWA; sign in with the
+password. Keep the same port number at both ends, since the login cookie is
+named by it.
+
+### Known limit: the agent can read its own controls
+
+OpenChamber puts its credentials into the environment of the OpenCode it starts,
+and so of the agent's shell and the browser terminal (its own code records them
+in `OPENCHAMBER_INJECTED_ENV`). Checked with 2.7.0: an agent session's shell has
+`OPENCHAMBER_UI_PASSWORD`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_PASSWORD` and
+`OPENCODE_JWT_SECRET` set. With them the agent can sign in to OpenChamber (or
+sign a cookie itself), or call its own OpenCode server's API, and so change
+settings, start sessions or scheduled tasks and answer its own permission
+prompts. Nothing leaves the sandbox: everything it could drive runs
+inside it, and the sandbox boundary is what was checked below.
+
+- **The launcher cannot remove them.** OpenChamber writes them into its own
+  environment. Hiding them from the agent's shell only would not help either: a
+  process of the same user in the sandbox can read the server's environment from
+  `/proc/<pid>/environ` (checked in a `bwopencode2` sandbox).
+- **The agent is told in the sandbox context** not to read, print or use them.
+  That is an instruction, not a control.
+- **`bwopencode2 --serve` has the same property** with `OPENCODE_PASSWORD`, which
+  its section lists as unchecked.
+- Where the agent's permission rules ask before risky actions, the agent holding
+  these credentials can answer its own prompts through the API, so those prompts
+  are not a barrier against a misbehaving agent here.
+
+### What was checked
+
+**A real launch on a workstation** (`bwopenchamber --port 24700`, pasta, OpenCode
+2.2.7, OpenChamber 2.7.0):
+
+- The host has one new listener, `127.52.255.1:24700`, and nothing on 3000 or on
+  OpenCode's port. Without a password the API gives 401, the same port on
+  `127.0.0.1` is refused, and OpenCode's own port is refused from the host.
+- A browser signed in through an `ssh -L` tunnel, and an agent session worked
+  through the model gateway.
+- OpenChamber's browser terminal runs inside the sandbox: `BWRAP_SANDBOX` is
+  `bwopenchamber`, `~/.ssh` does not exist, `ssh` is masked and
+  `BWRAP_NET_BACKEND` is `pasta`.
+- After Ctrl-C the OpenCode that OpenChamber started is gone.
+- The database guard refused to start next to an older OpenCode build, as
+  designed.
+
+**In a private network namespace without the launcher**, OpenChamber 2.7.0 with
+the launcher's environment: the server answers on `0.0.0.0`, 401 and 200 as
+above, the managed OpenCode receives `OPENCODE_CONFIG_CONTENT` (the sandbox
+context), `run/` holds the UI password in plain text, and the sign-in key behaves
+as described under Reaching it. With a `settings.json` naming a fake OpenCode,
+the environment alone let the fake run; with a read-only policy file at
+`/etc/openchamber/policy.json` pinning the installed OpenCode the fake never ran,
+and the server still listened on `0.0.0.0` using `allowNetworkAccess` from the
+file.
+
+**Tests:** `tests/test-bwopenchamber.sh` (104 checks through `--dry-run`: argument
+refusals, the environment and mounts built, the generated policy file, hostile
+host variables dropped, password and sign-in key handling, Node and install
+checks, and that a port held by another session does not change the result: the
+harness stubs the port probe, which Copilot found made the tests depend on running
+sessions).
+
+**Not checked:** git and worktrees from OpenChamber, whether the host listener
+belongs to pasta or to the network log's Python helper (`ss` names
+`platform-python`), and the shared-library move that is left for after #37.
+
+To repeat the host checks (do not capture the banner, it prints the password):
+
+```text
+bwopenchamber --port 24700          # in a project directory
+ss -ltnp                            # on the host: only 127.H1.H2.1:24700
+curl -s -o /dev/null -w '%{http_code}\n' http://127.H1.H2.1:24700/auth/session   # 401
+# in the browser through the tunnel: sign in, open the terminal and run
+#   echo $BWRAP_SANDBOX; ls ~/.ssh; ssh -V     # bwopenchamber; fails; fails
+# Ctrl-C, then: pgrep -af 'opencode.exe serve'  # none of this session's
+```
 
 ## `bwclaude`
 
@@ -723,7 +1706,7 @@ Additional options:
 | Option | Effect |
 | --- | --- |
 | `--debug` | Enable verbose Codex logging (sets `RUST_LOG=debug`) |
-| `--persist-config` | Bind-mount `~/.codex/config.toml` read-write into the sandbox so changes (e.g. project-trust grants) persist across sessions. Without this flag, `config.toml` is staged read-write into a per-session copy that is discarded on exit. Concurrent `--persist-config` sessions may race on writes |
+| `--persist-config` | Bind-mount `~/.codex/config.toml` read-write into the sandbox so changes (e.g. project-trust grants) persist across sessions. Without this flag, `config.toml` is copied read-write into the sandbox's tmpfs for the session and the copy is discarded on exit. Concurrent `--persist-config` sessions may race on writes |
 
 Note: Codex CLI also enforces its own inner Landlock-based sandbox for
 agent tool calls. The outer `bwrap` here is complementary — it scopes
@@ -734,5 +1717,8 @@ the entire Codex process tree, not just agent-issued commands.
 Shared sandbox-building primitives sourced by all `bw*` wrappers. Not
 intended to be executed directly. The library header documents the
 public function surface (sandbox construction, dynamic mount discovery,
-binary masking, environment scrubbing, and `build_sandbox_context` with its
-`SANDBOX_CONTEXT_*` variables; see [Sandbox context](#sandbox-context)).
+binary masking, environment scrubbing, `build_sandbox_context` with its
+`SANDBOX_CONTEXT_*` variables (see [Sandbox context](#sandbox-context)), and
+the network functions `detect_net_capabilities`, `net_add_publish`,
+`net_add_host_port`, `net_set_publish_addr`, `net_set_share`, `net_set_backend`,
+`net_print_help` and `build_net_isolation` (see [Network](#network)).

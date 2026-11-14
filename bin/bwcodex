@@ -25,8 +25,8 @@
 #     - history.jsonl: bind-mounted read-write (prompt history)
 #     - config.toml: by default, opened as a file descriptor and passed to
 #         bwrap via --file so Codex can persist project-trust grants for the
-#         session without touching the host file (the temp copy is unlinked
-#         immediately after opening; no cleanup needed on exit).
+#         session without touching the host file (nothing is staged on the
+#         host).
 #         With --persist-config, the host config.toml is
 #         bind-mounted RW so writes persist across sessions at the cost of
 #         weaker isolation.  Either the user file or the system file
@@ -102,6 +102,29 @@
 #                   so `--rw-path DIR --ro-path DIR/sub` protects DIR/sub.
 #   --no-sandbox-context
 #                   Do not generate the sandbox context file (see below).
+#   --publish PORT[:SANDBOXPORT]
+#                   Make a server in the sandbox reachable on the host at a
+#                   per-user, per-session loopback address (127.H1.H2.S:PORT).
+#                   May be repeated.
+#   --publish-addr ADDR
+#                   Use ADDR (in 127.0.0.0/8) for --publish instead.
+#   --host-port PORT[:SANDBOXPORT]
+#                   Make the host's 127.0.0.1:PORT reachable in the sandbox at
+#                   127.0.0.1:SANDBOXPORT (pasta only; that sandbox port is
+#                   then taken).  May be repeated.
+#   --share-net     Share the host network instead (the behaviour before
+#                   private namespaces); not with the options above.
+#   --net-backend pasta|slirp4netns
+#                   Use only this backend for the private namespace.
+#
+# Network: the sandbox has its own network namespace from pasta (package
+# passt), or else slirp4netns (--host-port needs pasta).
+# Outbound connections work; services on the host's loopback are unreachable
+# and the sandbox's listeners are invisible to the host, except for the ports
+# opened with --publish and --host-port.  Without a usable private namespace
+# the launch stops (exit 3) unless --share-net is given.  Every session (with
+# pasta every connection too) is recorded in the host's system log, tag
+# bwrap-net; there is no option to turn this off.
 #
 # Sandbox context: a short markdown file describing this sandbox (what is
 # mounted read-only or read-write, what is lost at exit, which tools are
@@ -185,6 +208,42 @@ parse_wrapper_args() {
                 # shellcheck disable=SC2034  # consumed by sourced bwrap_sandbox_lib.sh
                 SANDBOX_CONTEXT_ENABLED=0
                 shift
+                ;;
+            --publish)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_publish "$2"
+                shift 2
+                ;;
+            --publish-addr)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --publish-addr requires an address in 127.0.0.0/8." >&2
+                    exit 1
+                fi
+                net_set_publish_addr "$2"
+                shift 2
+                ;;
+            --host-port)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --host-port requires PORT[:SANDBOXPORT]." >&2
+                    exit 1
+                fi
+                net_add_host_port "$2"
+                shift 2
+                ;;
+            --share-net)
+                net_set_share
+                shift
+                ;;
+            --net-backend)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: --net-backend requires pasta or slirp4netns." >&2
+                    exit 1
+                fi
+                net_set_backend "$2"
+                shift 2
                 ;;
             --ro-path)
                 if [[ $# -lt 2 ]]; then
@@ -293,6 +352,7 @@ Authentication:
                          `codex login` to populate ~/.codex/auth.json.
 
 HELP_EOF
+    net_print_help
     # Delegate to codex --help inside the sandbox so the user sees the full
     # codex option set in the same invocation.
     bwrap_show_tool_help codex
@@ -406,36 +466,20 @@ build_codex_home_mount() {
     fi
 
     # User config.toml mount strategy (see file header):
-    #   - Default: open a temporary copy of config.toml as an fd and pass it
-    #     to bwrap via --file.  bwrap creates a plain (writable) file in the
-    #     sandbox tmpfs from the fd content, so Codex can persist project-trust
-    #     grants for the session without touching the host file.  The temp
-    #     file is unlinked immediately after the fd is opened, so no cleanup
-    #     is needed on exit — the fd holds the only reference and closes when
-    #     bwrap exec's into the tool.
+    #   - Default: bwrap --file copies config.toml, from a descriptor the
+    #     descriptor relay opens on the host file, into a plain (writable)
+    #     file in the sandbox tmpfs, so Codex can persist project-trust
+    #     grants for the session without touching the host file.  Nothing is
+    #     staged on the host.
     #   - --persist-config: bind host config.toml RW so writes persist.
     # If the user file does not exist (managed host using only system
     # config), skip the user mount entirely.
     if [[ -f "${CODEX_CONFIG_FILE}" ]]; then
         if [[ "${PERSIST_CONFIG}" -eq 1 ]]; then
             BWRAP_ARGS+=(--bind "${CODEX_CONFIG_FILE}" "${CODEX_CONFIG_FILE}")
-        elif [[ "${DRY_RUN}" -eq 1 ]]; then
-            # --dry-run stages nothing on the host, and a real fd number could
-            # not be reproduced by copy-paste: print a placeholder instead.
-            BWRAP_ARGS+=(--file "<config-fd>" "${CODEX_CONFIG_FILE}")
         else
-            local _config_fd _staged_config
-            _staged_config="$(mktemp --tmpdir bwcodex-config.XXXXXX.toml)"
-            # Plain cp (not cp -p) keeps mktemp's 0600 mode; -p would apply
-            # the source's mode (typically 0644), leaving a world-readable
-            # copy in the shared temp directory until the unlink below.
-            cp "${CODEX_CONFIG_FILE}" "${_staged_config}"
-            # Open the copy as an fd then immediately unlink it.  The kernel
-            # keeps the data alive via the open fd; the filename disappears
-            # from /tmp so there is nothing to clean up on exit or signal.
-            exec {_config_fd}< "${_staged_config}"
-            rm -f "${_staged_config}"
-            BWRAP_ARGS+=(--file "${_config_fd}" "${CODEX_CONFIG_FILE}")
+            bwrap_fd_from_file "${CODEX_CONFIG_FILE}"
+            BWRAP_ARGS+=(--file "${_BWRAP_FD}" "${CODEX_CONFIG_FILE}")
         fi
     fi
 
@@ -446,17 +490,11 @@ build_codex_home_mount() {
     # Keep the managed daemon package in tmpfs.  The complete CLI package
     # mounted by build_codex_bin_mount seeds it on each launch.  Disable the
     # daemon's updater before Codex starts so it does not fetch a newer copy.
-    BWRAP_ARGS+=(--perms 0700 --dir "${CODEX_HOME_DIR}/app-server-daemon")
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-        BWRAP_ARGS+=(--perms 0600 --file "<daemon-settings-fd>" "${CODEX_DAEMON_SETTINGS_FILE}")
-    else
-        local _settings_fd _staged_settings
-        _staged_settings="$(mktemp --tmpdir bwcodex-daemon-settings.XXXXXX.json)"
-        printf '{"updater":{"autoUpdateEnabled":false}}\n' > "${_staged_settings}"
-        exec {_settings_fd}< "${_staged_settings}"
-        rm -f "${_staged_settings}"
-        BWRAP_ARGS+=(--perms 0600 --file "${_settings_fd}" "${CODEX_DAEMON_SETTINGS_FILE}")
-    fi
+    # No --perms: it needs bwrap 0.5.0 and RHEL 8 ships 0.4.0.  Both paths
+    # live in the sandbox's private tmpfs, so their modes guard nothing.
+    BWRAP_ARGS+=(--dir "${CODEX_HOME_DIR}/app-server-daemon")
+    bwrap_fd_from_data "Codex daemon settings" '{"updater":{"autoUpdateEnabled":false}}'
+    BWRAP_ARGS+=(--file "${_BWRAP_FD}" "${CODEX_DAEMON_SETTINGS_FILE}")
 
     # auth.json: only persist if it already exists on the host.
     # Use --init-auth on first run to bootstrap persistent ChatGPT-login auth.
@@ -620,6 +658,7 @@ main() {
     bwrap_resolve_tool codex
 
     detect_kernel_capabilities
+    detect_net_capabilities
     resolve_common_paths
     resolve_codex_paths
     detect_shell
@@ -636,6 +675,7 @@ main() {
     build_proc_dev_tmp
     build_sys_mounts
     build_etc_mounts
+    build_net_isolation
     build_managed_skills
     build_home_tmpfs
     build_workdir_mount
@@ -645,6 +685,7 @@ main() {
     build_pixi_mounts
     build_ccache_mounts
     build_npm_mounts
+    build_prek_mounts
     build_user_bin_mount
     build_nsls2_mount
     build_codex_bin_mount

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Run bwopencode2's main() with the changes tests need, so --serve and
+# --serve-open can be dry-run without an installation:
+#   - resolve_bwrap_bin accepts the bwrap of the development sandbox, which is
+#     not owned by root there (the library's check is not weakened for real runs);
+#   - serve_port_is_free does not probe real sockets, so a running session
+#     holding 24700 does not change the port the tests expect;
+#   - the OpenCode 2 binary is a stub (HARNESS_OC2_BIN).
+#
+#   tests/bwopencode2-harness [bwopencode2 options]
+set -euo pipefail
+here="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=../bin/bwopencode2
+source "${here}/../bin/bwopencode2"
+resolve_bwrap_bin() {
+	echo /usr/bin/bwrap
+}
+serve_port_is_free() {
+	return 0
+}
+# shellcheck disable=SC2034  # read by bwopencode2's functions
+[[ -z "${HARNESS_OC2_BIN:-}" ]] || OC2_INSTALL_BIN="${HARNESS_OC2_BIN}"
+# The browsers --serve-open looks for, so a test does not depend on the host's
+# (HARNESS_SERVE_OPEN_CANDIDATES set to nothing means none).
+# shellcheck disable=SC2034  # read by bwopencode2's functions
+if [[ -n "${HARNESS_SERVE_OPEN_CANDIDATES+x}" ]]; then
+	read -r -a SERVE_OPEN_CANDIDATES <<<"${HARNESS_SERVE_OPEN_CANDIDATES}"
+fi
+main "$@"
