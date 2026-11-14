@@ -1133,7 +1133,8 @@ above is about servers that run outside it), and the OpenCode web UI is then
 reachable from a browser.
 
 ```text
-bwopencode2 --serve [--serve-port N] [--serve-open]
+bwopencode2 --serve [--serve-port N]
+bwopencode2 --serve-open [--serve-port N]
 bwopencode2 --serve-ssh-config
 ```
 
@@ -1148,7 +1149,8 @@ type:
   minutes, and setting up a tunnel can take longer than that, so **press Enter
   in the server's terminal for a new link** (the block is printed again).
 - **On the same host** (a desktop or remote desktop session), start with
-  `--serve-open`: the browser opens by itself, already signed in.
+  `--serve-open` instead of `--serve`: the same server, and the browser opens
+  by itself, already signed in.
   See [`--serve-open`](#--serve-open-a-browser-on-the-same-host).
 
 - **One server per invocation.** Each `--serve` is its own sandbox with its own
@@ -1228,7 +1230,7 @@ type:
   remaining race is another program taking the port in the moment before the
   server binds it, and then the server fails to start with an error: run it
   again.
-- **Limits.** `--serve` takes no opencode2 arguments and cannot be combined with
+- **Limits.** `--serve` and `--serve-open` take no opencode2 arguments and cannot be combined with
   `--exec`; `serve`, `--server`, `pair` and the other refused arguments stay
   refused. `--dry-run` shows the command (password redacted) and claims
   nothing, and opens no browser.
@@ -1245,12 +1247,15 @@ For a session on a workstation or a remote desktop, where the browser runs on
 the host that runs the server:
 
 ```text
-bwopencode2 --serve --serve-open
+bwopencode2 --serve-open [--serve-port N]
 ```
 
+- **Its own option, not an add-on.** `--serve-open` is `--serve` plus the
+  browser, so it needs no `--serve` next to it (`--serve --serve-open` means
+  the same). `--serve` alone never opens anything.
 - **Only when asked.** Without `--serve-open` nothing is ever opened, also
   with a display available (an `ssh -X` session has one, and Chrome should not
-  start over X forwarding by surprise). It needs `--serve`.
+  start over X forwarding by surprise).
 - **Started on the host, outside the sandbox.** The sandbox cannot start a
   browser and does not try. Before the launcher replaces itself with the
   sandbox it starts a small helper in the background (the launcher's pid does
@@ -1323,7 +1328,7 @@ a backslash; a new code on Enter through a pseudo-terminal; no spinning at end
 of input; a failed pairing) and the host helper against a stub browser (the
 `--app=` link, the plain link, the login page when no link came, a launcher
 that has gone, a helper that survives the launcher's `exec`, nothing on
-`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 41 checks through
+`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 53 checks through
 `--dry-run` (arguments, browser choice, no display). Not checked, because it
 needs a real launch and a browser: that Chrome opens an app window signed in,
 Enter at a terminal inside `bwrap --new-session`, and the helper's output on a
