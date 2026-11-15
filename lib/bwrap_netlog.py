@@ -3,7 +3,7 @@
 "Network log").  Standard library only; runs on Python 3.6 (RHEL 8
 platform-python) and later.
 
-    bwrap_netlog.py condense --session ID [--dns-forward ADDR]
+    bwrap_netlog.py condense --session ID [--user NAME] [--dns-forward ADDR]
         [--fifo PATH --parent PID [--marker TEXT] [--end-record TEXT]
          [--session-dir DIR] [--backend NAME]] -- CMD...
         Read pasta's debug output (its stderr, and the DNS relay's lines) and
@@ -24,13 +24,15 @@ platform-python) and later.
         LISTEN, for a namespace where this process cannot bind port 53
         itself; "-" means bind here (see DnsRelay.adopt).
 
-Output lines are logfmt (key=value), so Loki's `| logfmt` can filter them:
+Output lines are logfmt (key=value), so Loki's `| logfmt` can filter them.
+Every line names the session and the user who started it (--user), so a line
+can be attributed without looking up the session's start record:
 
-    session=ID flow=7 open proto=tcp dir=out src=... dst=140.82.113.22:443 domain=github.com t=21.359
-    session=ID flow=7 close proto=tcp dir=out dst=140.82.113.22:443 domain=github.com t=33.770 secs=12.411
-    session=ID flow=9 fail proto=tcp dir=out dst=192.0.2.1:443 src=... t=40.120
-    session=ID dns domain=github.com type=A rcode=NOERROR answers=140.82.113.22
-    session=ID dns domain=api.x.com type=A rcode=NOERROR answers=192.0.2.1 cname=lb.x.net
+    session=ID user=NAME flow=7 open proto=tcp dir=out src=... dst=140.82.113.22:443 domain=github.com t=21.359
+    session=ID user=NAME flow=7 close proto=tcp dir=out dst=140.82.113.22:443 domain=github.com t=33.770 secs=12.411
+    session=ID user=NAME flow=9 fail proto=tcp dir=out dst=192.0.2.1:443 src=... t=40.120
+    session=ID user=NAME dns domain=github.com type=A rcode=NOERROR answers=140.82.113.22
+    session=ID user=NAME dns domain=api.x.com type=A rcode=NOERROR answers=192.0.2.1 cname=lb.x.net
 """
 
 # Kept to what the DNS relay needs: it starts while the sandbox starts, and
@@ -79,6 +81,16 @@ def _value(text):
     if text and not re.search(r'[\s="]', text):
         return text
     return '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def record_prefix(session, user):
+    """The leading fields of every record the condenser writes."""
+    parts = []
+    if session:
+        parts.append("session=%s" % session)
+    if user:
+        parts.append("user=%s" % _value(user))
+    return " ".join(parts) + " " if parts else ""
 
 
 class Condenser:
@@ -291,7 +303,7 @@ def condense(argv):
     """
     import subprocess
 
-    session, dns_forward, cmd = "", "169.254.1.1", []
+    session, user, dns_forward, cmd = "", "", "169.254.1.1", []
     fifo, parent, marker, end_record, session_dir, stderr_fifo = None, None, None, None, None, None
     backend = "pasta"
     i = 0
@@ -299,6 +311,8 @@ def condense(argv):
         a = argv[i]
         if a == "--session":
             session = argv[i + 1]
+        elif a == "--user":
+            user = argv[i + 1]
         elif a == "--dns-forward":
             dns_forward = argv[i + 1]
         elif a == "--fifo":
@@ -343,11 +357,13 @@ def condense(argv):
     out = sink.stdin if sink else sys.stdout.buffer
     state = {"dead": False}
 
+    lead = record_prefix(session, user)
+
     def emit(text, prefix=True):
         if state["dead"]:
             return
-        if prefix and session:
-            text = "session=%s %s" % (session, text)
+        if prefix:
+            text = lead + text
         try:
             out.write((text + "\n").encode("utf-8", "replace"))
             out.flush()

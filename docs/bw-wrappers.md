@@ -431,16 +431,18 @@ change them, and they are the data needed for a later egress allowlist.
 
 | Record | Content |
 | --- | --- |
-| start | `event=start session=ID launcher=... user=... uid=... pid=... backend=... flows=logged\|unavailable pasta=VERSION publish=ADDR:PORTS host_ports=... dir=...` |
-| dns | `session=ID dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21`, plus `cname=...` when the answer went through aliases |
-| open | `session=ID flow=7 open proto=tcp dir=out src=ADDR:PORT dst=140.82.112.21:443 domain=github.com t=21.359` |
-| close | `session=ID flow=7 close proto=tcp dir=out dst=140.82.112.21:443 domain=github.com t=33.770 secs=12.411` |
-| fail | `session=ID flow=9 fail ...`: a connection that never became active (refused, unreachable) |
+| start | `event=start session=ID launcher=... user=NAME uid=... pid=... backend=... flows=logged\|unavailable pasta=VERSION publish=ADDR:PORTS host_ports=... dir=...` |
+| dns | `session=ID user=NAME dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21`, plus `cname=...` when the answer went through aliases |
+| open | `session=ID user=NAME flow=7 open proto=tcp dir=out src=ADDR:PORT dst=140.82.112.21:443 domain=github.com t=21.359` |
+| close | `session=ID user=NAME flow=7 close proto=tcp dir=out dst=140.82.112.21:443 domain=github.com t=33.770 secs=12.411` |
+| fail | `session=ID user=NAME flow=9 fail ...`: a connection that never became active (refused, unreachable) |
 | end | `event=end session=ID ...`, when the sandbox has exited |
 
 Every line is `key=value` (logfmt), so a log store's logfmt parser can filter
-on any field. See [Reading the network log](#reading-the-network-log) for how
-to fetch the records.
+on any field. Every record after the start names both the session and the
+user who started it, so a line can be attributed on its own. See
+[Reading the network log](#reading-the-network-log) for how to fetch the
+records.
 
 - `dir` is `out` (the sandbox to the network), `publish` (a host client to a
   `--publish` port) or `host-port` (the sandbox to a `--host-port` service).
@@ -459,11 +461,15 @@ to fetch the records.
 - **Tag** (`SYSLOG_IDENTIFIER`): `bwrap-net`. `journalctl -t bwrap-net` shows
   all sessions; `journalctl -t bwrap-net -g ID` one. Inside the sandbox
   `BWRAP_SESSION` is the same ID, and the context file names it.
-- **Who logged it.** Only the `start` and `end` records name the user
-  (`user=`, `uid=`, `launcher=`, `dir=`). Every other record (dns, open, close,
-  fail) carries only `session=ID`. To list what one user's agents did, first
-  find that user's session IDs from the `start` records, then select the other
-  records by those IDs.
+- **Who logged it.** Every record carries `user=NAME`, the account of the
+  process that ran the launcher (`id -un`, not `$USER`, which the caller can
+  set to anything). Characters outside `A-Za-z0-9._@-` in it are replaced by
+  `_`, so it cannot split or forge a field. The `start` record also has `uid=`,
+  `launcher=` and `dir=`. The user is the one who started the sandbox: the log
+  does not say which process inside it made a request. Sessions started before
+  this field was added have `user=` on their `start` and `end` records only;
+  for those, find the session ID from the `start` record and select the other
+  records by it.
 - **Tool:** `systemd-cat` when the journal's stream socket exists and accepts a
   connection, else `logger` (util-linux) on `/dev/log` (journald or rsyslog).
   Both are tried at launch without logging anything; the launcher then writes
@@ -550,8 +556,8 @@ timestamp, host, tag `bwrap-net`, the writer's pid) followed by the logfmt
 fields, for example:
 
 ```text
-<14>1 2026-01-01T12:00:00+00:00 HOST bwrap-net 1234 - - session=0123456789ab dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21
-<14>1 2026-01-01T12:00:05+00:00 HOST bwrap-net 1234 - - session=0123456789ab flow=7 open proto=tcp dir=out src=10.0.0.5:44464 dst=140.82.112.21:443 domain=github.com t=21.359
+<14>1 2026-01-01T12:00:00+00:00 HOST bwrap-net 1234 - - session=0123456789ab user=alice dns domain=github.com type=A proto=udp rcode=NOERROR answers=140.82.112.21
+<14>1 2026-01-01T12:00:05+00:00 HOST bwrap-net 1234 - - session=0123456789ab user=alice flow=7 open proto=tcp dir=out src=10.0.0.5:44464 dst=140.82.112.21:443 domain=github.com t=21.359
 ```
 
 The records are written on the host the launcher runs on, so the first place to
@@ -567,6 +573,7 @@ whole line above.
 ```bash
 journalctl -t bwrap-net --since '-12h'              # every session on this host
 journalctl -t bwrap-net -g 'session=ID'             # one session
+journalctl -t bwrap-net -g 'user=NAME'              # everything one user's sandboxes did
 journalctl -t bwrap-net -g 'event=start.*user=NAME' # a user's sessions
 journalctl -t bwrap-net -g ' dns domain='           # DNS lookups only
 ```
@@ -574,16 +581,12 @@ journalctl -t bwrap-net -g ' dns domain='           # DNS lookups only
 Inside a sandbox, `BWRAP_SESSION` is the session ID (the context file names it
 too).
 
-**Everything one user's agents looked up.** Records after `start` do not name
-the user, so this takes two steps:
-
-1. List that user's `start` records (`journalctl -t bwrap-net -g
-   'event=start.*user=NAME'`). They give the session IDs, and also the
-   launcher, directory and backend, which say whether flows and DNS were
-   logged.
-2. Select the `dns` records of those sessions, for example
-   `journalctl -t bwrap-net -g 'session=(ID1|ID2) dns domain='`, and count by
-   `domain`.
+**Everything one user's agents looked up.** Select the user's `dns` records,
+for example `journalctl -t bwrap-net -g 'user=NAME dns domain='`, and count by
+`domain`. The `start` records (`-g 'event=start.*user=NAME'`) give the session
+IDs, and also the launcher, directory and backend, which say whether flows and
+DNS were logged. For sessions from before `user=` was on every record, find the
+session IDs first, then select by them (`-g 'session=(ID1|ID2) dns domain='`).
 
 A and AAAA lookups are separate records (`type=`), so count by `domain` and
 `type` to tell them apart, or divide by about two for the number of names

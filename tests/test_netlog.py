@@ -163,6 +163,70 @@ class CondenserTest(unittest.TestCase):
         self.assertEqual(out[-1], "event=end session=x")
 
 
+class RecordPrefixTest(unittest.TestCase):
+    def test_session_and_user(self):
+        self.assertEqual(netlog.record_prefix("0123456789ab", "alice"), "session=0123456789ab user=alice ")
+
+    def test_missing_parts_are_left_out(self):
+        self.assertEqual(netlog.record_prefix("0123456789ab", ""), "session=0123456789ab ")
+        self.assertEqual(netlog.record_prefix("", "alice"), "user=alice ")
+        self.assertEqual(netlog.record_prefix("", ""), "")
+
+    def test_user_cannot_forge_fields(self):
+        p = netlog.record_prefix("s", 'bob dns domain=x"\nevent=end')
+        self.assertEqual(len(p.splitlines()), 1)
+        self.assertTrue(p.startswith('session=s user="bob dns'), p)
+        self.assertTrue(p.endswith('" '), p)
+        self.assertNotIn("\n", p)
+
+
+class CondenseCommandTest(unittest.TestCase):
+    """The condense command as the launcher runs it, reading standard input."""
+
+    def run_condense(self, *extra):
+        import subprocess
+        import tempfile
+
+        lines = [
+            "1.0000:          Flow 0 (NEW): FREE -> NEW",
+            "1.0001:          Flow 0 (TGT):     TAP [198.51.100.7]:5000 -> [192.0.2.1]:443 => HOST [0.0.0.0]:0 -> [192.0.2.1]:443",
+            "1.0002:          Flow 0 (TCP connection): TGT -> TYPED",
+            "1.0003:          Flow 0 (TCP connection): TYPED -> ACTIVE",
+            "2.0000:          Flow 0 (FREE): ACTIVE -> FREE",
+            "bwrap-dns domain=github.com type=A proto=udp rcode=NOERROR answers=192.0.2.1",
+            "event=end session=abc user=alice",
+        ]
+        cmd = [sys.executable, os.path.join(HERE, "..", "lib", "bwrap_netlog.py"), "condense", "--session", "abc"]
+        # The log tool's own output is discarded, so it writes to a file.
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "log")
+            cmd += list(extra) + ["--", "tee", path]
+            res = subprocess.run(
+                cmd,
+                input="\n".join(lines) + "\n",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            with open(path) as f:
+                return f.read().splitlines()
+
+    def test_every_record_names_session_and_user(self):
+        out = self.run_condense("--user", "alice")
+        records = [x for x in out if not x.startswith("event=")]
+        self.assertGreaterEqual(len(records), 3)
+        for line in records:
+            self.assertTrue(line.startswith("session=abc user=alice "), line)
+        self.assertEqual(out[-1], "event=end session=abc user=alice")
+
+    def test_without_user_the_prefix_is_the_session_only(self):
+        for line in self.run_condense():
+            if not line.startswith("event="):
+                self.assertTrue(line.startswith("session=abc "), line)
+                self.assertNotIn("user=", line)
+
+
 class DnsParseTest(unittest.TestCase):
     def test_query(self):
         self.assertEqual(netlog.parse_query(query("WWW.Example.org", 28)), ("www.example.org", "AAAA"))

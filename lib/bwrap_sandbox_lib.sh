@@ -2598,7 +2598,7 @@ _net_session_dir() {
 #
 #   tag (SYSLOG_IDENTIFIER)  bwrap-net
 #   start record             event=start session=ID launcher=... backend=...
-#   each pasta line          session=ID <pasta debug line>
+#   each pasta line          session=ID user=NAME <pasta debug line>
 #   end record               event=end session=ID ...
 #
 # `journalctl -t bwrap-net` shows them; `journalctl -t bwrap-net -g ID` one
@@ -2668,6 +2668,7 @@ _NET_LOG_PIPE=0
 _NET_LOG_TOOL=""
 _NET_LOG_TOOLS=()
 _NET_LOG_SESSION=""
+_NET_LOG_USER=""
 _NET_LOG_FLOWS=0
 _NET_LOG_FIFO=""
 _NET_LOG_ERR_FIFO=""
@@ -2681,6 +2682,7 @@ _NET_LOG_PASTA_VERSION=""
 #   the session id, and export BWRAP_SESSION.  Called by build_net_isolation.
 _net_log_detect() {
     _NET_LOG_SESSION="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+    _NET_LOG_USER="$(_net_log_user)"
     _NET_LOG_TOOLS=()
     # A real launch also tries each tool without logging anything:
     # systemd-cat connects to the journal before running `true`, and logger
@@ -2725,11 +2727,22 @@ _net_log_cmd() {
     esac
 }
 
+# _net_log_user
+#   Print the name of the account that runs this launcher, for the user= field
+#   of every record.  It is the account of the process (id -un), not $USER,
+#   which the caller can set to anything; characters that would split or
+#   forge a logfmt field are replaced.
+_net_log_user() {
+    local _n
+    _n="$(bwrap_account_name)"
+    printf '%s\n' "${_n//[^A-Za-z0-9._@-]/_}"
+}
+
 # _net_log_record EVENT
 #   Print the session record for EVENT (start or end).
 _net_log_record() {
     local _r _i _hp=""
-    _r="event=$1 session=${_NET_LOG_SESSION} launcher=${0##*/} user=${_USER:-$(id -un)} uid=$(id -u)"
+    _r="event=$1 session=${_NET_LOG_SESSION} launcher=${0##*/} user=${_NET_LOG_USER} uid=$(id -u)"
     _r+=" pid=$$ backend=${_NET_BACKEND}"
     if [[ "$1" == start ]]; then
         if [[ "${_NET_LOG_FLOWS}" -eq 1 ]]; then
@@ -2833,7 +2846,7 @@ _net_log_start() {
         # open, so that nothing written to it is lost; its stderr is the
         # user's, for what the backend said if the start fails.
         local -a _cond=("${_NET_LOG_PY}" -I -S "${_NET_LOG_HELPER}" condense
-            --session "${_NET_LOG_SESSION}" --dns-forward "${_NET_DNS_FORWARD_ADDR}"
+            --session "${_NET_LOG_SESSION}" --user "${_NET_LOG_USER}" --dns-forward "${_NET_DNS_FORWARD_ADDR}"
             --fifo "${_NET_LOG_FIFO}" --parent "$$" --marker "${_NET_LOG_MARKER}"
             --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}"
             --backend "${_NET_BACKEND}")
@@ -2879,7 +2892,7 @@ _net_log_supervisor() {
     trap '' INT QUIT TSTP HUP TERM PIPE
     exec < /dev/null > /dev/null
     exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
-    _prefix="session=${_NET_LOG_SESSION} "
+    _prefix="session=${_NET_LOG_SESSION} user=${_NET_LOG_USER} "
 
     if [[ "${_NET_LOG_PIPE}" -eq 1 ]]; then
         # Read-write, so end-of-file is never seen before pasta writes.  This
