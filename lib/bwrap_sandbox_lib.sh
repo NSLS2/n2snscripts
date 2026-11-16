@@ -3459,6 +3459,73 @@ _net_launcher_alive() {
     [[ "$(_net_ppid "${_me}")" == "$$" ]]
 }
 
+# Descriptors the launcher must keep open for the life of the sandbox, which
+# the `exec` into pasta (or the slirp4netns identity mapper) would otherwise
+# lose: pasta closes every inherited descriptor from 3 up.  The database guard's
+# session lock (bwopencode2) is one: a lock lasts only as long as some process
+# holds its descriptor, and without a private network the descriptor simply
+# travels through `exec` to bwrap and OpenCode.
+NET_HOLD_FDS=()
+_NET_HOLD_SLEEP=""
+
+# net_hold_fd FD...
+#   Register descriptors for _net_hold_start.  Call before launch_sandbox.
+net_hold_fd() {
+    local _n
+    for _n in "$@"; do
+        [[ "${_n}" =~ ^[0-9]+$ && "${_n}" -gt 2 ]] || continue
+        NET_HOLD_FDS+=("${_n}")
+    done
+}
+
+# _net_hold_start
+#   Just before the `exec`: start a background holder that keeps the registered
+#   descriptors open until the launcher process (which is pasta, or the identity
+#   mapper, after the exec) has gone, as the network log helper does.  It only
+#   has to outlive the sandbox, and it does not depend on a log tool working.
+#   Not used without a private network: the descriptors then pass through
+#   `exec` themselves.
+_net_hold_start() {
+    [[ "${#NET_HOLD_FDS[@]}" -gt 0 ]] || return 0
+    [[ "${_NET_BACKEND}" == pasta || "${_NET_BACKEND}" == slirp4netns ]] || return 0
+    # The holder runs on the host, outside the sandbox, for the whole session:
+    # it waits with the system's own sleep, never one found through PATH,
+    # which can include a directory the sandbox can write to.
+    _NET_HOLD_SLEEP=/usr/bin/sleep
+    [[ -x "${_NET_HOLD_SLEEP}" ]] || _NET_HOLD_SLEEP=/bin/sleep
+    if [[ ! -x "${_NET_HOLD_SLEEP}" ]]; then
+        printf 'Warning: %s: no /usr/bin/sleep or /bin/sleep; the database lock is not held for this session.\n' "${0##*/}" >&2
+        return 0
+    fi
+    _net_hold_run &
+}
+
+# _net_hold_run
+#   The holder: runs in a subshell (it is started with `&`; $$ is still the
+#   launcher).  It ignores the signals meant for the session, and closes every
+#   descriptor it inherited except the registered ones, so that it keeps
+#   nothing else alive (slirp4netns exits only when bwrap closes the sync
+#   descriptor).
+_net_hold_run() {
+    local _f _n _keep
+    set +e
+    trap '' INT QUIT TSTP HUP TERM PIPE
+    exec < /dev/null > /dev/null 2>&1
+    for _f in /proc/self/fd/*; do
+        _n="${_f##*/}"
+        [[ "${_n}" =~ ^[0-9]+$ && "${_n}" -gt 2 ]] || continue
+        for _keep in "${NET_HOLD_FDS[@]}"; do
+            [[ "${_n}" == "${_keep}" ]] && continue 2
+        done
+        eval "exec ${_n}>&-" 2> /dev/null
+    done
+    while _net_launcher_alive; do
+        # A failed sleep (no fork, killed) only retries: ending would drop the lock.
+        "${_NET_HOLD_SLEEP}" 1 || :
+    done
+    exit 0
+}
+
 # _net_slirp_quit
 #   The launcher is gone (unshare or the relay failed and has said why):
 #   clean up and exit without signalling anything.
@@ -5882,6 +5949,8 @@ launch_sandbox() {
     done
 
     [[ "${_NET_BACKEND}" != slirp4netns ]] || _net_slirp_start
+    # Before stderr goes to the log FIFO below, so the holder never has it.
+    _net_hold_start
     if [[ -n "${_NET_LOG_FIFO}" ]]; then
         # pasta's stderr goes to the network log (see "Network log"): a
         # write-only, append descriptor, the only kind SELinux lets pasta

@@ -1045,9 +1045,27 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
 - it refuses to start while another host, or another OpenCode 2 build on this
   host, is using the same data directory, or after the last daily check found
   damage;
-- it holds a shared lock for the life of the sandbox (a file descriptor that
-  the final `exec` passes on to `bwrap`), so sessions on this host and version
-  can run together;
+- it holds a shared lock for the life of the sandbox, so sessions on this host
+  and version can run together. The lock is a file descriptor, and a lock lasts
+  only while some process holds it open. With `--share-net` the final `exec`
+  passes the descriptor on to `bwrap`. With a private network that `exec` goes
+  into pasta, which closes every descriptor above 2 (with slirp4netns the
+  descriptor can survive the `exec`, but the descriptor relay may reopen its
+  number for a data file), so the launcher registers the lock with
+  `net_hold_fd` and `_net_hold_start` starts a small background holder that
+  keeps its own copy open until the launcher process (pasta, after the `exec`)
+  has gone. The holder runs on the host, ignores the signals meant for the
+  session, closes every other descriptor it inherited, waits with
+  `/usr/bin/sleep` (not one found through `PATH`) and does not depend on a log
+  tool working. It holds the lock next to OpenCode, not inside it. If someone
+  kills the holder the lock is released while OpenCode runs, and the holder
+  watches the launcher, not the sandbox: if the launcher is killed first,
+  the lock goes at once, while `bwrap --die-with-parent` ends the sandbox
+  only as its own parent chain unwinds. Passing the lock down the descriptor
+  relay instead, so that `bwrap` and OpenCode hold it themselves, is the
+  stronger design and is not done yet. To see the holders during a session,
+  run `fuser` on the lock file in
+  `~/.local/share/opencode2/opencode-db-guard`;
 - it starts a daily background backup (`opencode2-db backup --if-due`) and keeps
   the newest 3 compressed copies.
 

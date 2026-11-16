@@ -964,8 +964,12 @@ ensure_host_dirs() {
 # ── Database guard ───────────────────────────────────────────────
 # Refuse to start when another host, or another OpenCode 2 build, is using the
 # database; hold a lock for the life of the sandbox.  The lock is a file
-# descriptor opened here: launch_sandbox ends in `exec`, which passes it on to
-# bwrap and the sandboxed process, so it stays locked until they all exit.
+# descriptor opened here.  With --share-net launch_sandbox ends in an `exec`
+# that passes it on to bwrap and the sandboxed process, so it stays locked
+# until they all exit.  With a private network the `exec` goes into pasta (or
+# the slirp4netns identity mapper), which closes it: the descriptor is
+# registered with net_hold_fd, and a background holder keeps it open until the
+# launcher process has gone (see _net_hold_start).
 # Not applied to commands that never open the database, to --exec (an
 # arbitrary command) or to --dry-run.
 guard_opencode2_db() {
@@ -985,6 +989,7 @@ guard_opencode2_db() {
     # shellcheck disable=SC2034  # read by oc2db_* in opencode2-db-lock.sh
     OC2DB_PROG=bwopencode2
     oc2db_guard "${OC2_DATA_SRC}" "${_bin}" || exit 1
+    [[ -z "${OC2DB_SESSION_FD:-}" ]] || net_hold_fd "${OC2DB_SESSION_FD}"
 }
 
 # Resolve opencode2 config symlinks.
