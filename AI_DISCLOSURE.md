@@ -2,13 +2,16 @@
 tools-used:
   - OpenCode
 models-used:
+  - claude-fable-5-2
   - claude-opus-4-8
   - claude-opus-5-5
   - claude-sonnet-4-6
   - claude-sonnet-5
   - claude-sonnet-5-5
   - gpt-5.6-sol
+  - gpt-6-astra
   - gpt-6-sol
+  - gpt-6.1-sol
 providers:
   - Anthropic
   - OpenAI
@@ -20,7 +23,7 @@ scope:
     Shell wrapper scripts (bin/, lib/), the `azoidcapp` Python helper,
     documentation (docs/), and CI/lint configuration — all with human
     review and validation.
-last-updated: 2026-11-10
+last-updated: 2026-11-16
 ---
 
 # AI Disclosure

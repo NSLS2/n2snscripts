@@ -446,8 +446,9 @@ records.
 
 - `dir` is `out` (the sandbox to the network), `publish` (a host client to a
   `--publish` port) or `host-port` (the sandbox to a `--host-port` service).
-  `via=` is the address on the other side when it differs (the sandbox port
-  for `publish`). `t` is seconds since pasta started; `secs` is the
+  `via=` is the address and port on the other side when either differs (the
+  sandbox port for `publish`; for `--host-port 5432:15432` the host port, since
+  the address is the same). `t` is seconds since pasta started; `secs` is the
   connection's duration. Flows still open when the session ends get a close
   with `reason=session-end`.
 - `flow` is pasta's flow slot, which it reuses: it identifies a connection
@@ -503,12 +504,22 @@ records.
     and stops only when the launcher process, which is pasta by then, is
     gone (it is no longer the reader's parent), after draining the pipe. Then
     it writes the end record and removes the session directory.
-  - If the tool dies, it goes on reading and drops the lines, so pasta never
-    blocks on it.
+  - With Python, if the tool dies, or stays alive but stops reading, the
+    reader goes on reading and drops the lines, so pasta never blocks on it.
+    Lines wait in memory, up to 8 MiB, for a writer thread (which writes what
+    is waiting in one go); when that is full they are dropped (a tool that is
+    only slow, behind a burst larger than that, loses lines too), and the next
+    line that is queued carries a
+    `condense level=warn msg=log-tool-behind dropped=N` note in front of it. At the end the end record and the queue get 5 seconds in all, and
+    the tool 5 more to exit, before it is killed; if it was not reading, the
+    reader says on its stderr how many records were lost. Without Python the
+    bash supervisor writes synchronously, and a tool that stops reading stalls
+    it.
   - pasta prints its setup first, and if it fails to start, its error. The
     descriptor relay (pasta's command) prints a marker on the FIFO and reopens
     your stderr: by path when it is a terminal or a file, else (a pipe)
-    through a second FIFO that the reader copies. If pasta stops before the
+    through a second FIFO that the reader copies, byte for byte and as it
+    arrives (a prompt without a newline is not held back). If pasta stops before the
     marker, the reader prints pasta's lines on your terminal, prefixed
     `pasta:`, just after the launcher has exited. (With slirp4netns the same
     FIFO, marker and reader are used for the DNS relay's lines, and a failed

@@ -13,10 +13,13 @@ import os
 import re
 import socket
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "lib"))
@@ -133,6 +136,28 @@ class CondenserTest(unittest.TestCase):
             ],
         )
 
+    def test_host_port_translation_keeps_the_port(self):
+        # --host-port 5432:15432: the sandbox connects to 127.0.0.1:15432 and
+        # pasta carries it to the host's 127.0.0.1:5432; the address is the
+        # same on both sides, the port is not.
+        t = "1.0000:          Flow 4 "
+        out = condense(
+            [
+                t + "(NEW): FREE -> NEW",
+                t + "(TGT):     SPLICE [127.0.0.1]:40000 -> [127.0.0.1]:15432 => HOST [0.0.0.0]:0 -> [127.0.0.1]:5432",
+                t + "(TCP connection (spliced)): TGT -> TYPED",
+                t + "(TCP connection (spliced)): TYPED -> ACTIVE",
+                "2.0000:          Flow 4 (FREE): ACTIVE -> FREE",
+            ]
+        )
+        self.assertEqual(
+            out,
+            [
+                "flow=4 open proto=tcp dir=host-port src=127.0.0.1:40000 dst=127.0.0.1:15432 via=127.0.0.1:5432 t=1.000",
+                "flow=4 close proto=tcp dir=host-port dst=127.0.0.1:15432 via=127.0.0.1:5432 t=2.000 secs=1.000",
+            ],
+        )
+
     def test_failed_connection(self):
         t = "1.0000:          Flow 2 "
         out = condense(
@@ -227,6 +252,228 @@ class CondenseCommandTest(unittest.TestCase):
                 self.assertNotIn("user=", line)
 
 
+class BridgeStderrTest(unittest.TestCase):
+    def test_bytes_are_forwarded_at_once_and_unchanged(self):
+        class Err(object):
+            def __init__(self):
+                self.buffer = io.BytesIO()
+
+            def flush(self):
+                pass
+
+            def write(self, text):
+                raise AssertionError("text written, bytes expected")
+
+        err = Err()
+        stop = threading.Event()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "stderr")
+            os.mkfifo(path)
+            with mock.patch.object(sys, "stderr", err):
+                t = threading.Thread(target=netlog._bridge_stderr, args=(path, stop))
+                t.daemon = True
+                t.start()
+                fd = None
+                for _ in range(100):  # the reader opens its end first; ENXIO until then
+                    try:
+                        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+                self.assertIsNotNone(fd, "the bridge never opened the FIFO")
+                try:
+                    # A prompt with no newline, and bytes that are not UTF-8.
+                    os.write(fd, b"password: \xff\xfe")
+                    for _ in range(60):
+                        if err.buffer.getvalue():
+                            break
+                        time.sleep(0.05)
+                    self.assertEqual(err.buffer.getvalue(), b"password: \xff\xfe")
+                finally:
+                    os.close(fd)
+                    stop.set()
+                    t.join(timeout=5)
+        self.assertFalse(t.is_alive())
+
+
+class BoundedSinkTest(unittest.TestCase):
+    def test_a_sink_that_never_reads_does_not_block_and_drops(self):
+        r, w = os.pipe()
+        out = os.fdopen(w, "wb", 0)
+        sink = netlog.BoundedSink(out, limit=10000, note=lambda n: b"dropped %d\n" % n)
+        sent = []
+
+        def feed():
+            # Far more than the pipe (64 KiB) and the limit hold, with pauses
+            # so the writer thread gets to fill the pipe.
+            for i in range(20000):
+                sink.put(b"x" * 100 + b"\n")
+                sent.append(101)
+                if i % 50 == 0:
+                    time.sleep(0.002)
+
+        feeder = threading.Thread(target=feed)
+        feeder.daemon = True
+        try:
+            feeder.start()
+            feeder.join(30)  # a put() that blocked would never finish
+            self.assertFalse(feeder.is_alive(), "put() blocked on a sink that does not read")
+            self.assertGreater(sum(sent), 1000000)
+            self.assertGreater(sink.dropped, 0)
+            self.assertGreater(sink.size, 9000)  # full, to within one record
+            self.assertFalse(sink.close(0.2))  # still stalled: reported, not waited out
+        finally:
+            os.close(r)  # the blocked write now fails, and the rest is dropped
+        try:
+            self.assertTrue(sink.close(5))
+            self.assertTrue(sink.dead)
+        finally:
+            out.close()
+
+    def test_everything_is_written_when_the_sink_reads(self):
+        out = io.BytesIO()
+        sink = netlog.BoundedSink(out)
+        for i in range(100):
+            sink.put(b"line %d\n" % i)
+        self.assertTrue(sink.close(5))
+        self.assertEqual(out.getvalue().splitlines()[0], b"line 0")
+        self.assertEqual(len(out.getvalue().splitlines()), 100)
+
+    def test_a_burst_to_a_healthy_sink_loses_nothing(self):
+        out = io.BytesIO()
+        sink = netlog.BoundedSink(out)
+        for i in range(50000):
+            self.assertTrue(sink.put(b"line %d\n" % i))
+        self.assertTrue(sink.close(10))
+        self.assertEqual(len(out.getvalue().splitlines()), 50000)
+        self.assertEqual(sink.dropped, 0)
+
+    def test_a_note_says_how_many_were_lost(self):
+        gate = threading.Event()
+
+        class Slow(object):
+            def __init__(self):
+                self.data = b""
+
+            def write(self, data):
+                gate.wait(5)
+                self.data += bytes(data)
+                return len(data)
+
+            def flush(self):
+                pass
+
+        out = Slow()
+        sink = netlog.BoundedSink(out, limit=4, note=lambda n: b"lost %d\n" % n)
+        self.assertTrue(sink.put(b"a\n"))  # the writer takes this and blocks
+        for _ in range(100):
+            if not sink.items:
+                break
+            time.sleep(0.02)
+        results = [sink.put(b"b\n") for _ in range(10)]
+        self.assertIn(False, results)
+        lost = sink.dropped
+        self.assertGreater(lost, 0)
+        gate.set()
+        for _ in range(100):  # the writer drains what is waiting
+            if not sink.items:
+                break
+            time.sleep(0.05)
+        self.assertTrue(sink.put(b"z\n", wait=2))
+        self.assertTrue(sink.close(5))
+        self.assertIn(b"lost %d\nz\n" % lost, out.data)  # the note and the record are one item
+        self.assertEqual(sink.dropped, 0)
+
+    def test_a_record_waits_for_room_when_asked_to(self):
+        gate = threading.Event()
+
+        class Slow(object):
+            def write(self, data):
+                gate.wait(5)
+                return len(data)
+
+            def flush(self):
+                pass
+
+        sink = netlog.BoundedSink(Slow(), limit=4)
+        self.assertTrue(sink.put(b"a\n"))
+        for _ in range(100):
+            if not sink.items:
+                break
+            time.sleep(0.02)
+        self.assertTrue(sink.put(b"bb\n"))
+        self.assertFalse(sink.put(b"cc\n"))  # no room, no waiting
+        threading.Timer(0.3, gate.set).start()
+        self.assertTrue(sink.put(b"dd\n", wait=5))  # room once the writer takes the first
+        self.assertTrue(sink.close(5))
+
+
+class StalledLogToolTest(unittest.TestCase):
+    """condense with a log tool that stays alive but stops reading."""
+
+    LIB = os.path.join(HERE, "..", "lib")
+
+    def run_condense(self, lines, args, wait=None, limit=None):
+        script = "import sys; sys.path.insert(0, %r); import bwrap_netlog as n; %s%sn.condense(sys.argv[1:])" % (
+            self.LIB,
+            "n.SINK_CLOSE_WAIT = %d; " % wait if wait else "",
+            "n.SINK_BYTES = %d; " % limit if limit else "",
+        )
+        return subprocess.run(
+            [sys.executable, "-c", script, "--session", "abc"] + args,
+            input=lines.encode(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+
+    @staticmethod
+    def dns_lines(n):
+        return "".join(
+            "bwrap-dns domain=host%d.example.org type=A proto=udp rcode=NOERROR answers=192.0.2.1\n" % i
+            for i in range(n)
+        )
+
+    def test_condense_finishes_and_kills_the_tool(self):
+        with tempfile.TemporaryDirectory() as d:
+            pidfile = os.path.join(d, "pid")
+            # Never reads its standard input: the pipe fills, and the old code
+            # blocked in write() and stopped reading its own input.
+            tool = ["sh", "-c", "echo $$ > %s; exec sleep 120" % pidfile]
+            res = self.run_condense(
+                self.dns_lines(30000), ["--end-record", "event=end session=abc", "--"] + tool, wait=1, limit=100000
+            )
+            self.assertEqual(res.returncode, 0, res.stderr.decode())
+            self.assertIn(b"the log tool stopped reading", res.stderr)
+            self.assertIn(b"the end record may be missing", res.stderr)
+            self.assertRegex(res.stderr.decode(), r"reading; [1-9][0-9]* record\(s\) dropped")
+            with open(pidfile) as f:
+                pid = int(f.read())
+            with self.assertRaises(OSError):  # killed and reaped
+                os.kill(pid, 0)
+
+    def test_a_healthy_tool_gets_every_record_and_the_end_record(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "out")
+            res = self.run_condense(
+                self.dns_lines(20000), ["--end-record", "event=end session=abc", "--", "tee", out], wait=1
+            )
+            self.assertEqual(res.returncode, 0, res.stderr.decode())
+            with open(out) as f:
+                got = f.read().splitlines()
+        self.assertEqual(res.stderr, b"")
+        self.assertEqual(len(got), 20001)
+        self.assertEqual(
+            got[0], "session=abc dns domain=host0.example.org type=A proto=udp rcode=NOERROR answers=192.0.2.1"
+        )
+        self.assertEqual(got[-1], "event=end session=abc")
+
+    def test_without_a_tool_records_go_to_standard_output(self):
+        res = self.run_condense(self.dns_lines(5000), [])
+        self.assertEqual(res.returncode, 0, res.stderr.decode())
+        self.assertEqual(len(res.stdout.splitlines()), 5000)
+
+
 class DnsParseTest(unittest.TestCase):
     def test_query(self):
         self.assertEqual(netlog.parse_query(query("WWW.Example.org", 28)), ("www.example.org", "AAAA"))
@@ -256,6 +503,7 @@ class DnsRelayTest(unittest.TestCase):
         self.up_tcp.bind(("127.0.0.1", port))
         self.up_tcp.listen()
         self.up_tcp.settimeout(0.2)
+        self.up_tcp_answers = True
         self.up_udp_thread = threading.Thread(target=self._serve_udp)
         self.up_tcp_thread = threading.Thread(target=self._serve_tcp)
         self.up_udp_thread.start()
@@ -300,6 +548,8 @@ class DnsRelayTest(unittest.TestCase):
                 break
             with c:
                 c.settimeout(1)
+                if not self.up_tcp_answers:
+                    continue  # accept and close: the lookup fails upstream
                 try:
                     n = struct.unpack("!H", c.recv(2))[0]
                     r = answer(c.recv(n))
@@ -334,6 +584,37 @@ class DnsRelayTest(unittest.TestCase):
                 self.assertEqual(len(c.recv(n)), n)
         self.assertIn("type=AAAA proto=tcp rcode=NOERROR", self.wait_lines(1)[0])
         self.assertEqual(len(self.wait_lines(2)), 2)
+
+    def test_tcp_query_that_fails_upstream_is_logged_once(self):
+        self.up_tcp_answers = False
+        with socket.create_connection(self.addr, timeout=3) as c:
+            c.settimeout(3)
+            q = query("www.example.org")
+            c.sendall(struct.pack("!H", len(q)) + q)
+            self.assertEqual(c.recv(2), b"")  # let go without an answer
+        self.wait_lines(1)
+        time.sleep(0.3)  # a second record, if there were one, would be here by now
+        self.assertEqual(
+            self.out.getvalue().splitlines(),
+            ["bwrap-dns domain=www.example.org type=A proto=tcp rcode=TIMEOUT answers=-"],
+        )
+
+    def test_tcp_message_shorter_than_a_dns_header_is_dropped_unlogged(self):
+        with socket.create_connection(self.addr, timeout=3) as c:
+            c.settimeout(3)
+            c.sendall(struct.pack("!H", 0))  # a zero-length query
+            self.assertEqual(c.recv(2), b"")
+        time.sleep(0.3)
+        self.assertEqual(self.out.getvalue(), "")
+
+    def test_tcp_client_that_closes_without_a_query_is_not_logged(self):
+        with socket.create_connection(self.addr, timeout=3):
+            pass
+        with socket.create_connection(self.addr, timeout=3) as c:
+            q = query("www.example.org")
+            c.sendall(struct.pack("!H", len(q)) + q[:5])  # closes in the middle of one
+        time.sleep(0.5)
+        self.assertEqual(self.out.getvalue(), "")
 
     def test_dns_name_does_not_forge_log_lines(self):
         q = query("bad\nname.example.org")

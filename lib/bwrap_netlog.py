@@ -37,6 +37,7 @@ can be attributed without looking up the session's start record:
 
 # Kept to what the DNS relay needs: it starts while the sandbox starts, and
 # lookups made before it listens skip it (see bwrap_sandbox_lib.sh).
+import collections
 import ctypes
 import ipaddress
 from concurrent.futures import ThreadPoolExecutor
@@ -47,6 +48,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 
 # ── condense ────────────────────────────────────────────────────────────
 
@@ -169,7 +171,9 @@ class Condenser:
         if event == "open":
             parts.append("src=%s" % _hostport(*f["src"]))
         parts.append("dst=%s" % _hostport(*f["dst"]))
-        if f["tdst"][0] != f["dst"][0] and f["tdst"][0] not in ("0.0.0.0", "::"):
+        # The whole endpoint: --host-port 5432:15432 keeps the address and
+        # changes only the port.
+        if f["tdst"] != f["dst"] and f["tdst"][0] not in ("0.0.0.0", "::"):
             parts.append("via=%s" % _hostport(*f["tdst"]))
         name = self.names.get(f["dst"][0])
         if name and direction == "out":
@@ -211,12 +215,13 @@ def _parent_is(pid):
 
 
 class FifoReader:
-    """Read lines from a FIFO without ever blocking its writer.
+    """Read from a FIFO (bytes with `chunks()`, lines with `lines()`) without
+    ever blocking its writer.
 
     The FIFO is opened read-only and non-blocking: a read-only reader sees
     EOF whenever no writer has it open, which happens before the launcher
     opens its stderr on it and, briefly, if pasta is ever without the fd.
-    So EOF is not the end: `lines()` keeps polling until `done()` says the
+    So EOF is not the end: `chunks()` keeps polling until `done()` says the
     session is over, and then drains what is left.  The launcher opens its
     end only after this reader exists (it is told, see `ready`), so its
     write-only open does not block.
@@ -235,8 +240,6 @@ class FifoReader:
         """Return the bytes available within TIMEOUT_MS; b"" when none.
         Waits out TIMEOUT_MS even while the FIFO reports hang-up (no writer),
         which poll() would otherwise report at once, over and over."""
-        import time
-
         deadline = time.monotonic() + timeout_ms / 1000.0
         while True:
             left = deadline - time.monotonic()
@@ -251,16 +254,13 @@ class FifoReader:
                     return data
                 time.sleep(min(0.05, max(left, 0)))  # hang-up: no writer yet, or none left
 
-    def lines(self, poll_ms=1000):
-        """Yield complete lines (without the newline) until the session is
-        over and the FIFO is drained."""
+    def chunks(self, poll_ms=1000):
+        """Yield the bytes as they arrive, whole or partial lines, until the
+        session is over and the FIFO is drained."""
         while True:
             data = self._read(poll_ms)
             if data:
-                self.buf += data
-                while b"\n" in self.buf:
-                    line, _, self.buf = self.buf.partition(b"\n")
-                    yield line.decode("utf-8", "replace")
+                yield data
                 continue
             if self.done():
                 break
@@ -269,24 +269,145 @@ class FifoReader:
             data = self._read(200)
             if not data:
                 break
-            self.buf += data
-        for line in self.buf.split(b"\n"):
-            if line:
-                yield line.decode("utf-8", "replace")
-        self.buf = b""
+            yield data
         os.close(self.fd)
+
+    def lines(self, poll_ms=1000):
+        """Yield the non-empty lines (without the newline), the last one even
+        with no newline, until the session is over and the FIFO is drained."""
+        self.buf = b""
+        for data in self.chunks(poll_ms):
+            self.buf += data
+            while b"\n" in self.buf:
+                line, _, self.buf = self.buf.partition(b"\n")
+                if line:
+                    yield line.decode("utf-8", "replace")
+        if self.buf:
+            yield self.buf.decode("utf-8", "replace")
+        self.buf = b""
 
 
 def _bridge_stderr(path, stop):
     """Copy PATH (a FIFO the relay opens as the sandbox's stderr when the
-    user's is a pipe) to our stderr until STOP is set and it is drained."""
+    user's is a pipe) to our stderr until STOP is set and it is drained.
+
+    The bytes are passed on as they arrive and unchanged: a prompt or a
+    progress line without a newline must not wait for one, and output that is
+    not UTF-8 must not be rewritten."""
     reader = FifoReader(path, stop.is_set)
-    for line in reader.lines():
+    for data in reader.chunks():
         try:
-            sys.stderr.write(line + "\n")
             sys.stderr.flush()
+            out = getattr(sys.stderr, "buffer", None)
+            if out is not None:
+                out.write(data)
+                out.flush()
+            else:
+                sys.stderr.write(data.decode("utf-8", "replace"))
+                sys.stderr.flush()
         except (OSError, ValueError):
             pass
+
+
+# The log tool can stop reading its standard input without exiting.  Records
+# wait in memory, up to this many bytes, for a writer thread, and are dropped
+# when that is full, so the condenser keeps draining pasta's log (a full FIFO
+# would stall the sandbox's network).  The bound is generous: a tool that is
+# merely slow, behind a burst, still gets every record.  At the end the end
+# record and the queue get SINK_CLOSE_WAIT seconds in all, and then the tool
+# that many more to exit, before it is killed.
+SINK_BYTES = 8 * 1024 * 1024
+SINK_CLOSE_WAIT = 5
+
+
+class BoundedSink:
+    """Write records to the log tool from a thread, never blocking the caller.
+
+    put() queues a record and returns at once; when LIMIT bytes are already
+    waiting the record is dropped and counted, and the next record that is
+    queued has a note (from NOTE, called with the count) of how many were lost
+    in front of it, in the same item.  The thread writes what is waiting in
+    one go.  A write error means the tool is gone: later records are dropped.
+    """
+
+    def __init__(self, out, limit=None, note=None):
+        self.out = out
+        self.limit = limit or SINK_BYTES
+        self.note = note
+        self.items = collections.deque()
+        self.size = 0
+        self.dropped = 0  # since the last record that was queued
+        self.dropped_total = 0
+        self.dead = False
+        self.closing = False
+        self.cond = threading.Condition()
+        self.thread = threading.Thread(target=self._run)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            with self.cond:
+                while not self.items and not self.closing:
+                    self.cond.wait()
+                if not self.items:
+                    return
+                batch, n = [], 0
+                while self.items and n < 65536:
+                    batch.append(self.items.popleft())
+                    n += len(batch[-1])
+                self.size -= n
+                self.cond.notify_all()
+            if self.dead:
+                continue
+            try:
+                view = memoryview(b"".join(batch))
+                while view:
+                    view = view[(self.out.write(view) or 0) :]
+                self.out.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                self.dead = True
+
+    def put(self, data, wait=0):
+        """Queue DATA; wait up to WAIT seconds for room.  True if queued.
+
+        When records were dropped, the note about them goes in front of DATA
+        as part of the same item, so it is never lost on its own and the
+        count is cleared only once something is queued."""
+        with self.cond:
+            if self.dead or self.closing:
+                return False
+            item = data
+            if self.dropped and self.note:
+                item = self.note(self.dropped) + data
+
+            # An empty queue takes anything, so one item larger than the limit
+            # cannot be refused for ever.
+            def room():
+                return self.size == 0 or self.size + len(item) <= self.limit
+
+            if wait > 0 and not room():
+                self.cond.wait_for(lambda: self.dead or room(), wait)
+            if self.dead:
+                return False
+            if not room():
+                self.dropped += 1
+                self.dropped_total += 1
+                return False
+            self.items.append(item)
+            self.size += len(item)
+            self.dropped = 0
+            self.cond.notify_all()
+            return True
+
+    def close(self, wait):
+        """Let the thread finish what is queued, for up to WAIT seconds.
+        True if it did; False if the tool is stalled.  Safe to call again."""
+        with self.cond:
+            self.closing = True
+            self.cond.notify_all()
+        self.thread.join(wait)
+        return not self.thread.is_alive()
 
 
 def condense(argv):
@@ -351,25 +472,44 @@ def condense(argv):
     except (OSError, ValueError, AttributeError):
         pass
 
-    sink = None
+    proc = None
     if cmd:
-        sink = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    out = sink.stdin if sink else sys.stdout.buffer
+        # Unbuffered: the writer thread's write is the pipe's, so it can be
+        # ended by killing the tool (see below) and nothing is left in a
+        # buffer nobody can flush.
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, bufsize=0
+        )
+    lead = record_prefix(session, user)
+    # With a log tool the records go through a bounded queue, so a tool that
+    # stops reading costs records, not pasta's log.  Without one (by hand, in
+    # tests) they go to standard output as before, where a slow reader slows
+    # the filter down instead of losing lines.
+    sink = (
+        BoundedSink(
+            proc.stdin,
+            note=lambda n: (lead + "condense level=warn msg=log-tool-behind dropped=%d\n" % n).encode(),
+        )
+        if proc
+        else None
+    )
     state = {"dead": False}
 
-    lead = record_prefix(session, user)
-
-    def emit(text, prefix=True):
-        if state["dead"]:
-            return
+    def emit(text, prefix=True, wait=0):
         if prefix:
             text = lead + text
+        data = (text + "\n").encode("utf-8", "replace")
+        if sink is not None:
+            return sink.put(data, wait)
+        if state["dead"]:
+            return False
         try:
-            out.write((text + "\n").encode("utf-8", "replace"))
-            out.flush()
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
         except (BrokenPipeError, OSError):
-            # The log tool is gone: keep reading, so pasta never blocks.
             state["dead"] = True
+            return False
+        return True
 
     c = Condenser(emit, dns_forward)
 
@@ -417,14 +557,35 @@ def condense(argv):
             bridge_stop.set()
             bridge.join(5)
     c.finish()
-    if end_record:
-        emit(end_record, prefix=False)
-    if sink:
+    if sink is None:
+        if end_record:
+            emit(end_record, prefix=False)
+    else:
+        deadline = time.monotonic() + SINK_CLOSE_WAIT
+        if end_record:
+            emit(end_record, prefix=False, wait=SINK_CLOSE_WAIT)
+        flushed = sink.close(max(0.0, deadline - time.monotonic()))
+        if not flushed:
+            # The tool is not reading: end it, which also ends the writer
+            # thread's blocked write, then let the thread finish before the
+            # pipe is closed.  What it could not take is only said here.
+            unwritten = len(sink.items)
+            proc.kill()
+            sink.close(1)
+            sys.stderr.write(
+                "bwrap_netlog condense: the log tool stopped reading; %d record(s) dropped, %d queued but not written;"
+                " the end record may be missing\n" % (sink.dropped_total, unwritten)
+            )
+            sys.stderr.flush()
         try:
-            sink.stdin.close()
+            proc.stdin.close()
         except OSError:
             pass
-        sink.wait()
+        try:
+            proc.wait(SINK_CLOSE_WAIT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
     if session_dir:
         import shutil
 
@@ -599,6 +760,13 @@ class DnsRelay:
                 try:
                     hdr = self._recv_exact(conn, 2)
                     query = self._recv_exact(conn, struct.unpack("!H", hdr)[0])
+                except OSError:
+                    # The client closed or went idle between queries, or in
+                    # the middle of one: no complete query, nothing to log.
+                    break
+                if len(query) < 12:
+                    break  # shorter than a DNS header: not a query
+                try:
                     # DNS servers may close after one response.  A fresh
                     # connection per query also avoids replaying a request
                     # after an ambiguous upstream failure.
@@ -607,7 +775,13 @@ class DnsRelay:
                         up.sendall(hdr + query)
                         rhdr = self._recv_exact(up, 2)
                         response = self._recv_exact(up, struct.unpack("!H", rhdr)[0])
-                    self.log(query, response, "tcp")
+                except OSError:
+                    # A complete query that got no answer: logged like the
+                    # UDP case (rcode=TIMEOUT), once, then the client is let go.
+                    self.log(query, None, "tcp")
+                    break
+                self.log(query, response, "tcp")
+                try:
                     conn.sendall(rhdr + response)
                 except OSError:
                     break

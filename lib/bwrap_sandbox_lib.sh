@@ -2632,8 +2632,12 @@ _net_session_dir() {
 #     ignores end-of-file: it stops only when the launcher process is gone,
 #     after draining what is left.  pasta keeps descriptors 0-2 across its
 #     own sandboxing (it closes from 3 up).
-#   - It never blocks pasta: if the tool dies it goes on reading and drops the
-#     lines.
+#   - It never blocks pasta: if the tool dies, or stays alive but stops
+#     reading, it goes on reading and drops the lines (a queue bounded in
+#     bytes and a writer thread; the tool is killed at the end if it still has not taken
+#     what is queued).  That is the condenser, with Python.  The bash
+#     supervisor below writes to the tool synchronously, so a tool that stops
+#     reading stalls it, and with it pasta.
 #   - pasta's startup lines would otherwise print on the terminal; the relay
 #     prints a marker on the FIFO and then reopens the user's stderr by path
 #     (a terminal or a file), or through a second FIFO that the supervisor

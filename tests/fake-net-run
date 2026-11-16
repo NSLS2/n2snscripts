@@ -7,7 +7,11 @@
 # device at /dev/net/tun (/dev/null), and plain-file copies of /etc/resolv.conf
 # and /etc/hosts (a file that is itself a bwrap data mount cannot be bound
 # again).  The real pasta is hidden; --backend slirp4netns leaves the fake
-# pasta off PATH too.  The fakes read failure modes from $FAKE_NET_DIR.
+# pasta off PATH too.  The fakes read failure modes from $FAKE_NET_DIR.  The
+# launchers scrub the environment before they start a backend, so the fakes
+# there fall back to /tmp/opencode/fakenet: a different $FAKE_NET_DIR is bound
+# at that path inside the outer bwrap, so the fakes find the same settings (and
+# the directory exists for the fake slirp4netns's log).
 # FAKE_NET_LOG=journal (default), syslog, both or none puts a socket file at
 # /run/systemd/journal/stdout, /dev/log, both or neither (so the launcher
 # picks the fake systemd-cat or logger, which write to
@@ -49,11 +53,15 @@ syslog | both)
 	logsock+=(--bind "${FAKE_NET_DIR}/devlog.sock" /dev/log)
 	;;
 esac
+fixed=/tmp/opencode/fakenet
+fakedir=()
+[[ "${FAKE_NET_DIR}" == "${fixed}" ]] || fakedir=(--bind "${FAKE_NET_DIR}" "${fixed}")
 path="${here}/fakes/bin:${PATH}"
 [[ "${backend}" != pasta ]] || path="${here}/fakes/pasta-bin:${path}"
 exec bwrap --dev-bind / / --dev /dev --dev-bind /dev/null /dev/net/tun \
 	--ro-bind /dev/null /usr/bin/passt \
 	"${etc[@]}" \
 	${logsock[@]+"${logsock[@]}"} \
+	${fakedir[@]+"${fakedir[@]}"} \
 	--chdir "${PWD}" \
 	-- env PATH="${path}" "$@"
