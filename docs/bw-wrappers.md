@@ -1306,7 +1306,15 @@ bwopencode2 --serve-open [--serve-port N]
   `127.H1.H2.1:<port>`, asks it for **a one-time pairing code of its own**
   and starts the browser detached (`setsid`, output discarded), so ending the
   server does not close the window. The password reaches `curl` on its standard
-  input. It opens nothing when the launcher has exited.
+  input. It opens nothing when the launcher has exited. Because it runs on the
+  host while the sandbox runs, it looks its own tools up (`curl`, `sleep`,
+  `setsid`, `grep`, `basename`) in `/usr/bin:/bin` only, not in the `PATH` it
+  inherited: that can include a directory the sandbox can write to (an activated
+  project environment, for one), and a tool replaced there would run outside the
+  sandbox. The browser is the program chosen before the sandbox started, by its
+  full path (`BWOPENCODE2_SERVE_BROWSER`, a name on `PATH`, or `xdg-open`), and
+  the helper's children, the browser included, get the same `PATH`: a browser
+  start-up script that needs other directories on `PATH` has to add them itself.
 - **What the terminal shows.** Nothing of the ssh block: `--serve-open` is for
   the host you are on. The launcher prints one line before the sandbox starts,
   then either

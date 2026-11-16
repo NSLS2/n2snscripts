@@ -353,6 +353,40 @@ serve_open_run {pid_expr} "$(bwrap_proc_start_time "$$")"
             [f"--app=http://127.0.0.1:{self.port}/auth/connect/code1"],
         )
 
+    def test_the_helper_looks_its_tools_up_in_the_system_directories_only(self):
+        # The helper runs on the host while the sandbox runs.  A directory the
+        # sandbox can write to on the launcher's PATH (an activated project
+        # environment, for one) must not decide which curl or sleep it runs.
+        tmp = Path(self.tmp.name)
+        evil = tmp / "evil"
+        evil.mkdir()
+        tools = ("curl", "sleep", "setsid", "grep", "basename")
+        for tool in tools:
+            fake = evil / tool
+            fake.write_text(f"#!/bin/sh\ntouch '{tmp}/ran-{tool}'\necho 401\n")
+            fake.chmod(0o700)
+        script = f"""
+set -euo pipefail
+source "{WRAPPER}"
+SERVE_ADDR=127.0.0.1
+SERVE_PORT={free_port()}
+SERVE_PASSWORD='{PASSWORD}'
+SERVE_PASSWORD_RANDOM=1
+SERVE_OPEN_WAIT_SECONDS=1
+SERVE_OPEN_BIN="{self.browser}"
+SERVE_OPEN_APP=1
+serve_open_detached "$$" "$(bwrap_proc_start_time "$$")"
+"""
+        env = {"PATH": f"{evil}:{os.environ.get('PATH', '/usr/bin:/bin')}", "HOME": self.tmp.name}
+        try:
+            # Nothing listens on the port, so the helper waits (up to 60 s) for
+            # the server: long enough to have used a tool if it looked one up.
+            subprocess.run(["bash", "-c", script], env=env, timeout=3, capture_output=True, text=True)
+        except subprocess.TimeoutExpired:
+            pass
+        ran = sorted(tool for tool in tools if (tmp / f"ran-{tool}").exists())
+        self.assertEqual(ran, [], "the helper ran a tool from the launcher's PATH: %r" % ran)
+
     def test_other_browsers_get_the_plain_link(self):
         self.start_server()
         result = self.run_helper(app=0)

@@ -1187,11 +1187,18 @@ serve_open_close_fds() {
 
 # The helper as a background job: it ignores the terminal's signals (the
 # server's Ctrl-C is not its own), reads nothing and holds none of the
-# launcher's descriptors.
+# launcher's descriptors.  It runs on the host, outside the sandbox, for as long
+# as it waits for the server and then starts the browser, so the tools it uses
+# (curl, sleep, setsid, grep, basename) are looked up in the system directories
+# only: the PATH it inherits can include a directory the sandbox can write to (an
+# activated project environment, for one), and a tool replaced there would run
+# on the host.  The browser itself is the path chosen before the sandbox started.
 serve_open_detached() {
     trap '' INT QUIT HUP
     exec < /dev/null
     serve_open_close_fds
+    PATH=/usr/bin:/bin
+    export PATH
     serve_open_run "$@"
 }
 
