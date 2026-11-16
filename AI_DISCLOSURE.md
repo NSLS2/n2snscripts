@@ -66,7 +66,7 @@ for every merged change.
 ## Tools and models
 
 AI assistance in this repository is provided via
-**OpenCode** using Anthropic models for implementation and OpenAI GPT-5.6-sol
+**OpenCode** using Anthropic models for implementation and OpenAI GPT models
 for critical code review. See the metadata block at the top of this file for
 the current list of models.
 
@@ -83,7 +83,7 @@ AI tools are used to:
   `bwrap_sandbox_lib.sh` library.
 - Draft and refactor `gh-protect-branch`, `azoidcapp`, `pemdecompose`,
   and `gpg-passwd.sh`.
-- Perform critical code review (GPT-5.6-sol).
+- Perform critical code review (OpenAI GPT models).
 - Generate commit messages, code review responses, and documentation.
 
 ## Input data / datasets

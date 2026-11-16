@@ -584,7 +584,7 @@ whole line above.
 ```bash
 journalctl -t bwrap-net --since '-12h'              # every session on this host
 journalctl -t bwrap-net -g 'session=ID'             # one session
-journalctl -t bwrap-net -g 'user=NAME'              # everything one user's sandboxes did
+journalctl -t bwrap-net -g 'user=NAME '             # everything one user's sandboxes did
 journalctl -t bwrap-net -g 'event=start.*user=NAME' # a user's sessions
 journalctl -t bwrap-net -g ' dns domain='           # DNS lookups only
 ```
@@ -1055,17 +1055,22 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
   `net_hold_fd` and `_net_hold_start` starts a small background holder that
   keeps its own copy open until the launcher process (pasta, after the `exec`)
   has gone. The holder runs on the host, ignores the signals meant for the
-  session, closes every other descriptor it inherited, waits with
-  `/usr/bin/sleep` (not one found through `PATH`) and does not depend on a log
-  tool working. It holds the lock next to OpenCode, not inside it. If someone
-  kills the holder the lock is released while OpenCode runs, and the holder
-  watches the launcher, not the sandbox: if the launcher is killed first,
-  the lock goes at once, while `bwrap --die-with-parent` ends the sandbox
-  only as its own parent chain unwinds. Passing the lock down the descriptor
-  relay instead, so that `bwrap` and OpenCode hold it themselves, is the
-  stronger design and is not done yet. To see the holders during a session,
-  run `fuser` on the lock file in
-  `~/.local/share/opencode2/opencode-db-guard`;
+  session and closes every other descriptor it inherited. It runs no external
+  command: it waits with the shell's own `read -t` on a private FIFO and reads
+  its parent pid straight from `/proc`, so it depends on neither `PATH` (which
+  the sandbox may be able to write to), nor `LD_PRELOAD`, nor a fork that can
+  fail while the sandbox uses up the process limit, nor a log tool working. (If
+  the FIFO cannot be made it waits with `/usr/bin/sleep`.) The helpers started
+  before it, the network log's reader or supervisor and the slirp4netns helper,
+  close their copies of the lock first, so the holder keeps it alone. It holds
+  the lock next to OpenCode, not inside it. If someone kills the holder the lock
+  is released while OpenCode runs, and the holder watches the launcher, not the
+  sandbox: if the launcher is killed first, the lock goes within about a
+  second, while `bwrap --die-with-parent` ends the sandbox only as its own
+  parent chain unwinds. Passing the lock down the descriptor relay instead, so
+  that `bwrap` and OpenCode hold it themselves, is the stronger design and is
+  not done yet. To see the holder during a session, run `fuser` on the lock
+  files in `~/.local/share/opencode2/opencode-db-guard/locks/`;
 - it starts a daily background backup (`opencode2-db backup --if-due`) and keeps
   the newest 3 compressed copies.
 

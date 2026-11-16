@@ -2,9 +2,9 @@
 
     python3 -m unittest discover -s tests -p 'test_*.py'
 
-With a private network the launcher ends in an `exec` into pasta (or the
-slirp4netns identity mapper), and pasta closes every descriptor it inherited
-from 3 up.  The database guard's session lock (bwopencode2) is a descriptor of
+With a private network the launcher ends in an `exec` into pasta, and pasta
+closes every descriptor it inherited from 3 up (the slirp4netns identity mapper
+does not, but the descriptor relay can reopen a number for a data file).  The database guard's session lock (bwopencode2) is a descriptor of
 the launcher, and a flock lasts only as long as some process holds it, so the
 lock would be released while OpenCode runs.  net_hold_fd registers such a
 descriptor and _net_hold_start keeps it open in a background holder until the
@@ -18,6 +18,7 @@ with flock on the lock file, as another host's guard would.
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -46,7 +47,7 @@ exec "$7" -c 'import os, sys, time; os.closerange(3, 1024); open(sys.argv[2], "w
 
 def lock_is_held(path):
     """True while another process holds a lock that excludes an exclusive one."""
-    return subprocess.run(["flock", "-x", "-n", path, "true"]).returncode != 0
+    return subprocess.run(["flock", "-x", "-n", path, "true"]).returncode == 1
 
 
 def wait_for(condition, seconds):
@@ -68,19 +69,23 @@ def process_gone(pid):
 
 
 def holder_ready(pid, keep):
-    """The holder has closed every descriptor above 2 except KEEP's and ignores
-    the session's signals (read from /proc, so nothing is guessed from time)."""
+    """The holder has closed every descriptor above 2 except KEEP's and its own
+    wait FIFO, and ignores the session's signals (read from /proc, so nothing is
+    guessed from time)."""
     try:
         fds = {int(n) for n in os.listdir("/proc/%d/fd" % pid)}
         with open("/proc/%d/status" % pid) as f:
             status = f.read()
+        others = {n for n in fds if n > 2} - keep
+        fifos = {n for n in others if stat.S_ISFIFO(os.stat("/proc/%d/fd/%d" % (pid, n)).st_mode)}
     except OSError:
         return False
     ignored = int(next(ln for ln in status.splitlines() if ln.startswith("SigIgn:")).split()[1], 16)
     wanted = sum(
         1 << (sig - 1) for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGHUP, signal.SIGTERM, signal.SIGPIPE)
     )
-    return {n for n in fds if n > 2} <= keep and ignored & wanted == wanted
+    # Nothing but the lock and the one FIFO the holder waits on.
+    return others == fifos and len(fifos) <= 1 and ignored & wanted == wanted
 
 
 def children_of(pid):
@@ -216,6 +221,18 @@ class NetHoldTest(unittest.TestCase):
             self.fail("the pipe is still open: the holder kept a descriptor that was not registered")
         self.assertEqual(data, b"")  # end of file: every writer has gone
 
+    def test_the_holder_runs_no_external_command(self):
+        # It waits with the shell's own `read -t` and reads its parent from
+        # /proc: a `sleep` (looked up through PATH, loading LD_PRELOAD, needing a
+        # fork) would show up as a child of the holder about once a second.
+        self.start()
+        holder = self.holders[0]
+        seen = []
+        for _ in range(25):
+            seen.extend(children_of(holder))
+            time.sleep(0.12)
+        self.assertEqual(seen, [], "the holder started a process: %r" % seen)
+
     def test_the_holder_ignores_the_signals_of_the_session(self):
         self.start()
         for sig in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT):
@@ -233,6 +250,43 @@ class NetHoldTest(unittest.TestCase):
     def test_nothing_is_started_when_nothing_is_registered(self):
         self.start(hold="no")
         self.assertEqual(children_of(self.proc.pid), [])
+
+    def test_helpers_started_before_the_holder_can_let_go_of_the_lock(self):
+        # The log reader or supervisor and the slirp4netns helper are forked
+        # before the holder and call _net_hold_close_fds: a copy of the lock left
+        # in one of them (the supervisor blocked on a stalled log tool) would
+        # keep the lock after the sandbox had ended.
+        script = r"""
+source "$1" 2>/dev/null
+exec {fd}<> "$2"
+flock -s -n "${fd}" || exit 90
+net_hold_fd "${fd}"
+( if [[ "$3" == close ]]; then _net_hold_close_fds; fi; exec "$4" -c 'import time; time.sleep(5)' ) &
+exec {fd}>&-
+echo launcher-closed
+sleep 4
+"""
+        for variant, held in (("close", False), ("keep", True)):
+            with self.subTest(variant=variant):
+                proc = subprocess.Popen(
+                    ["bash", "-c", script, "_", LIB, self.lock, variant, sys.executable],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    universal_newlines=True,
+                )
+                try:
+                    self.assertEqual(proc.stdout.readline().strip(), "launcher-closed")
+                    time.sleep(0.5)  # the helper has closed its copy (or not) by now
+                    self.assertEqual(lock_is_held(self.lock), held, "variant %s" % variant)
+                finally:
+                    for pid in children_of(proc.pid):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    proc.kill()
+                    proc.wait()
+                    proc.stdout.close()
 
     def test_only_descriptors_above_two_are_accepted(self):
         script = 'source "$1" 2>/dev/null; net_hold_fd 0 1 2 x "" 7 12; printf "%s\\n" "${NET_HOLD_FDS[*]}"'

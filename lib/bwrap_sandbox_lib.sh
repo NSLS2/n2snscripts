@@ -2737,7 +2737,7 @@ _net_log_cmd() {
 #   which the caller can set to anything; characters that would split or
 #   forge a logfmt field are replaced.
 _net_log_user() {
-    local _n
+    local _n LC_ALL=C
     _n="$(bwrap_account_name)"
     printf '%s\n' "${_n//[^A-Za-z0-9._@-]/_}"
 }
@@ -2855,7 +2855,10 @@ _net_log_start() {
             --end-record "$(_net_log_record end)" --session-dir "${_NET_SESSION_DIR}"
             --backend "${_NET_BACKEND}")
         [[ -z "${_NET_LOG_ERR_FIFO}" ]] || _cond+=(--stderr-fifo "${_NET_LOG_ERR_FIFO}")
-        exec {_rfd}< <(exec setsid "${_cond[@]}" -- "${_NET_LOG_CMD[@]}" 3>&1 > /dev/null < /dev/null)
+        exec {_rfd}< <(
+                       _net_hold_close_fds
+                                            exec setsid "${_cond[@]}" -- "${_NET_LOG_CMD[@]}" 3>&1 > /dev/null < /dev/null
+        )
         IFS= read -r -t 10 _ready <&"${_rfd}" || _ready=""
         exec {_rfd}<&-
         if [[ "${_ready}" != ready ]]; then
@@ -2883,7 +2886,8 @@ _net_log_start() {
 
 # _net_log_supervisor
 #   The background half of the network log without Python (see "Network
-#   log"): copies pasta's lines as they are, prefixed with the session, or
+#   log"): copies pasta's lines as they are, prefixed with the session and the
+#   user, or
 #   without pasta just waits for the end.  Runs in a subshell; $$ is still
 #   the launcher, which is pasta (or bwrap) by then.
 _net_log_supervisor() {
@@ -2895,6 +2899,7 @@ _net_log_supervisor() {
     # the launcher has gone.
     trap '' INT QUIT TSTP HUP TERM PIPE
     exec < /dev/null > /dev/null
+    _net_hold_close_fds
     exec {_sink}> >(exec setsid "${_NET_LOG_CMD[@]}" > /dev/null 2>&1)
     _prefix="session=${_NET_LOG_SESSION} user=${_NET_LOG_USER} "
 
@@ -3384,6 +3389,7 @@ _net_slirp_helper() {
     local -a _api=()
     set +e
     exec 90>&- 91<&- 92>&-
+    _net_hold_close_fds
     trap '' INT QUIT TSTP
 
     # Wait (up to 10 s) until the launcher process has run unshare: a network
@@ -3460,13 +3466,15 @@ _net_launcher_alive() {
 }
 
 # Descriptors the launcher must keep open for the life of the sandbox, which
-# the `exec` into pasta (or the slirp4netns identity mapper) would otherwise
-# lose: pasta closes every inherited descriptor from 3 up.  The database guard's
-# session lock (bwopencode2) is one: a lock lasts only as long as some process
-# holds its descriptor, and without a private network the descriptor simply
-# travels through `exec` to bwrap and OpenCode.
+# the `exec` into pasta would otherwise lose: pasta closes every inherited
+# descriptor from 3 up.  The database guard's session lock (bwopencode2) is one:
+# a lock lasts only as long as some process holds its descriptor, and without a
+# private network the descriptor simply travels through `exec` to bwrap and
+# OpenCode.  (The slirp4netns identity mapper does not close it, but the
+# descriptor relay can reopen its number for a data file.)
 NET_HOLD_FDS=()
 _NET_HOLD_SLEEP=""
+_NET_HOLD_WAIT_FD=""
 
 # net_hold_fd FD...
 #   Register descriptors for _net_hold_start.  Call before launch_sandbox.
@@ -3478,50 +3486,107 @@ net_hold_fd() {
     done
 }
 
+# _net_hold_close_fds
+#   Close the registered descriptors in the calling process.  The helpers that
+#   launch_sandbox forks before the holder (the network log's reader or
+#   supervisor and its log tool, the slirp4netns helper) call it first: they
+#   have no use for the lock, and a copy kept by one of them (the supervisor,
+#   blocked on a log tool that stopped reading) would hold the lock after the
+#   sandbox has ended.
+_net_hold_close_fds() {
+    local _n
+    for _n in ${NET_HOLD_FDS[@]+"${NET_HOLD_FDS[@]}"}; do
+        eval "exec ${_n}>&-" 2> /dev/null || true
+    done
+}
+
 # _net_hold_start
 #   Just before the `exec`: start a background holder that keeps the registered
 #   descriptors open until the launcher process (which is pasta, or the identity
-#   mapper, after the exec) has gone, as the network log helper does.  It only
-#   has to outlive the sandbox, and it does not depend on a log tool working.
-#   Not used without a private network: the descriptors then pass through
-#   `exec` themselves.
+#   mapper, after the exec) has gone, as the network log helper did by accident.
+#   It does not depend on a log tool working.  Not used without a private
+#   network: the descriptors then pass through `exec` themselves.
+#
+#   The holder runs on the host, outside the sandbox, for the whole session, so
+#   it runs no external command: it waits with the shell's own `read -t` on a
+#   private FIFO (opened here, then unlinked), where a `sleep` would be looked
+#   up in a PATH the sandbox may be able to write to, load whatever LD_PRELOAD
+#   names, and need a fork that can fail while the sandbox uses up the process
+#   limit.  Only if the FIFO cannot be made does it fall back to the system's
+#   own sleep, by full path.
 _net_hold_start() {
     [[ "${#NET_HOLD_FDS[@]}" -gt 0 ]] || return 0
     [[ "${_NET_BACKEND}" == pasta || "${_NET_BACKEND}" == slirp4netns ]] || return 0
-    # The holder runs on the host, outside the sandbox, for the whole session:
-    # it waits with the system's own sleep, never one found through PATH,
-    # which can include a directory the sandbox can write to.
+    local _dir=""
+    _NET_HOLD_WAIT_FD=""
     _NET_HOLD_SLEEP=/usr/bin/sleep
     [[ -x "${_NET_HOLD_SLEEP}" ]] || _NET_HOLD_SLEEP=/bin/sleep
-    if [[ ! -x "${_NET_HOLD_SLEEP}" ]]; then
-        printf 'Warning: %s: no /usr/bin/sleep or /bin/sleep; the database lock is not held for this session.\n' "${0##*/}" >&2
+    [[ -x "${_NET_HOLD_SLEEP}" ]] || _NET_HOLD_SLEEP=""
+    _net_runtime_base
+    if _dir="$(mktemp -d "${_NET_RUNTIME_BASE}/hold.XXXXXXXX" 2> /dev/null)" &&
+        mkfifo -m 0600 "${_dir}/wait" 2> /dev/null &&
+        { exec {_NET_HOLD_WAIT_FD}<> "${_dir}/wait"; } 2> /dev/null; then
+        :
+    else
+        _NET_HOLD_WAIT_FD=""
+    fi
+    [[ -z "${_dir}" ]] || rm -rf -- "${_dir}"
+    if [[ -z "${_NET_HOLD_WAIT_FD}" && -z "${_NET_HOLD_SLEEP}" ]]; then
+        printf 'Warning: %s: cannot wait without a FIFO or /usr/bin/sleep; the database lock is not held for this session.\n' "${0##*/}" >&2
         return 0
     fi
     _net_hold_run &
+    # The launcher needs no copy: it goes into pasta, which would close it.
+    [[ -z "${_NET_HOLD_WAIT_FD}" ]] || exec {_NET_HOLD_WAIT_FD}>&-
 }
 
 # _net_hold_run
 #   The holder: runs in a subshell (it is started with `&`; $$ is still the
 #   launcher).  It ignores the signals meant for the session, and closes every
-#   descriptor it inherited except the registered ones, so that it keeps
-#   nothing else alive (slirp4netns exits only when bwrap closes the sync
-#   descriptor).
+#   descriptor it inherited except the registered ones and its wait FIFO, so
+#   that it keeps nothing else alive (slirp4netns exits only when bwrap closes
+#   the sync descriptor).  It ends when its parent is no longer the launcher,
+#   which is read straight from /proc with builtins (no fork): anything but a
+#   parent pid that is not the launcher's, an unreadable file for one, counts as
+#   "still there", so a failure here can only keep the lock longer.
 _net_hold_run() {
-    local _f _n _keep
+    local _f _n _keep _st _ppid _x _rc
     set +e
     trap '' INT QUIT TSTP HUP TERM PIPE
     exec < /dev/null > /dev/null 2>&1
+    unset "${!LD_@}"
     for _f in /proc/self/fd/*; do
         _n="${_f##*/}"
         [[ "${_n}" =~ ^[0-9]+$ && "${_n}" -gt 2 ]] || continue
+        [[ "${_n}" == "${_NET_HOLD_WAIT_FD}" ]] && continue
         for _keep in "${NET_HOLD_FDS[@]}"; do
             [[ "${_n}" == "${_keep}" ]] && continue 2
         done
         eval "exec ${_n}>&-" 2> /dev/null
     done
-    while _net_launcher_alive; do
-        # A failed sleep (no fork, killed) only retries: ending would drop the lock.
-        "${_NET_HOLD_SLEEP}" 1 || :
+    while :; do
+        _ppid=""
+        if IFS= read -r _st < "/proc/${BASHPID}/stat"; then
+            _st="${_st##*) }" # "STATE PPID ..." (the command name may hold spaces)
+            _st="${_st#* }"
+            _ppid="${_st%% *}"
+        fi
+        [[ -z "${_ppid}" || "${_ppid}" == "$$" ]] || break
+        if [[ -n "${_NET_HOLD_WAIT_FD}" ]]; then
+            # (No redirection here: bash keeps a descriptor open for it while the
+            # read waits.  Standard error is /dev/null already.)
+            read -r -t 1 -u "${_NET_HOLD_WAIT_FD}" _x
+            _rc=$?
+            # A timeout is the normal end of a wait.  Anything else (the FIFO is
+            # not usable) means: wait another way, never spin.
+            if ((_rc <= 128)); then
+                _NET_HOLD_WAIT_FD=""
+                [[ -n "${_NET_HOLD_SLEEP}" ]] || break
+            fi
+        else
+            # A failed sleep (no fork, killed) only retries: ending would drop the lock.
+            "${_NET_HOLD_SLEEP}" 1 || :
+        fi
     done
     exit 0
 }

@@ -410,6 +410,20 @@ class BoundedSink:
         return not self.thread.is_alive()
 
 
+def _say(text):
+    """Write TEXT to standard error, ignoring a stderr that is closed or gone."""
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        # What is left in its buffer would fail again when Python exits (status
+        # 120): give it somewhere to go.
+        try:
+            sys.stderr = open(os.devnull, "w")
+        except OSError:
+            pass
+
+
 def condense(argv):
     """Condense pasta's debug log into the system log.
 
@@ -557,6 +571,7 @@ def condense(argv):
             bridge_stop.set()
             bridge.join(5)
     c.finish()
+    report = ""
     if sink is None:
         if end_record:
             emit(end_record, prefix=False)
@@ -572,11 +587,12 @@ def condense(argv):
             unwritten = len(sink.items)
             proc.kill()
             sink.close(1)
-            sys.stderr.write(
-                "bwrap_netlog condense: the log tool stopped reading; %d record(s) dropped, %d queued but not written;"
-                " the end record may be missing\n" % (sink.dropped_total, unwritten)
+            # Said at the very end, and guarded: a closed or stalled stderr must
+            # not keep the session directory or the tool.
+            report = (
+                "bwrap_netlog condense: the log tool stopped reading; %d record(s) dropped, %d more queued or in"
+                " flight and possibly not written; the end record may be missing\n" % (sink.dropped_total, unwritten)
             )
-            sys.stderr.flush()
         try:
             proc.stdin.close()
         except OSError:
@@ -590,6 +606,8 @@ def condense(argv):
         import shutil
 
         shutil.rmtree(session_dir, ignore_errors=True)
+    if report:
+        _say(report)
 
 
 # ── dns relay ───────────────────────────────────────────────────────────

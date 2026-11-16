@@ -246,6 +246,8 @@ class CondenseCommandTest(unittest.TestCase):
         self.assertEqual(out[-1], "event=end session=abc user=alice")
 
     def test_without_user_the_prefix_is_the_session_only(self):
+        records = [x for x in self.run_condense() if not x.startswith("event=")]
+        self.assertGreaterEqual(len(records), 3)
         for line in self.run_condense():
             if not line.startswith("event="):
                 self.assertTrue(line.startswith("session=abc "), line)
@@ -301,14 +303,12 @@ class BoundedSinkTest(unittest.TestCase):
         r, w = os.pipe()
         out = os.fdopen(w, "wb", 0)
         sink = netlog.BoundedSink(out, limit=10000, note=lambda n: b"dropped %d\n" % n)
-        sent = []
 
         def feed():
-            # Far more than the pipe (64 KiB) and the limit hold, with pauses
-            # so the writer thread gets to fill the pipe.
+            # Far more than the pipe (64 KiB) and the limit hold (20000 x 101
+            # bytes), with pauses so the writer thread gets to fill the pipe.
             for i in range(20000):
                 sink.put(b"x" * 100 + b"\n")
-                sent.append(101)
                 if i % 50 == 0:
                     time.sleep(0.002)
 
@@ -318,7 +318,6 @@ class BoundedSinkTest(unittest.TestCase):
             feeder.start()
             feeder.join(30)  # a put() that blocked would never finish
             self.assertFalse(feeder.is_alive(), "put() blocked on a sink that does not read")
-            self.assertGreater(sum(sent), 1000000)
             self.assertGreater(sink.dropped, 0)
             self.assertGreater(sink.size, 9000)  # full, to within one record
             self.assertFalse(sink.close(0.2))  # still stalled: reported, not waited out
@@ -413,7 +412,7 @@ class StalledLogToolTest(unittest.TestCase):
 
     LIB = os.path.join(HERE, "..", "lib")
 
-    def run_condense(self, lines, args, wait=None, limit=None):
+    def run_condense(self, lines, args, wait=None, limit=None, stderr=subprocess.PIPE):
         script = "import sys; sys.path.insert(0, %r); import bwrap_netlog as n; %s%sn.condense(sys.argv[1:])" % (
             self.LIB,
             "n.SINK_CLOSE_WAIT = %d; " % wait if wait else "",
@@ -423,7 +422,7 @@ class StalledLogToolTest(unittest.TestCase):
             [sys.executable, "-c", script, "--session", "abc"] + args,
             input=lines.encode(),
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=stderr,
             timeout=60,
         )
 
@@ -452,12 +451,40 @@ class StalledLogToolTest(unittest.TestCase):
             with self.assertRaises(OSError):  # killed and reaped
                 os.kill(pid, 0)
 
+    def test_a_closed_stderr_does_not_stop_the_cleanup(self):
+        # The report that the tool stopped reading goes to stderr.  With stderr
+        # closed (a terminal that has gone, a pipe whose reader has exited) the
+        # write fails; the session directory must still be removed and the exit
+        # status stay 0.
+        with tempfile.TemporaryDirectory() as d:
+            session_dir = os.path.join(d, "session")
+            os.mkdir(session_dir)
+            open(os.path.join(session_dir, "leftover"), "w").close()
+            pidfile = os.path.join(d, "pid")
+            tool = ["sh", "-c", "echo $$ > %s; exec sleep 120" % pidfile]
+            r, w = os.pipe()
+            os.close(r)  # nobody reads: a write to w raises EPIPE
+            try:
+                res = self.run_condense(
+                    self.dns_lines(30000),
+                    ["--end-record", "event=end session=abc", "--session-dir", session_dir, "--"] + tool,
+                    wait=1,
+                    limit=100000,
+                    stderr=w,
+                )
+            finally:
+                os.close(w)
+            self.assertEqual(res.returncode, 0)
+            self.assertFalse(os.path.exists(session_dir), "the session directory was left behind")
+            with open(pidfile) as f:
+                pid = int(f.read())
+            with self.assertRaises(OSError):  # the tool was killed and reaped
+                os.kill(pid, 0)
+
     def test_a_healthy_tool_gets_every_record_and_the_end_record(self):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "out")
-            res = self.run_condense(
-                self.dns_lines(20000), ["--end-record", "event=end session=abc", "--", "tee", out], wait=1
-            )
+            res = self.run_condense(self.dns_lines(20000), ["--end-record", "event=end session=abc", "--", "tee", out])
             self.assertEqual(res.returncode, 0, res.stderr.decode())
             with open(out) as f:
                 got = f.read().splitlines()
@@ -591,7 +618,11 @@ class DnsRelayTest(unittest.TestCase):
             c.settimeout(3)
             q = query("www.example.org")
             c.sendall(struct.pack("!H", len(q)) + q)
-            self.assertEqual(c.recv(2), b"")  # let go without an answer
+            try:
+                answer = c.recv(2)
+            except ConnectionResetError:  # a reset is as good as a close here
+                answer = b""
+            self.assertEqual(answer, b"")  # let go without an answer
         self.wait_lines(1)
         time.sleep(0.3)  # a second record, if there were one, would be here by now
         self.assertEqual(
