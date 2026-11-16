@@ -1093,23 +1093,23 @@ The text above describes `--share-net`, where the launcher `exec`s into `bwrap`
 and the descriptor goes with it. With a private network the launcher `exec`s into
 pasta instead, and pasta closes every descriptor above 2 that it inherits (see
 "File descriptor relay"), so neither pasta, `bwrap` nor OpenCode holds the lock.
-Checked on a real launch (`fuser` on the lock file while a `bwopencode2` session
-ran on pasta): the only holders were the network log's helper processes, a forked
-copy of the launcher shell and its `bwrap_netlog.py condense` child. The lock
-was held for the whole session and was gone after it ended (`opencode2-db
-status`: `none held`), so the guard works, but **by inheritance, not by design**:
-the helper was started before the `exec`, so it received the descriptor.
 
-By reading the code (not tested), the lock would not be held when:
+It used to be held only by accident. Checked on a real launch (`fuser` on the
+lock file while a `bwopencode2` session ran on pasta): the only holders were the
+network log's helper processes, a forked copy of the launcher shell and its
+`bwrap_netlog.py condense` child, which received the descriptor because they were
+started before the `exec`. With no log tool (neither `systemd-cat` nor `logger`),
+or with the helper stopped, nothing held the lock, and a second host or OpenCode
+build could have passed the guard while the session ran.
 
-- no log tool can write (neither `systemd-cat` nor `logger`), because the launcher
-  then starts no helper ("this network session is not logged"), or
-- the helper is stopped while OpenCode keeps running.
-
-In those cases a second host or OpenCode build could pass the guard while the
-session runs. The same applies to `bwopenchamber`, which goes through the same
-launch. Passing the lock on deliberately is a change to the launch code of
-NSLS2/n2snscripts#37.
+That is fixed for both launchers: `bwopencode2` and `bwopenchamber` register the
+guard's descriptor with `net_hold_fd` (the holder and `bwopencode2`'s
+registration are in NSLS2/n2snscripts#37, `bwopenchamber`'s is in #43), and
+`_net_hold_start` starts a background holder before the `exec` that keeps the
+lock until the launcher process has gone, whether or not anything is logged. See
+"Database guard" above for what the holder does, and for its limits: it holds the
+lock next to OpenCode, not inside it. During a session, `fuser` on the lock file
+should list the holder.
 
 ### What is kept out of the sandbox
 
@@ -1248,8 +1248,8 @@ type:
   foreground and stops the server on Ctrl-C or when the sandbox ends.
 - **Password.** The server needs one (Basic auth, user `opencode`). The launcher uses a **random password for each
   session** and prints it with the sign-in block. To use a fixed one, export
-  `BWOPENCODE2_SERVE_PASSWORD` (at least 12 characters, for example from
-  `load-env`); the launcher prints nothing about it. Either way it reaches the
+  `BWOPENCODE2_SERVE_PASSWORD` (at least 12 characters, no control characters
+  such as a newline or a tab, for example from `load-env`); the launcher prints nothing about it. Either way it reaches the
   server only as `OPENCODE_PASSWORD` in the sandbox environment (the host's
   own `OPENCODE_PASSWORD` is still dropped) and is never written to a file.
   Trade-off: a sandboxed agent can read its own environment, so it can read its
@@ -1261,7 +1261,11 @@ type:
   start time, host, directory and start date, no secret) stops two launchers
   picking the same port; the port must also be free on the address checked
   (`127.H1.H2.1`, or `--publish-addr`), and the address is claimed as for any
-  `--publish`.
+  `--publish`. Launches that start at the same moment are serialised with an
+  `flock` on `~/.local/state/bwopencode2/serve/claims.lock`, held while stale
+  claims are removed and a port is chosen and released before the sandbox starts
+  (without `flock` a warning says two simultaneous launches may pick the same
+  port).
   A claim
   whose process is gone is stale and is removed on the next `--serve`. The
   launcher ends in `exec`, so it cannot retry or clean up afterwards; the
@@ -1469,7 +1473,8 @@ library is a follow-up.
   host's loopback too, behind its own random password; use it only where neither
   backend works.
 - **Password.** Random for each session, printed once; `BWOPENCODE2_SERVE_PASSWORD`
-  (12 characters or more) sets a fixed one for every session that uses it. It
+  (12 characters or more, no control characters) sets a fixed one for every
+  session that uses it. It
   reaches the server as `OPENCHAMBER_UI_PASSWORD` in the sandbox environment,
   never on a command line.
 - **Sign-in key.** The browser sign-in cookies are signed with a key that is

@@ -301,13 +301,13 @@ class OpenHelperTest(unittest.TestCase):
         self.addCleanup(lambda: (proc.kill(), proc.wait()))
         return proc
 
-    def run_helper(self, app, pid_expr='"$$"', timeout=30, browser=None, random=1):
+    def run_helper(self, app, pid_expr='"$$"', timeout=30, browser=None, random=1, password=PASSWORD):
         script = f"""
 set -euo pipefail
 source "{WRAPPER}"
 SERVE_ADDR=127.0.0.1
 SERVE_PORT={self.port}
-SERVE_PASSWORD='{PASSWORD}'
+SERVE_PASSWORD='{password}'
 SERVE_PASSWORD_RANDOM={random}
 SERVE_OPEN_WAIT_SECONDS=1
 SERVE_OPEN_BIN="{browser or self.browser}"
@@ -339,6 +339,19 @@ serve_open_run {pid_expr} "$(bwrap_proc_start_time "$$")"
         self.assertIn(f"OpenCode web UI on 127.0.0.1:{self.port}, opened in browser.", result.stderr)
         self.assertEqual(result.stderr.strip().count("\n"), 0, "one line when the browser opened")
         self.assertNotIn(PASSWORD, result.stderr)
+
+    def test_quote_and_backslash_in_the_password_reach_the_server(self):
+        # serve_request_code writes the password into curl's config on stdin,
+        # where a quote or backslash must be escaped.  The fake server accepts
+        # only the exact password, so a signed-in link means it arrived intact.
+        password = 'pa"ss\\word-123'
+        self.start_server(OPENCODE_PASSWORD=password)
+        result = self.run_helper(app=1, password=password)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.argv_log.read_text().split("\n")[:-1],
+            [f"--app=http://127.0.0.1:{self.port}/auth/connect/code1"],
+        )
 
     def test_other_browsers_get_the_plain_link(self):
         self.start_server()

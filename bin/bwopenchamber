@@ -247,7 +247,8 @@ or /usr/local/bin that is (the RHEL 10 nodejs24 package installs node-24 next to
 default node).  BWOPENCHAMBER_DIR names another OpenChamber install.
 
 The password is random for each session unless BWOPENCODE2_SERVE_PASSWORD is set
-(at least 12 characters; a fixed one is shared by every session that uses it).
+(at least 12 characters, no control characters; a fixed one is shared by every
+session that uses it).
 Browser sign-ins end with the session: their signing key is new for each session.
 
 The agent can read the credentials OpenChamber gives its own OpenCode (the UI
@@ -286,6 +287,9 @@ guard_opencode2_db() {
     OC2DB_PROG=bwopenchamber
     # shellcheck disable=SC2153  # OC2_DATA_SRC is set by resolve_opencode2_paths
     oc2db_guard "${OC2_DATA_SRC}" "${OC2_INSTALL_BIN}" || exit 1
+    # With a private network the launcher's exec goes into pasta, which closes
+    # the lock; a background holder keeps it (see _net_hold_start).
+    [[ -z "${OC2DB_SESSION_FD:-}" ]] || net_hold_fd "${OC2DB_SESSION_FD}"
 }
 
 # ═══════════════════════════════════════════════════════════════════

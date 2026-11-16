@@ -384,8 +384,8 @@ Wrapper options (consumed before opencode2 sees the command line):
                   "Use password" button also works.  The
                   password is random for each
                   session unless BWOPENCODE2_SERVE_PASSWORD is set (at least 12
-                  characters; a fixed password is shared by every session that
-                  uses it).  Takes no opencode2 arguments and cannot be combined
+                  characters, no control characters; a fixed password is shared
+                  by every session that uses it).  Takes no opencode2 arguments and cannot be combined
                   with --exec.  One server per invocation.
   --serve-port N  With --serve, use port N (inside the range) instead of the first
                   free one; fails if it is taken.
@@ -633,6 +633,37 @@ serve_claim_is_live() {
     ((_now - _mtime < 10))
 }
 
+# Serialise the port claims of launches that start at the same moment.  Without
+# it two launches that both see a stale claim file can each remove the other's
+# new one and each end up with the same port.  The lock file is in the state
+# directory, held (on SERVE_CLAIMS_FD) from before the stale files are cleaned
+# up until a port has been chosen, then released: it must not outlive the
+# choice, or it would stay open in the sandbox's process chain.  Without flock
+# (util-linux), or a lock file that cannot be opened, it warns and goes on as
+# before.
+SERVE_CLAIMS_FD=""
+serve_claims_lock() {
+    SERVE_CLAIMS_FD=""
+    if ! command -v flock > /dev/null 2>&1; then
+        echo "Warning: flock (util-linux) not found: two --serve launches at the same moment may pick the same port." >&2
+        return 0
+    fi
+    if ! { exec {SERVE_CLAIMS_FD}>> "${SERVE_STATE_DIR}/claims.lock"; } 2> /dev/null; then
+        SERVE_CLAIMS_FD=""
+        echo "Warning: cannot open ${SERVE_STATE_DIR}/claims.lock: two --serve launches at the same moment may pick the same port." >&2
+        return 0
+    fi
+    if ! flock -w 10 "${SERVE_CLAIMS_FD}"; then
+        echo "Error: could not get ${SERVE_STATE_DIR}/claims.lock (another --serve launch may hold it, or the filesystem refuses locks)." >&2
+        exit 1
+    fi
+}
+
+serve_claims_unlock() {
+    [[ -z "${SERVE_CLAIMS_FD}" ]] || exec {SERVE_CLAIMS_FD}>&-
+    SERVE_CLAIMS_FD=""
+}
+
 # Claim PORT atomically.  The file holds no secret: the pid is this launcher's,
 # which stays the pid of the bwrap process because the launch ends in exec.
 serve_claim_port() {
@@ -669,6 +700,7 @@ serve_choose_port() {
     if [[ "${DRY_RUN}" -eq 0 ]]; then
         mkdir -p "${SERVE_STATE_DIR}"
         chmod 700 "${SERVE_STATE_DIR}"
+        serve_claims_lock
         for _f in "${SERVE_STATE_DIR}"/*.session; do
             [[ -e "${_f}" ]] || continue
             serve_claim_is_live "${_f}" || rm -f "${_f}"
@@ -689,6 +721,7 @@ serve_choose_port() {
             fi
         fi
         SERVE_PORT="${_p}"
+        serve_claims_unlock
         return 0
     done
 
@@ -704,7 +737,11 @@ serve_choose_port() {
 serve_make_password() {
     if [[ -n "${BWOPENCODE2_SERVE_PASSWORD:-}" ]]; then
         if ((${#BWOPENCODE2_SERVE_PASSWORD} < 12)); then
-            echo "Error: BWOPENCODE2_SERVE_PASSWORD must have at least 12 characters." >&2
+            echo "Error: BWOPENCODE2_SERVE_PASSWORD must have at least 12 characters, with no control characters." >&2
+            exit 1
+        fi
+        if [[ "${BWOPENCODE2_SERVE_PASSWORD}" =~ [[:cntrl:]] ]]; then
+            echo "Error: BWOPENCODE2_SERVE_PASSWORD must not contain control characters (a newline, for one)." >&2
             exit 1
         fi
         SERVE_PASSWORD="${BWOPENCODE2_SERVE_PASSWORD}"

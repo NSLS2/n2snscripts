@@ -94,6 +94,15 @@ check '... and gives it the reason' contains "${OUT}" 'neither\ DISPLAY\ nor\ WA
 run BWOPENCODE2_SERVE_PASSWORD=a-fixed-password-123 -- --serve
 check 'a fixed password is announced to the wrapper as fixed' contains "${OUT}" '-oc fixed'
 check '... and never printed' lacks "${OUT}${ERR}" 'a-fixed-password-123'
+run BWOPENCODE2_SERVE_PASSWORD='a-fixed-"quoted\\"-password' -- --serve
+check 'a fixed password with a quote and a backslash is accepted' rc_is 0
+run "BWOPENCODE2_SERVE_PASSWORD=a-fixed-password
+extra-line = 1" -- --serve
+check 'a fixed password with a newline is refused' rc_is 1
+check '... saying why' contains "${ERR}" 'must not contain control characters'
+check '... and never printed' lacks "${ERR}" 'extra-line'
+run "BWOPENCODE2_SERVE_PASSWORD=a-fixed-password-$(printf '\t')tab" -- --serve
+check 'a fixed password with a tab is refused too' rc_is 1
 
 # ── --serve-open: arguments ──────────────────────────────────────────────
 
