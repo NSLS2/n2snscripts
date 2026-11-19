@@ -401,8 +401,7 @@ Wrapper options (consumed before opencode2 sees the command line):
                   The browser is looked up in /usr/bin, /usr/local/bin and /snap/bin
                   only (never on PATH, which can hold a directory the sandbox can
                   write to) and must be owned by root and not writable by group or
-                  others.  BWOPENCODE2_SERVE_BROWSER names another browser, by name
-                  in those directories or by absolute path, with the same rule.  Opens nothing,
+                  others; it runs with a minimal environment.  Opens nothing,
                   and says so, when neither DISPLAY nor WAYLAND_DISPLAY is set or no
                   browser is found.  Not for use over ssh from another machine: use
                   the printed ssh command there.
@@ -1004,8 +1003,10 @@ serve_print_info() {
 # after 5 minutes, and the published address already accepts connections from
 # every local user, with the password as the only protection.
 
-# Browsers tried, in order, when BWOPENCODE2_SERVE_BROWSER is not set; then the
-# default browser through xdg-open (see serve_open_default_browser).
+# Browsers tried, in order; then the default browser through xdg-open (see
+# serve_open_default_browser).  There is no way to name another one: a path
+# given by the caller would have to be checked up to the root, and the choice is
+# not worth that.
 SERVE_OPEN_CANDIDATES=(google-chrome google-chrome-stable chromium chromium-browser firefox)
 
 # Where the browser (and xdg-open, xdg-mime) may come from.  The browser is
@@ -1042,16 +1043,12 @@ serve_open_trusted() {
         serve_open_owner_ok "${1%/*}/."
 }
 
-# Print the path of the program NAME that may be run on the host: NAME itself
-# when it is an absolute path, else the first of SERVE_OPEN_DIRS that has it;
-# either way only when serve_open_trusted.  Fails when there is none.
+# Print the path of the program NAME (a bare name) that may be run on the host:
+# the first of SERVE_OPEN_DIRS that has it and serve_open_trusted accepts.  Fails
+# when there is none.  The directories are the system's, so no directory above
+# them can be changed by the sandbox.
 serve_open_find() {
     local _d
-    if [[ "$1" == /* ]]; then
-        serve_open_trusted "$1" || return 1
-        printf '%s\n' "$1"
-        return 0
-    fi
     [[ "$1" != */* ]] || return 1
     for _d in ${SERVE_OPEN_DIRS[@]+"${SERVE_OPEN_DIRS[@]}"}; do
         if serve_open_trusted "${_d}/$1"; then
@@ -1085,24 +1082,16 @@ serve_open_pick_browser() {
         SERVE_OPEN_WHY="neither DISPLAY nor WAYLAND_DISPLAY is set, so there is no desktop session here"
         return 0
     fi
-    if [[ -n "${BWOPENCODE2_SERVE_BROWSER:-}" ]]; then
-        _b="$(serve_open_find "${BWOPENCODE2_SERVE_BROWSER}")" || _b=""
-        if [[ -z "${_b}" ]]; then
-            echo "Error: BWOPENCODE2_SERVE_BROWSER='${BWOPENCODE2_SERVE_BROWSER}' is not a program in ${SERVE_OPEN_DIRS[*]-} (or an absolute path) owned by root and not writable by group or others." >&2
-            exit 1
-        fi
-    else
-        for _cand in ${SERVE_OPEN_CANDIDATES[@]+"${SERVE_OPEN_CANDIDATES[@]}"}; do
-            _b="$(serve_open_find "${_cand}")" && break
-            _b=""
-        done
-        if [[ -z "${_b}" ]] && serve_open_default_browser; then
-            _b="$(serve_open_find xdg-open)" || _b=""
-        fi
-        if [[ -z "${_b}" ]]; then
-            SERVE_OPEN_WHY="no web browser found: none of ${SERVE_OPEN_CANDIDATES[*]-} is installed in ${SERVE_OPEN_DIRS[*]-} (owned by root) and no default browser is registered"
-            return 0
-        fi
+    for _cand in ${SERVE_OPEN_CANDIDATES[@]+"${SERVE_OPEN_CANDIDATES[@]}"}; do
+        _b="$(serve_open_find "${_cand}")" && break
+        _b=""
+    done
+    if [[ -z "${_b}" ]] && serve_open_default_browser; then
+        _b="$(serve_open_find xdg-open)" || _b=""
+    fi
+    if [[ -z "${_b}" ]]; then
+        SERVE_OPEN_WHY="no web browser found: none of ${SERVE_OPEN_CANDIDATES[*]-} is installed in ${SERVE_OPEN_DIRS[*]-} (owned by root) and no default browser is registered"
+        return 0
     fi
     SERVE_OPEN_BIN="${_b}"
     case "$(basename -- "${_b}")" in
@@ -1166,7 +1155,7 @@ serve_open_browser() {
     if command -v setsid > /dev/null 2>&1 && setsid --help 2>&1 | grep -q -- --wait; then
         setsid -w "$@" < /dev/null > /dev/null 2>&1 &
     else
-        "$@" < /dev/null > /dev/null 2>&1 &
+        serve_open_clean_env "$@" < /dev/null > /dev/null 2>&1 &
     fi
     _bpid=$!
     for ((_i = 0; _i < SERVE_OPEN_WAIT_SECONDS * 5; _i++)); do
@@ -1244,20 +1233,43 @@ serve_open_close_fds() {
     done
 }
 
+# Run the command $@ on the host with a minimal environment.  The helper and
+# the browser run outside the sandbox, and the launcher's environment can point
+# into a directory the sandbox can write to: LD_PRELOAD and LD_LIBRARY_PATH (an
+# activated project environment sets the second), BASH_ENV and ENV (read by a
+# shell script such as Chrome's start-up script), BROWSER (read by xdg-open),
+# XDG_*_DIRS and the like.  Only what a desktop program needs is passed on.
+serve_open_clean_env() {
+    local -a _e=(PATH=/usr/bin:/bin)
+    local _v
+    for _v in HOME USER LOGNAME LANG LANGUAGE LC_ALL LC_CTYPE LC_COLLATE LC_MESSAGES \
+        LC_MONETARY LC_NUMERIC LC_TIME DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR \
+        XDG_SESSION_TYPE XDG_CURRENT_DESKTOP DESKTOP_SESSION DBUS_SESSION_BUS_ADDRESS; do
+        [[ -z "${!_v+x}" ]] || _e+=("${_v}=${!_v}")
+    done
+    /usr/bin/env -i "${_e[@]}" "$@"
+}
+
 # The helper as a background job: it ignores the terminal's signals (the
 # server's Ctrl-C is not its own), reads nothing and holds none of the
 # launcher's descriptors.  It runs on the host, outside the sandbox, for as long
 # as it waits for the server and then starts the browser, so the tools it uses
 # (curl, sleep, setsid, grep, basename) are looked up in the system directories
-# only: the PATH it inherits can include a directory the sandbox can write to (an
-# activated project environment, for one), and a tool replaced there would run
-# on the host.  The browser itself is the path chosen before the sandbox started.
+# only and run with a minimal environment (serve_open_clean_env): the PATH it
+# inherits can include a directory the sandbox can write to (an activated
+# project environment, for one), and a tool replaced there would run on the
+# host.  The browser itself is the path chosen before the sandbox started, and
+# runs the same way (setsid starts it).
 serve_open_detached() {
+    local _t
     trap '' INT QUIT HUP
     exec < /dev/null
     serve_open_close_fds
     PATH=/usr/bin:/bin
     export PATH
+    for _t in curl sleep setsid grep basename; do
+        eval "${_t}() { serve_open_clean_env ${_t} \"\$@\"; }"
+    done
     serve_open_run "$@"
 }
 

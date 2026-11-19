@@ -66,7 +66,7 @@ run() {
     done
     shift
     OUT="$(cd "${T}/work" && env -u OPENCODE_PASSWORD -u OPENCODE_SERVER_PASSWORD \
-        -u BWOPENCODE2_SERVE_PASSWORD -u BWOPENCODE2_SERVE_PORTS -u BWOPENCODE2_SERVE_BROWSER \
+        -u BWOPENCODE2_SERVE_PASSWORD -u BWOPENCODE2_SERVE_PORTS \
         -u OPENCODE2_DB_GUARD -u DISPLAY -u WAYLAND_DISPLAY \
         -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME \
         HOME="${T}/home" PATH="${T}/bin:${PATH}" DISPLAY=:0 \
@@ -141,20 +141,6 @@ check '... with a one-time link of its own' contains "${ERR}" '/auth/connect/COD
 check '... started on this host once the server is up' contains "${ERR}" 'will be started on this host once the server is up'
 check 'a dry run starts no browser' [ ! -e "${T}/ran-google-chrome" ]
 
-run BWOPENCODE2_SERVE_BROWSER=xdg-open -- --serve --serve-open
-check 'xdg-open gets the plain link' contains "${ERR}" "${T}/bin/xdg-open http://127."
-check '... without --app' lacks "${ERR}" '--app='
-
-run BWOPENCODE2_SERVE_BROWSER=firefox -- --serve-open
-check 'another browser gets the plain link' contains "${ERR}" "${T}/bin/firefox http://127."
-
-run BWOPENCODE2_SERVE_BROWSER=chromium -- --serve --serve-open
-check 'chromium named by the user gets --app' contains "${ERR}" "${T}/bin/chromium --app=http://127."
-
-run BWOPENCODE2_SERVE_BROWSER=no-such-browser-here -- --serve --serve-open
-check 'a named browser that does not exist is an error' rc_is 1
-check '... that names the variable' contains "${ERR}" 'BWOPENCODE2_SERVE_BROWSER'
-
 run DISPLAY= -- --serve --serve-open
 check 'no desktop session: still a normal launch' rc_is 0
 check '... says nothing will be opened and why' contains "${ERR}" 'nothing will be opened (neither DISPLAY nor WAYLAND_DISPLAY is set'
@@ -216,17 +202,13 @@ check 'a browser that is only on PATH is not found' rc_is 0
 check '... nothing will be opened, and why' contains "${ERR}" 'nothing will be opened (no web browser found'
 check '... the directories searched are named' contains "${ERR}" "${T}/sys"
 
-# 3. A named browser is held to the same rule.
-run PATH="${T}/evil:${PATH}" HARNESS_SERVE_OPEN_DIRS="${T}/sys" BWOPENCODE2_SERVE_BROWSER=google-chrome -- --serve-open
-check 'a named browser that is only on PATH is refused' rc_is 1
-check '... saying what is required' contains "${ERR}" 'owned by root and not writable by group or others'
-run BWOPENCODE2_SERVE_BROWSER="${T}/evil/google-chrome" -- --serve-open
-check 'a named absolute path outside the directories is accepted only when it passes' rc_is 0
-check '... and it is then the one started' contains "${ERR}" "${T}/evil/google-chrome --app=http://127."
-run BWOPENCODE2_SERVE_BROWSER=../evil/google-chrome -- --serve-open
-check 'a relative path with a slash is refused' rc_is 1
-run BWOPENCODE2_SERVE_BROWSER="${T}/bin/../evil/google-chrome" HARNESS_SERVE_OPEN_UID=0 -- --serve-open
-check 'an absolute path owned by someone else is refused' rc_is 1
+# 3. There is no way to name a browser: a variable left over from an earlier
+# version, or one an attacker set, changes nothing.
+for _v in "${T}/evil/google-chrome" firefox ../evil/google-chrome; do
+    run BWOPENCODE2_SERVE_BROWSER="${_v}" -- --serve-open
+    check "a leftover BWOPENCODE2_SERVE_BROWSER is ignored (${_v##*/})" lacks "${ERR}" "${T}/evil"
+    check '... the usual browser is started' contains "${ERR}" "${T}/bin/google-chrome --app=http://127."
+done
 
 # 4. The file and its directories must not be writable by group or others.
 chmod 775 "${T}/bin/google-chrome"
@@ -273,8 +255,6 @@ rm -f "${T}/default-browser"
 # do not change the result.
 run HARNESS_SERVE_OPEN_UID=0 -- --serve-open
 check 'files not owned by root are refused under the real rule' contains "${ERR}" 'nothing will be opened (no web browser found'
-run HARNESS_SERVE_OPEN_UID=0 BWOPENCODE2_SERVE_BROWSER=chromium -- --serve-open
-check 'a named browser not owned by root is refused' rc_is 1
 # With the real directories and owner (the host's own browsers count, so this runs
 # only where one is installed): a root-owned one in a system directory is started.
 _have=0

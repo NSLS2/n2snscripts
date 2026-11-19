@@ -387,6 +387,55 @@ serve_open_detached "$$" "$(bwrap_proc_start_time "$$")"
         ran = sorted(tool for tool in tools if (tmp / f"ran-{tool}").exists())
         self.assertEqual(ran, [], "the helper ran a tool from the launcher's PATH: %r" % ran)
 
+    def test_the_browser_and_the_helper_run_with_a_minimal_environment(self):
+        # The launcher's environment can point into a directory the sandbox can
+        # write to (LD_LIBRARY_PATH of an activated project environment, BASH_ENV,
+        # BROWSER for xdg-open).  None of it may reach the browser.
+        tmp = Path(self.tmp.name)
+        env_log = tmp / "browser-env"
+        browser = tmp / "env-browser"
+        browser.write_text(f"#!/bin/sh\n/usr/bin/env > {env_log}.tmp && mv {env_log}.tmp {env_log}\n")
+        browser.chmod(0o700)
+        self.start_server()
+        script = f"""
+set -euo pipefail
+source "{WRAPPER}"
+SERVE_ADDR=127.0.0.1
+SERVE_PORT={self.port}
+SERVE_PASSWORD='{PASSWORD}'
+SERVE_PASSWORD_RANDOM=1
+SERVE_OPEN_WAIT_SECONDS=1
+SERVE_OPEN_BIN="{browser}"
+SERVE_OPEN_APP=1
+serve_open_detached "$$" "$(bwrap_proc_start_time "$$")"
+"""
+        env = {
+            "PATH": f"{tmp}/evil:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "HOME": self.tmp.name,
+            "DISPLAY": ":7",
+            "LANG": "C.UTF-8",
+            "LD_LIBRARY_PATH": f"{tmp}/evil",
+            "BASH_ENV": f"{tmp}/evil/bashrc",
+            "ENV": f"{tmp}/evil/shrc",
+            "BROWSER": f"{tmp}/evil/browser",
+            "XDG_DATA_DIRS": f"{tmp}/evil",
+            "PYTHONPATH": f"{tmp}/evil",
+            "SOMETHING_ELSE": "1",
+        }
+        subprocess.run(["bash", "-c", script], env=env, timeout=30, capture_output=True, text=True)
+        for _ in range(50):
+            if env_log.exists():
+                break
+            time.sleep(0.1)
+        self.assertTrue(env_log.exists(), "the browser did not run")
+        seen = dict(line.split("=", 1) for line in env_log.read_text().splitlines() if "=" in line)
+        self.assertEqual(seen.get("PATH"), "/usr/bin:/bin")
+        self.assertEqual(seen.get("HOME"), self.tmp.name)
+        self.assertEqual(seen.get("DISPLAY"), ":7")
+        self.assertEqual(seen.get("LANG"), "C.UTF-8")
+        left = sorted(set(seen) - {"PATH", "HOME", "DISPLAY", "LANG", "PWD", "SHLVL", "_", "OLDPWD"})
+        self.assertEqual(left, [], "the browser inherited: %r" % left)
+
     def test_other_browsers_get_the_plain_link(self):
         self.start_server()
         result = self.run_helper(app=0)
