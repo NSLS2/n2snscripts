@@ -790,6 +790,22 @@ shared `bwrap_resolve_tool` library function and distinguishes three failures
 Entries listed in `N2SNSCRIPTS_TOOL_EXCLUDE_PATH` are ignored in all three
 cases.
 
+## The launcher's own environment is trusted
+
+The launchers run on the host with the environment of the shell that starts
+them, and they cannot protect themselves from it. A dynamic loader variable
+(`LD_PRELOAD`, `LD_LIBRARY_PATH`) or a shell start-up variable (`BASH_ENV`,
+`ENV`) takes effect in the launcher's own `bash` before its first line runs, as
+it does for your shell and every command you type. So do not point any of them
+into a directory the sandbox can write to (`~/Projects`, `~/.pixi`, `~/.npm`, a
+project environment): a file placed there would run on the host. What the
+launchers start themselves is kept apart: the sandbox and its network helper
+start under `env -i`, the `--serve-open` helper and browser with a minimal
+environment, and `bwopenchamber`'s Node version probe in a read-only sandbox of
+its own with an empty environment. Re-running the launcher under `env -i` would
+not help, as it needs variables from your shell (`DISPLAY`, the `BWOPENCODE2_*`
+options, `GH_TOKEN_*`).
+
 ## Credentials and secrets handling
 
 - **Only four files of the XDG git directory are mounted.** From the host
