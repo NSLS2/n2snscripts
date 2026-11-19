@@ -89,8 +89,9 @@
 # --serve-open is --serve plus opening the signed-in web UI on the SAME host: a
 # helper on the host (outside the sandbox) waits for the server, asks it for
 # its own one-time sign-in link and starts google-chrome --app=LINK (or
-# chromium, else firefox or the registered default browser).  Never started
-# without the option; --serve on its own opens nothing.
+# chromium, else firefox or the registered default browser), found in the
+# system directories only and only when root owns it (see serve_open_trusted).
+# Never started without the option; --serve on its own opens nothing.
 #
 # Usage:
 #   bwopencode2 [bwopencode2-options] [opencode2 arguments...]
@@ -397,7 +398,11 @@ Wrapper options (consumed before opencode2 sees the command line):
                   app window), else google-chrome-stable, chromium,
                   chromium-browser, else firefox LINK, else xdg-open LINK but only
                   when a default web browser is registered (xdg-mime).
-                  BWOPENCODE2_SERVE_BROWSER names another browser.  Opens nothing,
+                  The browser is looked up in /usr/bin, /usr/local/bin and /snap/bin
+                  only (never on PATH, which can hold a directory the sandbox can
+                  write to) and must be owned by root and not writable by group or
+                  others.  BWOPENCODE2_SERVE_BROWSER names another browser, by name
+                  in those directories or by absolute path, with the same rule.  Opens nothing,
                   and says so, when neither DISPLAY nor WAYLAND_DISPLAY is set or no
                   browser is found.  Not for use over ssh from another machine: use
                   the printed ssh command there.
@@ -1003,20 +1008,74 @@ serve_print_info() {
 # default browser through xdg-open (see serve_open_default_browser).
 SERVE_OPEN_CANDIDATES=(google-chrome google-chrome-stable chromium chromium-browser firefox)
 
+# Where the browser (and xdg-open, xdg-mime) may come from.  The browser is
+# started on the host, outside the sandbox, so it is never looked up on PATH:
+# that can include a directory the sandbox can write to (an activated project
+# environment, ~/.pixi), and a program planted there would run outside the
+# sandbox.  It is looked up in these system directories only, and the file must
+# be owned by SERVE_OPEN_UID (root) and not writable by group or others (see
+# serve_open_trusted).  The tests set both (tests/bwopencode2-harness).
+SERVE_OPEN_DIRS=(/usr/bin /usr/local/bin /snap/bin)
+SERVE_OPEN_UID=0
+
+# True when PATH is owned by SERVE_OPEN_UID and not writable by group or others.
+# stat is run by absolute path: one found on PATH could report a made-up owner.
+serve_open_owner_ok() {
+    local _st
+    _st="$(/usr/bin/stat -c '%u %a' -- "$1" 2> /dev/null)" || return 1
+    [[ "${_st% *}" == "${SERVE_OPEN_UID}" ]] && (((8#${_st#* } & 8#022) == 0))
+}
+
+# True when executable FILE (an absolute path) is safe to run on the host: it
+# resolves, through any symlinks (/usr/bin/google-chrome is one, via
+# /etc/alternatives), to a regular executable file, and that file, the
+# directory it is in and the directory of FILE itself are owned by root and not
+# writable by group or others.  (Directories above those are not checked: they
+# are the system's, or the owner of one of these could change the file anyway.)
+serve_open_trusted() {
+    local _real
+    [[ "$1" == /* && -x "$1" ]] || return 1
+    _real="$(/usr/bin/readlink -f -- "$1" 2> /dev/null)" || return 1
+    [[ -n "${_real}" && -f "${_real}" && -x "${_real}" ]] || return 1
+    serve_open_owner_ok "${_real}" &&
+        serve_open_owner_ok "${_real%/*}/." &&
+        serve_open_owner_ok "${1%/*}/."
+}
+
+# Print the path of the program NAME that may be run on the host: NAME itself
+# when it is an absolute path, else the first of SERVE_OPEN_DIRS that has it;
+# either way only when serve_open_trusted.  Fails when there is none.
+serve_open_find() {
+    local _d
+    if [[ "$1" == /* ]]; then
+        serve_open_trusted "$1" || return 1
+        printf '%s\n' "$1"
+        return 0
+    fi
+    [[ "$1" != */* ]] || return 1
+    for _d in ${SERVE_OPEN_DIRS[@]+"${SERVE_OPEN_DIRS[@]}"}; do
+        if serve_open_trusted "${_d}/$1"; then
+            printf '%s\n' "${_d}/$1"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # True when a default web browser is registered for http, the scheme of the link
 # (it is on 127.H1.H2.1, without TLS).  Without one, xdg-open does not fail: it
 # hands the link to whatever opens a URL as a file (on GNOME, the text editor),
 # which would also use up the one-time link.
 serve_open_default_browser() {
-    local _h
-    command -v xdg-mime > /dev/null 2>&1 || return 1
-    _h="$(xdg-mime query default x-scheme-handler/http 2> /dev/null)" || return 1
+    local _h _x
+    _x="$(serve_open_find xdg-mime)" || return 1
+    _h="$("${_x}" query default x-scheme-handler/http 2> /dev/null)" || return 1
     [[ -n "${_h}" ]]
 }
 
 # Choose the browser: sets SERVE_OPEN_BIN (empty when nothing will be opened,
 # with SERVE_OPEN_WHY saying why) and SERVE_OPEN_APP (1 for Chromium-based
-# browsers, which take --app=URL).
+# browsers, which take --app=URL).  Only programs serve_open_find accepts.
 serve_open_pick_browser() {
     local _b="" _cand
     SERVE_OPEN_BIN=""
@@ -1027,21 +1086,21 @@ serve_open_pick_browser() {
         return 0
     fi
     if [[ -n "${BWOPENCODE2_SERVE_BROWSER:-}" ]]; then
-        _b="$(command -v -- "${BWOPENCODE2_SERVE_BROWSER}" 2> /dev/null)" || _b=""
+        _b="$(serve_open_find "${BWOPENCODE2_SERVE_BROWSER}")" || _b=""
         if [[ -z "${_b}" ]]; then
-            echo "Error: BWOPENCODE2_SERVE_BROWSER='${BWOPENCODE2_SERVE_BROWSER}' is not a command on PATH." >&2
+            echo "Error: BWOPENCODE2_SERVE_BROWSER='${BWOPENCODE2_SERVE_BROWSER}' is not a program in ${SERVE_OPEN_DIRS[*]-} (or an absolute path) owned by root and not writable by group or others." >&2
             exit 1
         fi
     else
         for _cand in ${SERVE_OPEN_CANDIDATES[@]+"${SERVE_OPEN_CANDIDATES[@]}"}; do
-            _b="$(command -v -- "${_cand}" 2> /dev/null)" && break
+            _b="$(serve_open_find "${_cand}")" && break
             _b=""
         done
         if [[ -z "${_b}" ]] && serve_open_default_browser; then
-            _b="$(command -v -- xdg-open 2> /dev/null)" || _b=""
+            _b="$(serve_open_find xdg-open)" || _b=""
         fi
         if [[ -z "${_b}" ]]; then
-            SERVE_OPEN_WHY="no web browser found: none of ${SERVE_OPEN_CANDIDATES[*]-} is installed and no default browser is registered"
+            SERVE_OPEN_WHY="no web browser found: none of ${SERVE_OPEN_CANDIDATES[*]-} is installed in ${SERVE_OPEN_DIRS[*]-} (owned by root) and no default browser is registered"
             return 0
         fi
     fi

@@ -1312,9 +1312,9 @@ bwopencode2 --serve-open [--serve-port N]
   inherited: that can include a directory the sandbox can write to (an activated
   project environment, for one), and a tool replaced there would run outside the
   sandbox. The browser is the program chosen before the sandbox started, by its
-  full path (`BWOPENCODE2_SERVE_BROWSER`, a name on `PATH`, or `xdg-open`), and
-  the helper's children, the browser included, get the same `PATH`: a browser
-  start-up script that needs other directories on `PATH` has to add them itself.
+  full path (see "Which browser" for where it may come from), and the helper's
+  children, the browser included, get the same `PATH`: a browser start-up script
+  that needs other directories on `PATH` has to add them itself.
 - **What the terminal shows.** Nothing of the ssh block: `--serve-open` is for
   the host you are on. The launcher prints one line before the sandbox starts,
   then either
@@ -1345,16 +1345,33 @@ bwopencode2 --serve-open [--serve-port N]
   variable), never when the browser opened. `--serve` prints the full block
   described above, unchanged.
 - **Which browser.** The first of `google-chrome`, `google-chrome-stable`,
-  `chromium`, `chromium-browser` on `PATH`, started as `BROWSER
+  `chromium`, `chromium-browser` found, started as `BROWSER
   --app=LINK` (an app window); else `firefox LINK`; else `xdg-open LINK`, but
   only when a default web browser is registered for `http`, the scheme of the
   link (`xdg-mime query default x-scheme-handler/http` prints one). Without one `xdg-open` does not fail: on
   GNOME it opens the link in the text editor, which shows "Could Not Open File,
   HTTP Client Error: Unauthorized" and has used up the one-time link (seen on a
   workstation with no browser installed, and the reason for this rule).
-  `BWOPENCODE2_SERVE_BROWSER` names another command, which must exist
-  (otherwise the launch stops): a name containing `chrom`, `edge` or `brave`
-  gets `--app=`, any other (`firefox`, `xdg-open`) gets the plain link.
+  `BWOPENCODE2_SERVE_BROWSER` names another program: a name found as below, or
+  an absolute path (otherwise the launch stops). A name containing `chrom`,
+  `edge` or `brave` gets `--app=`, any other (`firefox`, `xdg-open`) gets the
+  plain link.
+- **Where the browser may come from.** The browser starts on the host, outside
+  the sandbox, so it is **never looked up on `PATH`**: that can include a
+  directory the sandbox can write to (an activated project environment,
+  `~/.pixi`), and a `chromium` planted there would run outside the sandbox.
+  Names (the list above, `xdg-open`, `xdg-mime`) are looked up in `/usr/bin`,
+  `/usr/local/bin` and `/snap/bin`, in that order. A program is used only if
+  it is owned by root and not writable by group or others, and so are the file
+  it resolves to through symlinks (`/usr/bin/google-chrome` goes through
+  `/etc/alternatives` to `/opt/google/chrome/google-chrome`) and the directories
+  that hold the symlink and its target. One that fails is skipped, as if it were
+  not installed; a program named in `BWOPENCODE2_SERVE_BROWSER` that fails stops
+  the launch with the rule in the message. An absolute path outside the three
+  directories works if it passes the same check. There is no option to switch
+  the check off: a browser that cannot pass it (one in your home directory, or
+  installed by a tool as your user) is not used, and the link is printed to
+  open by hand.
 - **Holds none of the launcher's descriptors.** The launcher has the database
   session lock (see Database guard) and the sandbox's own descriptors open when
   the helper starts. A browser that inherited them would keep the lock for as

@@ -20,6 +20,16 @@ serve_port_is_free() {
 }
 # shellcheck disable=SC2034  # read by bwopencode2's functions
 [[ -z "${HARNESS_OC2_BIN:-}" ]] || OC2_INSTALL_BIN="${HARNESS_OC2_BIN}"
+# Where --serve-open may find a browser, and who must own it: the tests' stubs
+# are owned by the test user, in a directory of its own (HARNESS_SERVE_OPEN_DIRS,
+# space separated; HARNESS_SERVE_OPEN_UID).  Unset or empty, the real rule
+# applies: the system directories, files owned by root.
+# shellcheck disable=SC2034  # read by bwopencode2's functions
+if [[ -n "${HARNESS_SERVE_OPEN_DIRS:-}" ]]; then
+	read -r -a SERVE_OPEN_DIRS <<<"${HARNESS_SERVE_OPEN_DIRS}"
+fi
+# shellcheck disable=SC2034  # read by bwopencode2's functions
+[[ -z "${HARNESS_SERVE_OPEN_UID:-}" ]] || SERVE_OPEN_UID="${HARNESS_SERVE_OPEN_UID}"
 # The browsers --serve-open looks for, so a test does not depend on the host's
 # (HARNESS_SERVE_OPEN_CANDIDATES set to nothing means none).
 # shellcheck disable=SC2034  # read by bwopencode2's functions

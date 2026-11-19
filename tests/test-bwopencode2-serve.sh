@@ -40,20 +40,24 @@ echo '{}' > "${T}/home/.config/opencode2/opencode/opencode.json"
 printf '#!/bin/sh\necho "opencode v2.2.7"\n' > "${T}/oc2/opencode.exe"
 chmod +x "${T}/oc2/opencode.exe"
 # Browsers: stubs that record that they ran (a dry run must never run one).
+# They are owned by the test user, so the harness accepts that user and this
+# directory in place of root and the system directories (see the end of the
+# file for the tests of the real rule).  Modes are set, not left to the umask.
+chmod 755 "${T}/bin"
 for _b in google-chrome chromium xdg-open firefox; do
     printf '#!/bin/sh\ntouch "%s/ran-%s"\n' "${T}" "${_b}" > "${T}/bin/${_b}"
-    chmod +x "${T}/bin/${_b}"
+    chmod 755 "${T}/bin/${_b}"
 done
 
 # xdg-mime: prints the default browser registered for http in the test, if any (the
 # file default-browser holds its name, https-only-browser the one for https only).
 printf '#!/bin/sh\n[ "$3" = x-scheme-handler/http ] && cat "%s/default-browser" 2>/dev/null\n' "${T}" > "${T}/bin/xdg-mime"
-chmod +x "${T}/bin/xdg-mime"
+chmod 755 "${T}/bin/xdg-mime"
 
 # run [VAR=VALUE ...] -- ARGS...: dry-run the launcher; sets OUT, ERR, RC.  A
-# desktop session is assumed (DISPLAY) unless the caller sets DISPLAY= ; PATH
-# has the stub browsers first, so a browser the host has does not matter for
-# the tests that name one.
+# desktop session is assumed (DISPLAY) unless the caller sets DISPLAY= ; the
+# harness looks for browsers only in the stub directory, as the test user, so
+# a browser the host has does not matter (a caller can override these).
 run() {
     local -a _env=()
     while [[ $# -gt 0 && "$1" != -- ]]; do
@@ -66,6 +70,7 @@ run() {
         -u OPENCODE2_DB_GUARD -u DISPLAY -u WAYLAND_DISPLAY \
         -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME \
         HOME="${T}/home" PATH="${T}/bin:${PATH}" DISPLAY=:0 \
+        HARNESS_SERVE_OPEN_DIRS="${T}/bin" HARNESS_SERVE_OPEN_UID="$(id -u)" \
         HARNESS_OC2_BIN="${T}/oc2/opencode.exe" ${_env[@]+"${_env[@]}"} \
         "${HARNESS}" --dry-run --share-net "$@" 2> "${T}/err")"
     RC=$?
@@ -189,6 +194,92 @@ check '... without --app' lacks "${ERR}" '--app='
 
 run HARNESS_SERVE_OPEN_CANDIDATES="chromium firefox" -- --serve --serve-open
 check 'a Chromium-based browser is tried before firefox' contains "${ERR}" "${T}/bin/chromium --app=http://127."
+
+# ── --serve-open: the browser is never taken from where the sandbox can write ──
+
+# These runs use the harness's directory and user (as above) unless they say
+# otherwise.  A planted browser is a stub that records that it ran: a dry run
+# never runs one, so what matters is which path the launcher would start.
+mkdir -p "${T}/evil" "${T}/sys"
+chmod 755 "${T}/evil" "${T}/sys"
+printf '#!/bin/sh\ntouch "%s/ran-evil"\n' "${T}" > "${T}/evil/google-chrome"
+chmod 755 "${T}/evil/google-chrome"
+
+# 1. PATH is not searched: an evil browser first on PATH, outside the directories.
+run PATH="${T}/evil:${T}/bin:${PATH}" -- --serve --serve-open
+check 'a browser first on PATH, outside the system directories, is not used' lacks "${ERR}" "${T}/evil"
+check '... the one in the system directory is' contains "${ERR}" "${T}/bin/google-chrome --app=http://127."
+
+# 2. Only a browser on PATH and nowhere else: nothing is opened.
+run HARNESS_SERVE_OPEN_DIRS="${T}/sys" -- --serve --serve-open
+check 'a browser that is only on PATH is not found' rc_is 0
+check '... nothing will be opened, and why' contains "${ERR}" 'nothing will be opened (no web browser found'
+check '... the directories searched are named' contains "${ERR}" "${T}/sys"
+
+# 3. A named browser is held to the same rule.
+run PATH="${T}/evil:${PATH}" HARNESS_SERVE_OPEN_DIRS="${T}/sys" BWOPENCODE2_SERVE_BROWSER=google-chrome -- --serve-open
+check 'a named browser that is only on PATH is refused' rc_is 1
+check '... saying what is required' contains "${ERR}" 'owned by root and not writable by group or others'
+run BWOPENCODE2_SERVE_BROWSER="${T}/evil/google-chrome" -- --serve-open
+check 'a named absolute path outside the directories is accepted only when it passes' rc_is 0
+check '... and it is then the one started' contains "${ERR}" "${T}/evil/google-chrome --app=http://127."
+run BWOPENCODE2_SERVE_BROWSER=../evil/google-chrome -- --serve-open
+check 'a relative path with a slash is refused' rc_is 1
+run BWOPENCODE2_SERVE_BROWSER="${T}/bin/../evil/google-chrome" HARNESS_SERVE_OPEN_UID=0 -- --serve-open
+check 'an absolute path owned by someone else is refused' rc_is 1
+
+# 4. The file and its directories must not be writable by group or others.
+chmod 775 "${T}/bin/google-chrome"
+run -- --serve-open
+check 'a group-writable browser is skipped' lacks "${ERR}" "${T}/bin/google-chrome"
+check '... the next one is used' contains "${ERR}" "${T}/bin/chromium --app=http://127."
+chmod 755 "${T}/bin/google-chrome"
+chmod 777 "${T}/bin/chromium"
+run HARNESS_SERVE_OPEN_CANDIDATES=chromium -- --serve-open
+check 'a world-writable browser is not used' contains "${ERR}" 'nothing will be opened (no web browser found'
+chmod 755 "${T}/bin/chromium"
+chmod 775 "${T}/bin"
+run -- --serve-open
+check 'a browser in a group-writable directory is not used' lacks "${ERR}" "${T}/bin/google-chrome"
+chmod 755 "${T}/bin"
+
+# 5. A symlink is judged by its target: a root-owned name does not help a
+# target that someone else can change, and a symlink to a good target works.
+mkdir -p "${T}/real"
+chmod 755 "${T}/real"
+cp "${T}/bin/firefox" "${T}/real/firefox"
+chmod 755 "${T}/real/firefox"
+ln -sf "${T}/real/firefox" "${T}/bin/linked-firefox"
+run HARNESS_SERVE_OPEN_CANDIDATES=linked-firefox -- --serve-open
+check 'a symlink to a trusted file is accepted' contains "${ERR}" "${T}/bin/linked-firefox http://127."
+chmod 777 "${T}/real/firefox"
+run HARNESS_SERVE_OPEN_CANDIDATES=linked-firefox -- --serve-open
+check 'a symlink to a writable file is not' contains "${ERR}" 'nothing will be opened (no web browser found'
+chmod 755 "${T}/real/firefox"
+chmod 777 "${T}/real"
+run HARNESS_SERVE_OPEN_CANDIDATES=linked-firefox -- --serve-open
+check 'a symlink to a file in a writable directory is not' contains "${ERR}" 'nothing will be opened (no web browser found'
+chmod 755 "${T}/real"
+rm -f "${T}/bin/linked-firefox"
+
+# 6. xdg-open and xdg-mime are found the same way.
+echo 'firefox.desktop' > "${T}/default-browser"
+run HARNESS_SERVE_OPEN_CANDIDATES= HARNESS_SERVE_OPEN_DIRS="${T}/sys" PATH="${T}/bin:${PATH}" -- --serve-open
+check 'xdg-mime and xdg-open on PATH only are not used' contains "${ERR}" 'nothing will be opened (no web browser found'
+rm -f "${T}/default-browser"
+
+# 7. The real rule: the test user's stubs are not owned by root, and the
+# system directories (not the stub directory) are searched.
+run HARNESS_SERVE_OPEN_DIRS= HARNESS_SERVE_OPEN_UID=0 -- --serve-open
+check 'files not owned by root are refused under the real rule' contains "${ERR}" 'nothing will be opened (no web browser found'
+check '... and the default directories are named' contains "${ERR}" '/usr/bin /usr/local/bin /snap/bin'
+run HARNESS_SERVE_OPEN_UID=0 BWOPENCODE2_SERVE_BROWSER=chromium -- --serve-open
+check 'a named browser not owned by root is refused' rc_is 1
+SYSBROWSER="$(command -v google-chrome chromium chromium-browser firefox 2> /dev/null | head -1)"
+if [[ "${SYSBROWSER}" == /usr/bin/* && "$(stat -c %u "$(readlink -f "${SYSBROWSER}")")" == 0 ]]; then
+    run HARNESS_SERVE_OPEN_DIRS= HARNESS_SERVE_OPEN_UID= -- --serve-open
+    check 'with the real directories and owner, a system browser is found' contains "${ERR}" "${SYSBROWSER}"
+fi
 
 # ── nothing else changed ─────────────────────────────────────────────────
 
