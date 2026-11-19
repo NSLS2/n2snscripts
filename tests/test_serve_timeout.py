@@ -64,18 +64,18 @@ httpd.serve_forever()
             )
             try:
                 deadline = time.monotonic() + 9
-                lines = []
-                while time.monotonic() < deadline:
-                    ready, _, _ = select.select([proc.stderr], [], [], max(0, deadline - time.monotonic()))
+                data = ""
+                fd = proc.stderr.fileno()
+                # os.read, not readline: select cannot see lines a buffered reader already holds.
+                while time.monotonic() < deadline and "could not get a pairing link" not in data:
+                    ready, _, _ = select.select([fd], [], [], max(0, deadline - time.monotonic()))
                     if not ready:
                         break
-                    line = proc.stderr.readline()
-                    if not line:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
                         break
-                    lines.append(line)
-                    if "could not get a pairing link" in line:
-                        break
-                self.assertIn("could not get a pairing link", "".join(lines))
+                    data += chunk.decode()
+                self.assertIn("could not get a pairing link", data)
             finally:
                 proc.terminate()
                 try:

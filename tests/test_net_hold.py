@@ -294,5 +294,66 @@ sleep 4
         self.assertEqual(out.stdout.decode().strip(), "7 12")
 
 
+REG_DRIVER = r"""
+set -euo pipefail
+source "$1"
+SCRIPT_DIR="$2"
+DRY_RUN=0
+TEST_CMD=""
+OC2_DATA_SRC="$3"
+OC2_INSTALL_BIN=""
+_TOOL_BIN=""
+TOOL_ARGS=()
+guard_opencode2_db
+echo "fd=${OC2DB_SESSION_FD:-} hold=${NET_HOLD_FDS[*]-}"
+"""
+
+
+@unittest.skipUnless(shutil.which("flock"), "flock (util-linux) not installed")
+class LauncherRegistrationTest(unittest.TestCase):
+    """Each launcher that takes the database lock registers it with the holder.
+
+    The real guard runs against a temporary data directory (and an empty fake
+    /proc), so nothing of the user's is touched.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="net-hold-reg.")
+        self.data = os.path.join(self.dir, "data", "opencode")
+        os.makedirs(self.data)
+        open(os.path.join(self.data, "opencode.db"), "w").close()
+        os.makedirs(os.path.join(self.dir, "proc", "self", "ns"))
+        os.symlink("pid:[4001]", os.path.join(self.dir, "proc", "self", "ns", "pid"))
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def registered(self, launcher):
+        bin_dir = os.path.join(HERE, "..", "bin")
+        env = dict(os.environ, OC2DB_PROC=os.path.join(self.dir, "proc"), OC2DB_TOOL="/nonexistent")
+        for name in ("BWRAP_SANDBOX", "OPENCODE2_DB_GUARD"):
+            env.pop(name, None)
+        out = subprocess.run(
+            ["bash", "-c", REG_DRIVER, "_", os.path.join(bin_dir, launcher), bin_dir, self.data],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+        )
+        self.assertEqual(out.returncode, 0, out.stderr.decode())
+        return dict(field.split("=", 1) for field in out.stdout.decode().split() if "=" in field)
+
+    def check(self, launcher):
+        got = self.registered(launcher)
+        self.assertTrue(got["fd"].isdigit() and int(got["fd"]) >= 200, "no session lock was taken: %r" % got)
+        self.assertEqual(got["hold"], got["fd"], "the lock is not registered with the holder: %r" % got)
+
+    def test_bwopencode2_registers_its_session_lock(self):
+        self.check("bwopencode2")
+
+    def test_bwopenchamber_registers_its_session_lock(self):
+        self.check("bwopenchamber")
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())

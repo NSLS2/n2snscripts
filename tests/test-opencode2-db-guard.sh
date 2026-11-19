@@ -130,6 +130,32 @@ OUT="$(run_guard "${D}")"
 check "second session of the same version on this host is allowed" contains "${OUT}" 'rc=0'
 check "the running session holds its lock" bash -c '! flock -x -n "$1" true' _ "$(locks_of "${D}")/session@${HOST}@2.2.5.lock"
 
+# The sandbox library hands the sandbox data on descriptors 10 up and its relay
+# opens them over whatever is there (here 10 to 29, so the number bash would pick
+# for the lock is among them).  The session lock must not be on one of
+# those, or the relay closes it and the lock is released while the sandbox runs.
+D="$(new_data relay)"
+LOCK="$(locks_of "${D}")/session@${HOST}@2.2.5.lock"
+OUT="$(
+       bash -c '
+    source "$1"
+    source "$2"
+    oc2db_guard "$3" "$4" > /dev/null 2>&1 || exit 1
+    echo "fd=${OC2DB_SESSION_FD}"
+    _entries=()
+    for _n in $(seq 10 29); do
+        export "_BWRAP_FD_DATA_${_n}=data"
+        _entries+=("${_n}" data)
+    done
+    exec /usr/bin/bash -c "$_BWRAP_FD_RELAY_SHIM" bwrap-fd-relay "${_entries[@]}" -- /usr/bin/sleep 4
+' _ "${ROOT}/lib/bwrap_sandbox_lib.sh" "${LIB}" "${D}" "${NEW}" 2> /dev/null &
+    sleep 1.5
+    flock -x -n "${LOCK}" true && echo "lock=released" || echo "lock=held"
+    wait
+)"
+check "the session lock is on a descriptor the relay does not use" bash -c '[[ "$(sed -n "s/^fd=//p" <<< "$1")" -ge 200 ]]' _ "${OUT}"
+check "the session lock is still held after the relay opened descriptors 10 to 29" contains "${OUT}" 'lock=held'
+
 D="$(new_data otherhost)"
 hold_lock "$(locks_of "${D}")/session@elsewhere.example@2.2.5.lock" 4
 OUT="$(run_guard "${D}")"

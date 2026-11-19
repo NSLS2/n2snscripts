@@ -6,8 +6,9 @@ masked privileged binaries, ephemeral auth on shared accounts, and
 filesystem isolation from the rest of the host. See the NSLS-II
 coding-agents documentation for the policy these wrappers implement.
 
-All five wrappers source the shared library `lib/bwrap_sandbox_lib.sh`
-for sandbox construction. Each wrapper's `--help` is the authoritative
+All six wrappers use the shared library `lib/bwrap_sandbox_lib.sh`
+for sandbox construction (`bwopenchamber` through `bwopencode2`, which it
+sources). Each wrapper's `--help` is the authoritative
 option list; the tables below summarise the common surface.
 
 [bwrap]: https://github.com/containers/bubblewrap
@@ -789,6 +790,22 @@ shared `bwrap_resolve_tool` library function and distinguishes three failures
 Entries listed in `N2SNSCRIPTS_TOOL_EXCLUDE_PATH` are ignored in all three
 cases.
 
+## The launcher's own environment is trusted
+
+The launchers run on the host with the environment of the shell that starts
+them, and they cannot protect themselves from it. A dynamic loader variable
+(`LD_PRELOAD`, `LD_LIBRARY_PATH`) or a shell start-up variable (`BASH_ENV`,
+`ENV`) takes effect in the launcher's own `bash` before its first line runs, as
+it does for your shell and every command you type. So do not point any of them
+into a directory the sandbox can write to (`~/Projects`, `~/.pixi`, `~/.npm`, a
+project environment): a file placed there would run on the host. What the
+launchers start themselves is kept apart: the sandbox and its network helper
+start under `env -i`, the `--serve-open` helper and browser with a minimal
+environment, and `bwopenchamber`'s Node version probe in a sandbox of its own
+with an empty environment and only the system and Node directories. Re-running the launcher under `env -i` would
+not help, as it needs variables from your shell (`DISPLAY`, the `BWOPENCODE2_*`
+options, `GH_TOKEN_*`).
+
 ## Credentials and secrets handling
 
 - **Only four files of the XDG git directory are mounted.** From the host
@@ -1054,8 +1071,9 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
   number for a data file), so the launcher registers the lock with
   `net_hold_fd` and `_net_hold_start` starts a small background holder that
   keeps its own copy open until the launcher process (pasta, after the `exec`)
-  has gone. The holder runs on the host, ignores the signals meant for the
-  session and closes every other descriptor it inherited. It runs no external
+  has gone (see "Where the lock lives with a private network" below). The
+  holder runs on the host, ignores the signals meant for the session and closes
+  every other descriptor it inherited. It runs no external
   command: it waits with the shell's own `read -t` on a private FIFO and reads
   its parent pid straight from `/proc`, so it depends on neither `PATH` (which
   the sandbox may be able to write to), nor `LD_PRELOAD`, nor a fork that can
@@ -1070,7 +1088,12 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
   parent chain unwinds. Passing the lock down the descriptor relay instead, so
   that `bwrap` and OpenCode hold it themselves, is the stronger design and is
   not done yet. To see the holder during a session, run `fuser` on the lock
-  files in `~/.local/share/opencode2/opencode-db-guard/locks/`;
+  files in `~/.local/share/opencode2/opencode-db-guard/locks/`. The descriptor is
+  numbered 200 or higher on purpose: the launcher hands the sandbox its files and
+  data on descriptors 10 and up, and the relay opens those over whatever is
+  there. With the lock on bash's own choice (10 or 11) it was closed, and so
+  released, whenever the launcher passed two or more data descriptors, as
+  `bwopenchamber` does (found in review of NSLS2/n2snscripts#43);
 - it starts a daily background backup (`opencode2-db backup --if-due`) and keeps
   the newest 3 compressed copies.
 
@@ -1079,6 +1102,30 @@ host. Before the sandbox starts, `bwopencode2` calls `oc2db_guard`
 files are in `~/.local/share/opencode2/opencode-db-guard`, which is not mounted
 in the sandbox. The rules, the recovery steps (`opencode2-db restore` and
 `rebuild`) and the limits are in [opencode2-db.md](opencode2-db.md).
+
+#### Where the lock lives with a private network
+
+The text above describes `--share-net`, where the launcher `exec`s into `bwrap`
+and the descriptor goes with it. With a private network the launcher `exec`s into
+pasta instead, and pasta closes every descriptor above 2 that it inherits (see
+"File descriptor relay"), so neither pasta, `bwrap` nor OpenCode holds the lock.
+
+It used to be held only by accident. Checked on a real launch (`fuser` on the
+lock file while a `bwopencode2` session ran on pasta): the only holders were the
+network log's helper processes, a forked copy of the launcher shell and its
+`bwrap_netlog.py condense` child, which received the descriptor because they were
+started before the `exec`. With no log tool (neither `systemd-cat` nor `logger`),
+or with the helper stopped, nothing held the lock, and a second host or OpenCode
+build could have passed the guard while the session ran.
+
+That is fixed for both launchers: `bwopencode2` and `bwopenchamber` register the
+guard's descriptor with `net_hold_fd` (the holder and `bwopencode2`'s
+registration are in NSLS2/n2snscripts#37, `bwopenchamber`'s is in #43), and
+`_net_hold_start` starts a background holder before the `exec` that keeps the
+lock until the launcher process has gone, whether or not anything is logged. See
+"Database guard" above for what the holder does, and for its limits: it holds the
+lock next to OpenCode, not inside it. During a session, `fuser` on the lock file
+should list the holder.
 
 ### What is kept out of the sandbox
 
@@ -1141,8 +1188,24 @@ reachable from a browser.
 
 ```text
 bwopencode2 --serve [--serve-port N]
+bwopencode2 --serve-open [--serve-port N]
 bwopencode2 --serve-ssh-config
 ```
+
+Two ways to reach it, both signed in with a one-time link and no password to
+type:
+
+- **From your own machine, over ssh** (the usual case). When the server is up
+  the launcher prints one block with the `ssh -L` command (and the `ssh
+  <host>-oc` alias), the sign-in link for `http://127.0.0.1:PORT`, and the same
+  link as a `google-chrome --app=...` command, which opens the UI as an app
+  window without tabs or an address bar. A link works once and expires after 5
+  minutes, and setting up a tunnel can take longer than that, so **press Enter
+  in the server's terminal for a new link** (the block is printed again).
+- **On the same host** (a desktop or remote desktop session), start with
+  `--serve-open` instead of `--serve`: the same server, and the browser opens
+  by itself, already signed in.
+  See [`--serve-open`](#--serve-open-a-browser-on-the-same-host).
 
 - **One server per invocation.** Each `--serve` is its own sandbox with its own
   server; stop it with Ctrl-C in its terminal.
@@ -1184,19 +1247,25 @@ bwopencode2 --serve-ssh-config
   (the wrapper refuses it, and outside the sandbox it points at the shared
   service). Instead the sandbox runs a small wrapper, not `opencode2 serve`
   directly: it starts the server, waits until it answers, asks it for a
-  one-time pairing code and prints the link twice, for the tunnel
-  (`http://127.0.0.1:<port>/auth/connect/<code>`) and for this host
-  (`http://127.H1.H2.1:<port>/...`). Open one to be signed in, with the 30-day cookie, without typing the password.
-  The link works once and expires after 5 minutes; after that, or if the
-  printed link failed, click **Use password** and enter the password. The
-  password reaches `curl` on its standard input (`-K -`), never on a command
-  line, because a process in the sandbox is visible to `ps` on the host. The
-  wrapper stays in the foreground and stops the server on Ctrl-C or when the
-  sandbox ends.
+  one-time pairing code and prints one block: the `ssh -L` command and the
+  alias, the link through the tunnel
+  (`http://127.0.0.1:<port>/auth/connect/<code>`), the same as a
+  `google-chrome --app=...` command, the link for this host
+  (`http://127.H1.H2.1:<port>/...`) and the password. Open a link to be signed
+  in, with the 30-day cookie, without typing the password. A link works once
+  and expires after 5 minutes. **Enter** in the terminal asks the server for a
+  new code and prints the block again; it is only read when the wrapper has a
+  terminal, and at end of input the wrapper stops reading and keeps waiting
+  for the server. If the server gives no link, the block shows the plain page
+  and the password and you click **Use password**. The password reaches `curl`
+  on its standard input (`-K -`), never on a command line, because a process in
+  the sandbox is visible to `ps` on the host (a backslash or double quote in a
+  fixed password is escaped for curl's config file). The wrapper stays in the
+  foreground and stops the server on Ctrl-C or when the sandbox ends.
 - **Password.** The server needs one (Basic auth, user `opencode`). The launcher uses a **random password for each
-  session** and prints it at start. To use a fixed one, export
-  `BWOPENCODE2_SERVE_PASSWORD` (at least 12 characters, for example from
-  `load-env`); the launcher prints nothing about it. Either way it reaches the
+  session** and prints it with the sign-in block. To use a fixed one, export
+  `BWOPENCODE2_SERVE_PASSWORD` (at least 12 characters, no control characters
+  such as a newline or a tab, for example from `load-env`); the launcher prints nothing about it. Either way it reaches the
   server only as `OPENCODE_PASSWORD` in the sandbox environment (the host's
   own `OPENCODE_PASSWORD` is still dropped) and is never written to a file.
   Trade-off: a sandboxed agent can read its own environment, so it can read its
@@ -1208,23 +1277,151 @@ bwopencode2 --serve-ssh-config
   start time, host, directory and start date, no secret) stops two launchers
   picking the same port; the port must also be free on the address checked
   (`127.H1.H2.1`, or `--publish-addr`), and the address is claimed as for any
-  `--publish`.
+  `--publish`. Launches that start at the same moment are serialised with an
+  `flock` on `~/.local/state/bwopencode2/serve/claims.lock`, held while stale
+  claims are removed and a port is chosen and released before the sandbox starts
+  (without `flock` a warning says two simultaneous launches may pick the same
+  port).
   A claim
   whose process is gone is stale and is removed on the next `--serve`. The
   launcher ends in `exec`, so it cannot retry or clean up afterwards; the
   remaining race is another program taking the port in the moment before the
   server binds it, and then the server fails to start with an error: run it
   again.
-- **Limits.** `--serve` takes no opencode2 arguments and cannot be combined with
+- **Limits.** `--serve` and `--serve-open` take no opencode2 arguments and cannot be combined with
   `--exec`; `serve`, `--server`, `pair` and the other refused arguments stay
   refused. `--dry-run` shows the command (password redacted) and claims
-  nothing.
+  nothing, and opens no browser.
 - **Cookie.** The server names its login cookie `opencode_session_<port>` from
   the port in the address the browser used (checked with 2.2.6 using curl), so
   sessions on different ports do not log each other out. The cookie holds an
   expiry (30 days) and a hash made with the server password: with a fixed
   password a cookie is accepted by any session that shares it, with a random
   one it stops working when the session ends.
+
+#### `--serve-open`: a browser on the same host
+
+For a session on a workstation or a remote desktop, where the browser runs on
+the host that runs the server:
+
+```text
+bwopencode2 --serve-open [--serve-port N]
+```
+
+- **Its own option, not an add-on.** `--serve-open` is `--serve` plus the
+  browser, so it needs no `--serve` next to it (`--serve --serve-open` means
+  the same). `--serve` alone never opens anything.
+- **Only when asked.** Without `--serve-open` nothing is ever opened, also
+  with a display available (an `ssh -X` session has one, and Chrome should not
+  start over X forwarding by surprise).
+- **Started on the host, outside the sandbox.** The sandbox cannot start a
+  browser and does not try. Before the launcher replaces itself with the
+  sandbox it starts a small helper in the background (the launcher's pid does
+  not change at `exec`, so the helper can tell when the launcher has gone). The
+  helper waits up to about a minute for the server to answer on
+  `127.H1.H2.1:<port>`, asks it for **a one-time pairing code of its own**
+  and starts the browser detached (`setsid`, output discarded), so ending the
+  server does not close the window. The password reaches `curl` on its standard
+  input. It opens nothing when the launcher has exited. Because it runs on the
+  host while the sandbox runs, it looks its own tools up (`curl`, `sleep`,
+  `setsid`, `grep`, `basename`) in `/usr/bin:/bin` only, not in the `PATH` it
+  inherited: that can include a directory the sandbox can write to (an activated
+  project environment, for one), and a tool replaced there would run outside the
+  sandbox. The browser is the program chosen before the sandbox started, by its
+  full path (see "Which browser"), and the helper's tools and the browser run
+  with a minimal environment, `PATH` included (see "A minimal environment"): a
+  browser start-up script that needs other directories on `PATH` has to add them
+  itself.
+- **What the terminal shows.** Nothing of the ssh block: `--serve-open` is for
+  the host you are on. The launcher prints one line before the sandbox starts,
+  then either
+
+  ```text
+  bwopencode2: OpenCode web UI on 127.52.255.1:24700, opened in google-chrome.
+  ```
+
+  or, if no browser opened, a link to open by hand and the password:
+
+  ```text
+  bwopencode2: could not open a browser (no web browser found: ...).
+    Open this on this machine:  http://127.52.255.1:24700/auth/connect/<code>
+    (works once, expires in 5 minutes; press Enter for a new link)
+    If the link fails, click "Use password": <password>
+  ```
+
+  The helper decides after starting the browser: one that exits with an error
+  within 8 seconds (a browser that cannot start)
+  counts as not opened, and one still running, or that exited 0 (Chrome handing
+  the link to a window that is already open), counts as opened. A browser that
+  fails later is not noticed. The fallback link is a **new** code, because a
+  failed attempt may already have used the first. The same fallback is printed
+  by the helper when the server never answered, and by the sandbox's wrapper
+  when no browser could be chosen (no desktop session, none installed; the line
+  says why). Enter prints a new link in the same short form. The password is printed only in the
+  fallback (random password; with `BWOPENCODE2_SERVE_PASSWORD` the line names the
+  variable), never when the browser opened. `--serve` prints the full block
+  described above, unchanged.
+- **Which browser.** The first of `google-chrome`, `google-chrome-stable`,
+  `chromium`, `chromium-browser` found, started as `BROWSER
+  --app=LINK` (an app window); else `firefox LINK`. No other browser is ever
+  started, and neither is the desktop's default browser: `xdg-open` runs
+  whatever `~/.config/mimeapps.list` and a `.desktop` file name, which the
+  launcher cannot check (a handler you registered could point into a directory
+  the sandbox can write to). You cannot name another browser either: a path
+  given by the caller would have to be checked up to the root of the file
+  system. Without one of the five, the link is printed to open by hand.
+- **Where the browser may come from.** The browser starts on the host, outside
+  the sandbox, so it is **never looked up on `PATH`**: that can include a
+  directory the sandbox can write to (an activated project environment,
+  `~/.pixi`), and a `chromium` planted there would run outside the sandbox.
+  The names above are looked up in `/usr/bin`,
+  `/usr/local/bin` and `/snap/bin`, in that order. A program is used only if
+  it is owned by root and not writable by group or others, and so are the file
+  it resolves to through symlinks (`/usr/bin/google-chrome` goes through
+  `/etc/alternatives` to `/opt/google/chrome/google-chrome`) and the directories
+  that hold the symlink and its target. One that fails is skipped, as if it were
+  not installed. There is no option to switch the check off: a browser that
+  cannot pass it (one in your home directory, or installed by a tool as your
+  user) is not used, and the link is printed to open by hand.
+- **A minimal environment.** The helper's tools and the browser run with
+  `PATH=/usr/bin:/bin` and only `HOME`, `USER`, `LOGNAME`, `LANG`, `LANGUAGE`,
+  `LC_*`, `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`,
+  `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`, `DESKTOP_SESSION` and
+  `DBUS_SESSION_BUS_ADDRESS`, whatever the launcher's environment holds. Your
+  shell can point `LD_PRELOAD`, `LD_LIBRARY_PATH` (an activated project
+  environment sets it), `BASH_ENV`, `ENV` (read by a shell script such as
+  Chrome's start-up script), `BROWSER` or `XDG_DATA_DIRS`
+  into a directory the sandbox can write to, and a file there would run outside
+  the sandbox. A browser that needs another variable does not get it: the
+  window may open without your theme or proxy settings.
+- **Holds none of the launcher's descriptors.** The launcher has the database
+  session lock (see Database guard) and the sandbox's own descriptors open when
+  the helper starts. A browser that inherited them would keep the lock for as
+  long as its window stays open, and the next `bwopencode2` on the same data
+  directory would be refused. The helper closes every descriptor above 2 before
+  it starts the browser (found in Copilot's review of PR #43, reproduced: the
+  browser held descriptor 200, the lock, until its window closed; the test
+  fails without the fix). Bash keeps descriptor 255, its handle on the script
+  file, to itself; it holds no lock.
+- **No desktop session.** If neither `DISPLAY` nor `WAYLAND_DISPLAY` is set, or
+  no browser is found, the launch continues and the launcher says that nothing
+  will be opened and why; the ssh instructions then apply.
+- **The link is on the browser's command line.** Another user of the host can
+  read it with `ps` for the moment the browser starts. It works once and
+  expires after 5 minutes, but a local user who gets there first would hold a
+  signed-in session for 30 days (the published address already accepts
+  connections from every local user, and the password is the only thing that
+  stops them). Do not use `--serve-open` on a host where other people log in.
+- **Only a browser signs in.** The server answers `GET /auth/connect/<code>`
+  with `302` to `/` and the login cookie only when the request asks for HTML
+  (`Accept: text/html`, which every browser sends). Any other client (`curl`,
+  the GNOME text editor through gvfs) gets `200` with a JSON token, no cookie,
+  and the code is used up. Checked with OpenCode 2.2.7: `Accept: text/html`
+  alone gives `302` and the cookie (`Sec-Fetch-*` headers alone do not), and
+  a second use of the same code gives `401`.
+- **Cookie.** The cookie goes into the browser's normal profile, named by the
+  port as above. Opening `http://127.H1.H2.1:<port>/` again later stays signed
+  in for as long as the session lives.
 
 Checked against OpenCode 2.2.6 with curl and an isolated data directory: the
 server answers 401 without the password and 200 with it, serves the web UI page
@@ -1238,6 +1435,272 @@ because it needs a browser or the real launcher: signing in with the link in a
 browser, entering the password, a Ctrl-C from the terminal, and two sessions
 open in one browser. Whether the agent can read `OPENCODE_PASSWORD` in tool
 output (`printenv`) is also unchecked.
+
+The sign-in block, Enter for a new link and `--serve-open` were tested without a
+real OpenCode or browser: `tests/test_serve_signin.py` runs the wrapper against
+a fake server (the right password reaches it through curl, including a quote and
+a backslash; a new code on Enter through a pseudo-terminal; no spinning at end
+of input; a failed pairing) and the host helper against a stub browser (the
+`--app=` link, the plain link, the login page when no link came, a launcher
+that has gone, a helper that survives the launcher's `exec`, nothing on
+`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 57 checks through
+`--dry-run` (arguments, browser choice, no display). Not checked, because it
+needs a real launch and a browser: that Chrome opens an app window signed in,
+Enter at a terminal inside `bwrap --new-session`, and the helper's output on a
+terminal. A real launch on a workstation with no browser, with a stand-in
+browser script, showed the helper starting it once the server answered, with
+the link of its own; that the link redirects to `/` with the cookie was
+checked with `curl` against a throwaway server (see "Only a browser signs in").
+
+## `bwopenchamber`
+
+Launches [OpenChamber](https://openchamber.dev) (npm `@openchamber/web`), a web
+UI for OpenCode, inside a bubblewrap sandbox. OpenChamber is a Node.js server
+that starts its own `opencode serve` and adds a browser terminal, git and
+worktree handling, scheduled tasks and session goals on top of it.
+
+```text
+bwopenchamber [bwopenchamber-options]
+bwopenchamber --ssh-config
+```
+
+**Everything runs in the one sandbox.** The OpenChamber server, its OpenCode,
+the browser terminal's shells, git, worktree commands, project start commands,
+scheduled tasks and every tool call the agent makes are processes of this
+sandbox. Only the browser is outside, on another machine, reached through an
+ssh tunnel. This is deliberate: OpenChamber is not only a screen. An
+OpenChamber that runs outside a sandbox in front of a sandboxed OpenCode
+(`OPENCODE_HOST`, or a Windows or desktop install) would run the terminal, git
+and worktree commands unsandboxed, and gives the agent tools that call back into
+it. Do not connect one to `bwopencode2 --serve`.
+
+It is a launcher of its own, not a mode of `bwopencode2`: it sources
+`bin/bwopencode2` for the OpenCode 2 mounts, environment, [database
+guard](#database-guard) and the [`--serve`](#--serve-the-web-ui-from-a-browser)
+port pool, so a fix made there applies here. Moving that shared code into the
+library is a follow-up.
+
+### What it needs
+
+- **Node.js 24.14 or newer** (OpenChamber's own requirement). The launcher looks
+  for one in this order: `BWOPENCHAMBER_NODE`, if set (only that one, and an error
+  if it is too old); the `node` on `PATH`, if it is new enough; the newest
+  versioned binary (`node-24`, `nodejs24`) in `/usr/bin` and `/usr/local/bin` that
+  is new enough. That finds the RHEL 10 `nodejs24` package, which installs
+  `node-24` next to the default `node` (22). On RHEL 8 and 9 the base role enables
+  the `nodejs:24` module, which puts a new enough `node` on `PATH`. When none
+  qualifies, the error lists what it found with versions and says what to do. To
+  use a Node from elsewhere, for example pixi, set `BWOPENCHAMBER_NODE` to its
+  path: `BWOPENCHAMBER_NODE=$(pixi exec -s nodejs=24 -- sh -c 'command -v node')`.
+  To read a candidate's version the launcher runs `node --version`, but never on
+  the host: the `node` on `PATH` can be in a directory the sandbox can write to
+  (`~/.pixi/bin`), so the probe runs in a sandbox of its own with no network, an
+  empty environment and, read-only, only the system directories (`/usr`, `/bin`,
+  `/sbin`, `/lib`, `/lib64`, `/etc`), the candidate's own directory (and that of
+  the file it resolves to) and its environment's `lib` directory. It cannot see
+  the home directory, `/run` or `/tmp`, so none of your credentials, tokens or
+  Unix sockets (the D-Bus session bus, an ssh or gpg agent). A replaced `node`
+  can only print a version there; the one chosen then runs in the real sandbox.
+  A `node` directly in your home directory is not probed, and neither does a
+  `pixi global` trampoline in `~/.pixi/bin` work (it starts a `node` the probe
+  cannot see): name the real one with `BWOPENCHAMBER_NODE`, for example
+  `~/.pixi/envs/nodejs/bin/node`.
+- **OpenChamber** in `/opt/nsls2/openchamber` (`node_modules/@openchamber/web`),
+  mounted read-only. `BWOPENCHAMBER_DIR` names another install. The ansible base
+  role does not install it yet.
+- **OpenCode 2** in `/opt/nsls2/opencode2` and an OpenCode config, as for
+  `bwopencode2`.
+- A private network backend (`pasta` or `slirp4netns`), or `--share-net`: see
+  [Network](#network).
+
+### Reaching it
+
+- **Port and address.** The port comes from the same pool as `bwopencode2
+  --serve` (24700-24709, `BWOPENCODE2_SERVE_PORTS=LO-HI`), claimed in the same
+  state directory, so a port is never given to both and **one ssh_config block
+  covers both**: `bwopenchamber --ssh-config` prints the same block as
+  `bwopencode2 --serve-ssh-config`. `--port N` asks for one port. It is published
+  like `--publish`, always on your first publish address `127.H1.H2.1`, and the
+  launcher prints the `ssh -L` command and the URL.
+- **Private network.** The server listens on `0.0.0.0` inside the sandbox's
+  private network, where only the published port reaches it. **The published
+  address is not access control**: any local user can connect to any `127/8`
+  address (see [Opening ports](#opening-ports)), so another user of the host can
+  reach this port, and the UI password is what keeps them out. OpenCode's own
+  port (a random one on `127.0.0.1` inside the sandbox) is not published and the
+  host cannot connect to it (checked). With `--share-net` the server binds your
+  publish address on the host network instead, and OpenCode's port is then on the
+  host's loopback too, behind its own random password; use it only where neither
+  backend works.
+- **Password.** Random for each session, printed once; `BWOPENCODE2_SERVE_PASSWORD`
+  (12 characters or more, no control characters) sets a fixed one for every
+  session that uses it. It
+  reaches the server as `OPENCHAMBER_UI_PASSWORD` in the sandbox environment,
+  never on a command line.
+- **Sign-in key.** The browser sign-in cookies are signed with a key that is
+  random for each session (`OPENCODE_JWT_SECRET`), so a sign-in ends with the
+  session that issued it. Without it OpenChamber 2.7.0 writes a key to
+  `jwt-secret` in its data directory and reuses it: a browser that signed in once
+  stayed signed in across restarts and after the password changed (12 hours, or 7
+  days on a trusted device), and the agent could read the file. Checked: with a
+  new key a cookie is refused after a restart (401), signing in again works, and
+  no `jwt-secret` file is written. Reload the page after a restart and it asks
+  for the password. The key is still in the environment of the agent's shell
+  (checked: `printenv | grep -c OPENCODE_JWT_SECRET` prints 1), so an agent can
+  still sign a cookie for the current session; the change limits that to the
+  session instead of leaving a reusable key on disk (see the known limit below).
+- **Preview.** A dev server started by the agent is not reachable from your
+  browser by itself. Publish its port with `--publish PORT` (also on your
+  `127.H1.H2.1`) and add a forward for it.
+- **No arguments.** The server is always `serve --foreground`, on the published
+  address. `--host`, `--lan`, `tunnel`, `startup`, `connect-url` and every other
+  OpenChamber argument are refused. `--exec CMD` runs `CMD` in the same sandbox
+  (a shell for diagnostics) without a server, password or port.
+
+### Policy: what is turned off
+
+- **The policy is a read-only file the launcher generates**, mounted from a
+  descriptor at `/etc/openchamber/policy.json` inside the sandbox (the host's
+  file is not visible there and plays no part). It sets enterprise mode (no
+  tunnels (Cloudflare, ngrok, Tailscale), no public relay, no classification
+  service (Jev), no adding model providers in the app, no outside integrations
+  catalogue, no extensions that send data off the machine, generic
+  push-notification titles), `allowNetworkAccess: true` (the server listens on the
+  private network's interface; enterprise mode refuses that by default), the
+  installed OpenCode 2 as `opencodeBinary`, and hides the four built-in
+  third-party skills catalogues. It holds no secret. `OPENCHAMBER_ENTERPRISE_MODE=1`
+  and `OPENCHAMBER_PUSH_RELAY_DISABLED=true` are also set, so that if the file were
+  missing the server would fail closed (enterprise mode refuses a network address
+  without `allowNetworkAccess`) and not run unpinned.
+- **Why a file and not environment variables.** Without a policy file, a saved
+  `opencodeBinary` in OpenChamber's `settings.json` overrides `OPENCODE_BINARY`.
+  That file is in the persistent data directory, which the agent can write, so the
+  agent could name another executable and OpenChamber would start it as
+  "OpenCode" with OpenChamber's environment, bypassing the pin and the database
+  guard's identity check. Only a policy file outranks the saved setting. Copilot
+  review found this; checked with 2.7.0: with the environment alone a fake
+  OpenCode named in `settings.json` ran, and with the read-only policy file
+  OpenChamber started the installed OpenCode and the fake never ran. The first
+  version of this launcher passed the pin as `OPENCODE_BINARY` only and said it was
+  pinned; that was wrong.
+- **The host's own policy** (`/etc/openchamber/policy.json` deployed by ansible)
+  governs an OpenChamber run outside `bwopenchamber`; the launcher's file takes its
+  place inside the sandbox.
+- **Host variables.** The launcher never passes `OPENCODE_HOST`, `OPENCODE_PORT`,
+  `OPENCODE_SKIP_START`, a server password or any other host `OPENCODE_*` or
+  `OPENCHAMBER_*` variable: the sandbox environment starts clean, and
+  `AIFAPIM_*`, the allowlisted `OPENCODE_*` switches and, with
+  `--github-tokens`, the `GH_TOKEN_*` variables are added as for `bwopencode2`.
+- **Which model providers may be used** is decided by OpenCode, not
+  OpenChamber (the managed `/etc/opencode` config is mounted as for
+  `bwopencode2`).
+
+### Data and mounts
+
+- Everything `bwopencode2` mounts (config read-only, OpenCode data and cache,
+  authoring directories, git, pixi, npm, N2C tokens with `--n2c-token`), plus the
+  OpenChamber install read-only and OpenChamber's own data directory.
+- **OpenChamber's data** (settings, projects, chats, worktrees, logs) is
+  `~/.local/share/bwopenchamber` on the host, mounted at
+  `~/.local/share/openchamber` in the sandbox: apart from any OpenChamber run
+  outside a sandbox, which is never mounted. It is bound whole and read-write,
+  so if it is a symlink the launcher resolves it and refuses a target that
+  contains a blocked path (for example a directory holding `~/.config/gh`), and
+  mounts the resolved path (found in Copilot's review of PR #43; the same check
+  as for the install directory).
+- **`run/` is an empty tmpfs.** OpenChamber writes its pid file and an instance
+  file there, and the instance file contains the UI password in plain text (checked
+  with 2.7.0), so it must not reach the persistent directory.
+- **No sign-in key is kept.** `jwt-secret` is not written (see Sign-in key). A
+  file left by an earlier run stays in the data directory but is not used.
+- **Projects.** Only the directory you start in (its git root) is mounted
+  read-write, so a project that OpenChamber opens elsewhere needs `--rw-path`.
+  Starting in a parent directory that is not itself a git repository, such as
+  `~/Projects`, gives it all the repositories below.
+- **Do not sign in to GitHub or add SSH keys in OpenChamber.** Whatever it
+  stores is readable by the agent, and it can merge pull requests and push.
+  Use `--github-tokens` for read-only access. The agent is told this in the
+  sandbox context.
+
+### Connecting from another machine
+
+Forward the port (`ssh -L`, or the alias from `--ssh-config`) and open
+`http://127.0.0.1:PORT/` in a browser or the installed PWA; sign in with the
+password. Keep the same port number at both ends, since the login cookie is
+named by it.
+
+### Known limit: the agent can read its own controls
+
+OpenChamber puts its credentials into the environment of the OpenCode it starts,
+and so of the agent's shell and the browser terminal (its own code records them
+in `OPENCHAMBER_INJECTED_ENV`). Checked with 2.7.0: an agent session's shell has
+`OPENCHAMBER_UI_PASSWORD`, `OPENCODE_SERVER_PASSWORD`, `OPENCODE_PASSWORD` and
+`OPENCODE_JWT_SECRET` set. With them the agent can sign in to OpenChamber (or
+sign a cookie itself), or call its own OpenCode server's API, and so change
+settings, start sessions or scheduled tasks and answer its own permission
+prompts. Nothing leaves the sandbox: everything it could drive runs
+inside it, and the sandbox boundary is what was checked below.
+
+- **The launcher cannot remove them.** OpenChamber writes them into its own
+  environment. Hiding them from the agent's shell only would not help either: a
+  process of the same user in the sandbox can read the server's environment from
+  `/proc/<pid>/environ` (checked in a `bwopencode2` sandbox).
+- **The agent is told in the sandbox context** not to read, print or use them.
+  That is an instruction, not a control.
+- **`bwopencode2 --serve` has the same property** with `OPENCODE_PASSWORD`, which
+  its section lists as unchecked.
+- Where the agent's permission rules ask before risky actions, the agent holding
+  these credentials can answer its own prompts through the API, so those prompts
+  are not a barrier against a misbehaving agent here.
+
+### What was checked
+
+**A real launch on a workstation** (`bwopenchamber --port 24700`, pasta, OpenCode
+2.2.7, OpenChamber 2.7.0):
+
+- The host has one new listener, `127.52.255.1:24700`, and nothing on 3000 or on
+  OpenCode's port. Without a password the API gives 401, the same port on
+  `127.0.0.1` is refused, and OpenCode's own port is refused from the host.
+- A browser signed in through an `ssh -L` tunnel, and an agent session worked
+  through the model gateway.
+- OpenChamber's browser terminal runs inside the sandbox: `BWRAP_SANDBOX` is
+  `bwopenchamber`, `~/.ssh` does not exist, `ssh` is masked and
+  `BWRAP_NET_BACKEND` is `pasta`.
+- After Ctrl-C the OpenCode that OpenChamber started is gone.
+- The database guard refused to start next to an older OpenCode build, as
+  designed.
+
+**In a private network namespace without the launcher**, OpenChamber 2.7.0 with
+the launcher's environment: the server answers on `0.0.0.0`, 401 and 200 as
+above, the managed OpenCode receives `OPENCODE_CONFIG_CONTENT` (the sandbox
+context), `run/` holds the UI password in plain text, and the sign-in key behaves
+as described under Reaching it. With a `settings.json` naming a fake OpenCode,
+the environment alone let the fake run; with a read-only policy file at
+`/etc/openchamber/policy.json` pinning the installed OpenCode the fake never ran,
+and the server still listened on `0.0.0.0` using `allowNetworkAccess` from the
+file.
+
+**Tests:** `tests/test-bwopenchamber.sh` (104 checks through `--dry-run`: argument
+refusals, the environment and mounts built, the generated policy file, hostile
+host variables dropped, password and sign-in key handling, Node and install
+checks, and that a port held by another session does not change the result: the
+harness stubs the port probe, which Copilot found made the tests depend on running
+sessions).
+
+**Not checked:** git and worktrees from OpenChamber, whether the host listener
+belongs to pasta or to the network log's Python helper (`ss` names
+`platform-python`), and the shared-library move that is left for after #37.
+
+To repeat the host checks (do not capture the banner, it prints the password):
+
+```text
+bwopenchamber --port 24700          # in a project directory
+ss -ltnp                            # on the host: only 127.H1.H2.1:24700
+curl -s -o /dev/null -w '%{http_code}\n' http://127.H1.H2.1:24700/auth/session   # 401
+# in the browser through the tunnel: sign in, open the terminal and run
+#   echo $BWRAP_SANDBOX; ls ~/.ssh; ssh -V     # bwopenchamber; fails; fails
+# Ctrl-C, then: pgrep -af 'opencode.exe serve'  # none of this session's
+```
 
 ## `bwclaude`
 
