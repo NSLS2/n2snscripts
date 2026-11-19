@@ -2,12 +2,16 @@
 tools-used:
   - OpenCode
 models-used:
+  - claude-fable-5-2
   - claude-opus-4-8
   - claude-opus-5-5
   - claude-sonnet-4-6
   - claude-sonnet-5
   - claude-sonnet-5-5
   - gpt-5.6-sol
+  - gpt-6-astra
+  - gpt-6-sol
+  - gpt-6.1-sol
 providers:
   - Anthropic
   - OpenAI
@@ -19,7 +23,7 @@ scope:
     Shell wrapper scripts (bin/, lib/), the `azoidcapp` Python helper,
     documentation (docs/), and CI/lint configuration — all with human
     review and validation.
-last-updated: 2026-10-24
+last-updated: 2026-11-16
 ---
 
 # AI Disclosure
@@ -62,7 +66,7 @@ for every merged change.
 ## Tools and models
 
 AI assistance in this repository is provided via
-**OpenCode** using Anthropic models for implementation and OpenAI GPT-5.6-sol
+**OpenCode** using Anthropic models for implementation and OpenAI GPT models
 for critical code review. See the metadata block at the top of this file for
 the current list of models.
 
@@ -79,7 +83,7 @@ AI tools are used to:
   `bwrap_sandbox_lib.sh` library.
 - Draft and refactor `gh-protect-branch`, `azoidcapp`, `pemdecompose`,
   and `gpg-passwd.sh`.
-- Perform critical code review (GPT-5.6-sol).
+- Perform critical code review (OpenAI GPT models).
 - Generate commit messages, code review responses, and documentation.
 
 ## Input data / datasets

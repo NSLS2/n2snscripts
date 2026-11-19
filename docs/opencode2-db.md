@@ -46,9 +46,12 @@ sessions on two hosts.
 
 - Each session holds a shared `flock(2)` lock on
   `session@<host>@<version>.lock`. The lock is on a file descriptor opened by
-  the launcher; the launcher's `exec` passes the descriptor on (through `env`
-  and `bwrap` for `bwopencode2`), so the lock lasts as long as any process
-  still has it open.
+  the launcher. With `--share-net` the launcher's `exec` passes the descriptor
+  on (through `env` and `bwrap` for `bwopencode2`), so the lock lasts as long as
+  any process still has it open. With a private network (the default) the
+  `exec` goes into pasta, which closes it, so `bwopencode2` starts a small
+  background holder that keeps the lock until the launcher process has gone
+  (see "Database guard" in [bw-wrappers.md](bw-wrappers.md)).
 - Each session also writes the build id of its binary (device and inode) as the
   first line of its lock file, under `guard.lock`, so a launch compares builds
   even while the other launcher has not yet started its process.
@@ -59,9 +62,11 @@ sessions on two hosts.
   is what makes them visible from other hosts. They have a lease: a host that
   dies releases its locks after about 90 seconds, so a refusal that names a
   host that is gone clears itself.
-- Every process that OpenCode starts inherits the descriptor. A tool or
-  background command that outlives OpenCode keeps the lock; the refusal then
-  names the host, and ending that process frees it.
+- With `--share-net`, every process that OpenCode starts inherits the
+  descriptor. A tool or background command that outlives OpenCode keeps the
+  lock; the refusal then names the host, and ending that process frees it. With
+  a private network the holder keeps the lock, so a command that outlives
+  OpenCode does not, but the lock goes when the launcher does.
 - If the home directory is mounted with `local_lock=all`, `local_lock=flock` or
   `nolock`, locks are local to one host and the cross-host check cannot see
   anything. The guard prints a warning in that case.

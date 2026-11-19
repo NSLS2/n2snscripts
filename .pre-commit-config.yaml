@@ -95,10 +95,17 @@ repos:
         entry: pixi run --frozen -e dev yamllint
         types: [yaml]
 
-  - repo: https://github.com/rhysd/actionlint
-    rev: v1.7.12
+  # From pixi (conda-forge) rather than the upstream hook, which is
+  # `language: golang` and builds actionlint from source: a Go toolchain and
+  # its modules downloaded in every fresh environment.
+  - repo: local
     hooks:
       - id: actionlint
+        name: actionlint (pixi dev)
+        language: system
+        entry: pixi run --frozen -e dev actionlint
+        types: [yaml]
+        files: '^\.github/workflows/'
 
   - repo: local
     hooks:

@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Fake slirp4netns for testing the bw* launchers without /dev/net/tun.
+
+Like the real one: joins /proc/PID/ns/{user,net}, creates the interface (a
+dummy, not a tap) with the --cidr address .100, serves add_hostfwd on
+--api-socket (really forwarding host_addr:host_port to .100:guest_port),
+writes "1" to --ready-fd, and exits when --exit-fd hangs up.
+
+It runs under `env -i`, so it reads its settings from $FAKE_NET_DIR (default
+/tmp/opencode/fakenet): slirp.fail (ready: fail before ready; api: refuse
+add_hostfwd; delay: start 2 s late), slirp.libslirp (reported libslirp
+version); it logs to slirp.log there.
+"""
+
+import json
+import os
+import select
+import socket
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+import _nsproxy  # noqa: E402
+
+FAKE_DIR = os.environ.get("FAKE_NET_DIR", "/tmp/opencode/fakenet")
+
+
+def setting(name, default=""):
+    try:
+        return open(os.path.join(FAKE_DIR, name)).read().strip()
+    except OSError:
+        return default
+
+
+def log(msg):
+    with open(os.path.join(FAKE_DIR, "slirp.log"), "a") as f:
+        f.write(msg + "\n")
+
+
+args = sys.argv[1:]
+if args in (["--version"], ["-v"]):
+    print("slirp4netns version 1.2.3\ncommit: fake")
+    print("libslirp: " + setting("slirp.libslirp", "4.4.0"))
+    print("SLIRP_CONFIG_VERSION_MAX: 3\nlibseccomp: 2.5.2")
+    sys.exit(0)
+
+FAIL = setting("slirp.fail")
+opts, pos = {}, []
+for a in args:
+    if a.startswith("--"):
+        k, _, v = a.partition("=")
+        opts[k] = v
+    else:
+        pos.append(a)
+log("argv " + repr(args))
+log("env " + repr(sorted(os.environ)))
+log("fds " + repr(sorted(int(x) for x in os.listdir("/proc/self/fd"))))
+log("sid==pid %s" % (os.getsid(0) == os.getpid()))
+for need in ("--configure", "--disable-host-loopback", "--cidr", "--ready-fd", "--exit-fd"):
+    if need not in opts:
+        sys.exit("fake slirp4netns: missing " + need)
+pid, tap = int(pos[0]), pos[1]
+net = opts["--cidr"].rsplit(".", 1)[0]
+guest = net + ".100"
+
+if FAIL == "delay":
+    time.sleep(2)
+if FAIL == "ready":
+    sys.exit("WARNING: fake failure before ready")
+
+try:
+    proxy = _nsproxy.NsProxy(pid)
+    for cmd in (
+        ["ip", "link", "set", "lo", "up"],
+        ["ip", "link", "add", tap, "type", "dummy"],
+        ["ip", "addr", "add", guest + "/24", "dev", tap],
+        ["ip", "link", "set", tap, "up"],
+    ):
+        r = proxy.run(cmd)
+        if r["rc"] != 0:
+            raise OSError(r["err"])
+except OSError as e:
+    sys.exit("fake slirp4netns: namespace setup failed: %s" % e)
+
+api = opts.get("--api-socket")
+if api:
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(api)
+    srv.listen()
+
+    def serve():
+        n = 0
+        while True:
+            c, _ = srv.accept()
+            data = b""
+            while True:
+                chunk = c.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            req = json.loads(data)
+            log("api " + json.dumps(req))
+            a = req.get("arguments", {})
+            try:
+                if FAIL == "api":
+                    raise OSError("fake: bind failed")
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((a.get("host_addr", "0.0.0.0"), a["host_port"]))
+                s.listen(16)
+                gp = a["guest_port"]
+                _nsproxy.forward(s, lambda gp=gp: proxy.connect(a.get("guest_addr", guest), gp))
+                n += 1
+                rep = {"return": {"id": n}}
+            except OSError as e:
+                rep = {"error": {"desc": str(e)}}
+            c.sendall(json.dumps(rep).encode())
+            c.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+
+ready = int(opts["--ready-fd"])
+os.write(ready, b"1")
+os.close(ready)
+log("ready")
+
+p = select.poll()
+p.register(int(opts["--exit-fd"]), select.POLLIN | select.POLLHUP)
+while True:
+    if any(e & select.POLLHUP for _, e in p.poll()):
+        break
+log("exit-fd hangup, exiting")

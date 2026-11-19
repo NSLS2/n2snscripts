@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Fake pasta for testing the bw* launchers without /dev/net/tun.
+
+Like the real one it closes inherited descriptors above 2, creates a user
+namespace (mapping the caller to uid 0) and a network namespace, starts the
+command in it and stays its parent, and forwards -t (host -> namespace
+interface address) and -T (namespace loopback -> host loopback) ports.  Like
+the real one (fwd_rule.c), -T and -U take no listening address: "-T ADDR/..."
+stops it with pasta's error.  With --dns-forward ADDR it answers DNS queries
+to ADDR:53 itself (every name is 192.0.2.10).  The namespace gets a dummy
+interface with 192.168.77.2 instead of a tap with the host's address.
+
+With --debug (and no --log-file, as the launchers run it) its debug lines go
+to stderr in pasta's stderr format (log.c vlogmsg): "T: message", with
+"Flow N (KIND): ..." state changes and endpoints plus timer noise, so the
+launcher's condenser can be tested against them.  Writes block, as pasta's
+do.  With --log-file they go to that file instead, with pasta's log file
+header and level column.  The failure mode is read from
+$FAKE_NET_DIR/pasta.fail (bind: refuse every -t port).
+"""
+
+import os
+import struct
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
+import _nsproxy  # noqa: E402
+
+NS_ADDR = "192.168.77.2"
+FAKE_DIR = os.environ.get("FAKE_NET_DIR", "/tmp/opencode/fakenet")
+
+args = sys.argv[1:]
+if args[:1] in (["--help"], ["-h"]):
+    print("Usage: pasta [OPTION]... [COMMAND [ARG]...]")
+    print("  --no-pidns		Don't spawn command in a new PID namespace")
+    sys.exit(0)
+if args[:1] == ["--version"]:
+    print("pasta fake-2026_10_02")
+    sys.exit(0)
+
+VALUE_OPTS = {"-t", "-u", "-T", "-U", "--dns-forward", "--search", "--log-file", "--log-size"}
+opts, fwd_t, fwd_T, cmd = {}, [], [], []
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "--":
+        cmd = args[i + 1 :]
+        break
+    if a in VALUE_OPTS:
+        v = args[i + 1]
+        if a == "-t" and v != "none":
+            fwd_t.append(v)
+        elif a == "-T" and v != "none":
+            fwd_T.append(v)
+        else:
+            opts[a] = v
+        i += 2
+        continue
+    opts[a] = True
+    i += 1
+if not cmd:
+    sys.exit("fake pasta: no command")
+for opt, specs in (("T", fwd_T), ("U", [opts.get("-U", "none")])):
+    for spec in specs:
+        if spec != "none" and "/" in spec:
+            sys.exit("0.0012: ERROR:   Listening address not allowed for -%s %s" % (opt, spec))
+
+os.closerange(3, 4096)
+
+log_fd = -1
+if "--debug" in opts:
+    if "--log-file" in opts:
+        log_fd = os.open(opts["--log-file"], os.O_CREAT | os.O_TRUNC | os.O_APPEND | os.O_RDWR, 0o600)
+        os.write(log_fd, ("pasta fake-2026_10_02: %s (%d)\n" % (os.path.realpath(__file__), os.getpid())).encode())
+    else:
+        log_fd = 2
+log_lock = threading.Lock()
+T0 = time.monotonic()
+_flow_ids = []
+
+
+def log(msg, level="        "):
+    if log_fd < 0:
+        return
+    if log_fd == 2:
+        line = "%.4f: %s\n" % (time.monotonic() - T0, msg)  # stderr: no level column
+    else:
+        line = "%.4f: %s  %s\n" % (time.monotonic() - T0, level, msg)
+    with log_lock:
+        try:
+            os.write(log_fd, line.encode())
+        except OSError:
+            pass
+
+
+def ep(a, p):
+    return "[%s]:%s" % (a, p)
+
+
+def flow_open(kind, ini, src, dst, tgt, tsrc, tdst):
+    with log_lock:
+        idx = next(i for i in range(len(_flow_ids) + 1) if i >= len(_flow_ids) or _flow_ids[i] is None)
+        if idx == len(_flow_ids):
+            _flow_ids.append(True)
+        _flow_ids[idx] = True
+    ends = "%s %s -> %s => %s %s -> %s" % (ini, ep(*src), ep(*dst), tgt, ep(*tsrc), ep(*tdst))
+    for line in (
+        "Flow %d (NEW): FREE -> NEW" % idx,
+        "Flow %d (INI): NEW -> INI" % idx,
+        "Flow %d (INI):     %s %s -> %s => ?" % (idx, ini, ep(*src), ep(*dst)),
+        "Flow %d (TGT): INI -> TGT" % idx,
+        "Flow %d (TGT):     %s" % (idx, ends),
+        "Flow %d (%s): TGT -> TYPED" % (idx, kind),
+        "Flow %d (%s):     %s" % (idx, kind, ends),
+        "Flow %d (%s): TYPED -> ACTIVE" % (idx, kind),
+        "Flow %d (%s): timer expires in 2.000s" % (idx, kind),
+    ):
+        log(line)
+    return (idx, kind, ends)
+
+
+def flow_close(token):
+    idx, kind, ends = token
+    log("Flow %d (%s): CLOSED" % (idx, kind))
+    log("Flow %d (FREE): ACTIVE -> FREE" % idx)
+    log("Flow %d (FREE):     %s" % (idx, ends))
+    with log_lock:
+        _flow_ids[idx] = None
+
+
+try:
+    FAIL = open(os.path.join(FAKE_DIR, "pasta.fail")).read().strip()
+except OSError:
+    FAIL = ""
+
+uid, gid = os.getuid(), os.getgid()
+ready_r, ready_w = os.pipe()
+go_r, go_w = os.pipe()
+child = os.fork()
+if child == 0:
+    os.close(ready_r)
+    os.close(go_w)
+    os.unshare(os.CLONE_NEWUSER | os.CLONE_NEWNET | os.CLONE_NEWUTS)
+    with open("/proc/self/setgroups", "w") as f:
+        f.write("deny")
+    with open("/proc/self/uid_map", "w") as f:
+        f.write("0 %d 1" % uid)
+    with open("/proc/self/gid_map", "w") as f:
+        f.write("0 %d 1" % gid)
+    import socket as _s
+
+    _s.sethostname("pasta-" + os.uname().nodename)
+    setup = [
+        ["ip", "link", "set", "lo", "up"],
+        ["ip", "link", "add", "eth0", "type", "dummy"],
+        ["ip", "addr", "add", NS_ADDR + "/24", "dev", "eth0"],
+        ["ip", "link", "set", "eth0", "up"],
+    ]
+    if "--dns-forward" in opts:
+        setup.append(["ip", "addr", "add", opts["--dns-forward"] + "/32", "dev", "lo"])
+    for c in setup:
+        if os.spawnvp(os.P_WAIT, c[0], c) != 0:
+            os._exit(1)
+    os.write(ready_w, b"1")
+    os.close(ready_w)
+    if os.read(go_r, 1) != b"1":
+        os._exit(1)  # pasta failed during setup: never start the command
+    os.close(go_r)
+    try:
+        os.execvp(cmd[0], cmd)
+    except OSError as e:
+        print("fake pasta: %s: %s" % (cmd[0], e), file=sys.stderr)
+        os._exit(127)
+os.close(ready_w)
+os.close(go_r)
+if os.read(ready_r, 1) != b"1":
+    print("fake pasta: namespace setup failed", file=sys.stderr)
+    sys.exit(1)
+proxy = _nsproxy.NsProxy(child)
+log("Template interface: eth0 (IPv4)", "info:  ")
+
+import socket  # noqa: E402
+
+for spec in fwd_t:
+    addr, _, ports = spec.rpartition("/")
+    pairs = []
+    for part in ports.split(","):
+        hports, _, gports = part.partition(":")
+        pairs += zip(_nsproxy.port_range(hports), _nsproxy.port_range(gports or hports))
+    for hp, gp in pairs:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            if FAIL == "bind":
+                raise OSError("fake: bind refused")
+            s.bind((addr or "0.0.0.0", hp))
+        except OSError as e:
+            print("Failed to bind port %d (%s) for option '-t %s', exiting" % (hp, e, spec), file=sys.stderr)
+            os.kill(child, 9)
+            sys.exit(1)
+        s.listen(16)
+        _nsproxy.forward(
+            s,
+            lambda gp=gp: proxy.connect(NS_ADDR, gp),
+            lambda peer, hp=hp, gp=gp, addr=addr: flow_open(
+                "TCP connection (spliced)", "HOST", peer, (addr, hp), "SPLICE", ("0.0.0.0", 0), (NS_ADDR, gp)
+            ),
+            flow_close,
+        )
+for spec in fwd_T:
+    ports = spec
+    pairs = []
+    for part in ports.split(","):
+        sports, _, hports = part.partition(":")
+        pairs += zip(_nsproxy.port_range(sports), _nsproxy.port_range(hports or sports))
+    for sp, hp in pairs:
+        s = proxy.listen("127.0.0.1", sp)
+        _nsproxy.forward(
+            s,
+            lambda hp=hp: socket.create_connection(("127.0.0.1", hp)),
+            lambda peer, sp=sp, hp=hp: flow_open(
+                "TCP connection (spliced)", "SPLICE", peer, ("127.0.0.1", sp), "HOST", ("0.0.0.0", 0), ("127.0.0.1", hp)
+            ),
+            flow_close,
+        )
+
+
+def dns_answer(query):
+    """Answer QUERY with A 192.0.2.10 (no records for other types)."""
+    tid, _, qd = struct.unpack("!HHH", query[:6])
+    off = 12
+    while query[off]:
+        off += 1 + query[off]
+    off += 5
+    qtype = struct.unpack("!H", query[off - 4 : off - 2])[0]
+    question = query[12:off]
+    if qtype == 1:
+        rr = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 60, 4) + socket.inet_aton("192.0.2.10")
+        return struct.pack("!HHHHHH", tid, 0x8180, 1, 1, 0, 0) + question + rr
+    return struct.pack("!HHHHHH", tid, 0x8180, 1, 0, 0, 0) + question
+
+
+def dns_loop(sock, addr):
+    while True:
+        query, peer = sock.recvfrom(4096)
+        token = flow_open("UDP flow", "TAP", peer, (addr, 53), "HOST", ("0.0.0.0", peer[1]), ("127.0.0.53", 53))
+        try:
+            sock.sendto(dns_answer(query), peer)
+        except (OSError, IndexError, struct.error):
+            pass
+        flow_close(token)
+
+
+if "--dns-forward" in opts:
+    threading.Thread(
+        target=dns_loop, args=(proxy.udp(opts["--dns-forward"], 53), opts["--dns-forward"]), daemon=True
+    ).start()
+
+os.write(go_w, b"1")
+os.close(go_w)
+_, status = os.waitpid(child, 0)
+log("pasta: child exited")
+sys.exit(os.waitstatus_to_exitcode(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status))
