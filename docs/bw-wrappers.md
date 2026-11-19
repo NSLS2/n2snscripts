@@ -801,8 +801,8 @@ into a directory the sandbox can write to (`~/Projects`, `~/.pixi`, `~/.npm`, a
 project environment): a file placed there would run on the host. What the
 launchers start themselves is kept apart: the sandbox and its network helper
 start under `env -i`, the `--serve-open` helper and browser with a minimal
-environment, and `bwopenchamber`'s Node version probe in a read-only sandbox of
-its own with an empty environment. Re-running the launcher under `env -i` would
+environment, and `bwopenchamber`'s Node version probe in a sandbox of its own
+with an empty environment and only the system and Node directories. Re-running the launcher under `env -i` would
 not help, as it needs variables from your shell (`DISPLAY`, the `BWOPENCODE2_*`
 options, `GH_TOKEN_*`).
 
@@ -1494,9 +1494,17 @@ library is a follow-up.
   path: `BWOPENCHAMBER_NODE=$(pixi exec -s nodejs=24 -- sh -c 'command -v node')`.
   To read a candidate's version the launcher runs `node --version`, but never on
   the host: the `node` on `PATH` can be in a directory the sandbox can write to
-  (`~/.pixi/bin`), so the probe runs in a sandbox of its own, with the whole file
-  system read-only, no network and an empty environment. A replaced `node` can
-  only print a version there; the one chosen then runs in the real sandbox.
+  (`~/.pixi/bin`), so the probe runs in a sandbox of its own with no network, an
+  empty environment and, read-only, only the system directories (`/usr`, `/bin`,
+  `/sbin`, `/lib`, `/lib64`, `/etc`), the candidate's own directory (and that of
+  the file it resolves to) and its environment's `lib` directory. It cannot see
+  the home directory, `/run` or `/tmp`, so none of your credentials, tokens or
+  Unix sockets (the D-Bus session bus, an ssh or gpg agent). A replaced `node`
+  can only print a version there; the one chosen then runs in the real sandbox.
+  A `node` directly in your home directory is not probed, and neither does a
+  `pixi global` trampoline in `~/.pixi/bin` work (it starts a `node` the probe
+  cannot see): name the real one with `BWOPENCHAMBER_NODE`, for example
+  `~/.pixi/envs/nodejs/bin/node`.
 - **OpenChamber** in `/opt/nsls2/openchamber` (`node_modules/@openchamber/web`),
   mounted read-only. `BWOPENCHAMBER_DIR` names another install. The ansible base
   role does not install it yet.

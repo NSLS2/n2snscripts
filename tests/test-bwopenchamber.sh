@@ -273,17 +273,40 @@ NODE="${T}/node/24.14.0"
 # ── a node is never run on the host ──────────────────────────────────────
 
 # The node on PATH can be in a directory the sandbox can write to (~/.pixi/bin).
-# Its version probe runs in a sandbox of its own: read-only, no network, empty
-# environment.  This one tries to leave a file and to read the environment, and
-# then prints a good version, so it is still chosen.
-mkdir -p "${T}/evil-node"
-printf '#!/bin/sh\ntouch "%s/node-ran-on-host" 2>/dev/null\nenv > "%s/node-env" 2>/dev/null\necho "v24.14.0"\n' "${T}" "${T}" > "${T}/evil-node/node"
+# Its version probe runs in a sandbox of its own: no network, empty environment,
+# only the system directories and the node's own, read-only.  This one tries to
+# leave a file, to write out its environment and to read a secret in the home
+# directory, the test's other files and /run; it prints a good version only when
+# all of that failed, so the launch succeeds only if the probe was confined.
+mkdir -p "${T}/evil-node" "${T}/home/.ssh"
+echo secret > "${T}/home/.ssh/id_test"
+echo other > "${T}/other-file"
+cat > "${T}/evil-node/node" << EOF
+#!/bin/sh
+touch "${T}/node-ran-on-host" 2> /dev/null
+env > "${T}/node-env" 2> /dev/null
+for f in "${T}/home/.ssh/id_test" "${T}/other-file"; do
+    [ -r "\$f" ] && { echo "v1.0.0"; exit 0; }
+done
+[ -d /run ] && [ -n "\$(ls -A /run 2> /dev/null)" ] && { echo "v1.0.1"; exit 0; }
+echo "v24.14.0"
+EOF
 chmod +x "${T}/evil-node/node"
-NODE="${T}/evil-node" run LD_PRELOAD= BASH_ENV="${T}/evil-node/bashrc" --
-check 'a node on PATH is still found and used' contains "${OUT}" "-- ${T}/evil-node/node "
-check '... but its version probe cannot write on the host' [ ! -e "${T}/node-ran-on-host" ]
+NODE="${T}/evil-node" run BASH_ENV="${T}/evil-node/bashrc" --
+check 'a node on PATH is probed in a confined sandbox and still used' contains "${OUT}" "-- ${T}/evil-node/node "
+check '... its probe cannot write on the host' [ ! -e "${T}/node-ran-on-host" ]
 check '... nor anything else' [ ! -e "${T}/node-env" ]
 rm -f "${T}/node-ran-on-host" "${T}/node-env"
+
+# A node directly in the home directory is not probed: the probe would have to
+# see the whole home directory.
+cp "${T}/node/24.14.0/node" "${T}/home/node"
+PATH_SAVE="${NODE}"
+NODE="${T}/home" run --
+check 'a node directly in the home directory is not probed' rc_is 1
+check '... and is listed without a version' contains "${ERR}" "${T}/home/node  (no version)"
+NODE="${PATH_SAVE}"
+rm -f "${T}/home/node"
 
 # ── which Node is used ───────────────────────────────────────────────────
 

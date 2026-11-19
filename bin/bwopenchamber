@@ -322,20 +322,56 @@ och_check_args() {
 # The candidates come from PATH and from directories the sandbox may be able to
 # write to (~/.pixi/bin is read-write inside it, and pixi global installs node
 # there), and the launcher runs on the host.  So BIN is never run on the host:
-# `--version` runs in a sandbox of its own, with the whole file system read-only,
-# no network and an empty environment (env -i, also for bwrap itself).  A
-# replaced node can only print a version there; the one chosen then runs in the
-# real sandbox like any tool.  _OCH_PROBE_BWRAP and _OCH_PROBE_ENV are set by
-# och_resolve_node.
+# `--version` runs in a sandbox of its own (och_probe_args) that has no network,
+# an empty environment (env -i, also for bwrap itself) and only the system
+# directories and BIN's own directories, read-only: not the home directory,
+# /run or /tmp, so none of the host's credentials, tokens or Unix sockets (the
+# D-Bus session bus, an ssh or gpg agent).  A replaced node can only print a
+# version there; the one chosen then runs in the real sandbox like any tool.
+# _OCH_PROBE_BWRAP and _OCH_PROBE_ENV are set by och_resolve_node.
 och_node_version() {
     local _v
+    local -a _args=()
+    och_probe_args "$1" || return 1
     _v="$("${_OCH_PROBE_ENV}" -i PATH=/usr/bin:/bin \
-        "${_OCH_PROBE_BWRAP}" --ro-bind / / --dev /dev --proc /proc \
-        --unshare-all --die-with-parent -- "$1" --version 2> /dev/null < /dev/null)" || return 1
+        "${_OCH_PROBE_BWRAP}" "${_args[@]}" -- "$1" --version 2> /dev/null < /dev/null)" || return 1
     _v="${_v%%$'\n'*}"
     _v="${_v#v}"
     [[ "${_v}" =~ ^[0-9]+\.[0-9]+ ]] || return 1
     printf '%s' "${_v}"
+}
+
+# What the Node version probe may see: the system directories, the directory of
+# BIN as given and of the file it resolves to, and that file's PREFIX/lib (the
+# layout of a conda or pixi environment, PREFIX/bin/node next to PREFIX/lib),
+# all read-only.  Never the home directory itself or a directory above it: a
+# node directly in one of those is not probed (it shows as "no version").  A
+# pixi global trampoline in ~/.pixi/bin starts a node the probe cannot see, so
+# it is not found either; BWOPENCHAMBER_NODE can name the node in
+# ~/.pixi/envs/nodejs/bin instead.
+OCH_PROBE_SYSTEM=(/usr /bin /sbin /lib /lib64 /etc)
+
+# och_probe_args BIN: set _args (the caller's local) to the bwrap arguments for
+# probing BIN.  Fails when BIN cannot be resolved or sits in the home directory
+# or above it.
+och_probe_args() {
+    local _real _p _d _hdir
+    _real="$(/usr/bin/readlink -f -- "$1" 2> /dev/null)" || return 1
+    [[ -n "${_real}" && "$1" == /* ]] || return 1
+    _hdir="$(/usr/bin/readlink -f -- "${HOME:-/nonexistent}" 2> /dev/null)" || _hdir="${HOME:-/nonexistent}"
+    _args=(--unshare-all --die-with-parent --new-session --dev /dev --proc /proc --tmpfs /tmp)
+    for _d in "${OCH_PROBE_SYSTEM[@]}"; do
+        [[ -e "${_d}" ]] && _args+=(--ro-bind "${_d}" "${_d}")
+    done
+    for _p in "${1%/*}" "${_real%/*}"; do
+        _p="$(/usr/bin/readlink -f -- "${_p:-/}" 2> /dev/null)" || return 1
+        # The home directory, or a directory above it (/ included).
+        [[ "${_hdir}/" != "${_p%/}/"* ]] || return 1
+        _args+=(--ro-bind "${_p}" "${_p}")
+    done
+    _d="${_real%/*}"
+    _d="${_d%/*}/lib"
+    [[ ! -d "${_d}" || "${_hdir}/" == "${_d}/"* ]] || _args+=(--ro-bind "${_d}" "${_d}")
 }
 
 # och_node_ok VERSION: true when VERSION is at least the minimum OpenChamber needs.
