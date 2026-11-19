@@ -319,9 +319,19 @@ och_check_args() {
 }
 
 # och_node_version BIN: print BIN's Node.js version (MAJOR.MINOR.PATCH), or fail.
+# The candidates come from PATH and from directories the sandbox may be able to
+# write to (~/.pixi/bin is read-write inside it, and pixi global installs node
+# there), and the launcher runs on the host.  So BIN is never run on the host:
+# `--version` runs in a sandbox of its own, with the whole file system read-only,
+# no network and an empty environment (env -i, also for bwrap itself).  A
+# replaced node can only print a version there; the one chosen then runs in the
+# real sandbox like any tool.  _OCH_PROBE_BWRAP and _OCH_PROBE_ENV are set by
+# och_resolve_node.
 och_node_version() {
     local _v
-    _v="$("$1" --version 2> /dev/null)" || return 1
+    _v="$("${_OCH_PROBE_ENV}" -i PATH=/usr/bin:/bin \
+        "${_OCH_PROBE_BWRAP}" --ro-bind / / --dev /dev --proc /proc \
+        --unshare-all --die-with-parent -- "$1" --version 2> /dev/null < /dev/null)" || return 1
     _v="${_v%%$'\n'*}"
     _v="${_v#v}"
     [[ "${_v}" =~ ^[0-9]+\.[0-9]+ ]] || return 1
@@ -352,6 +362,8 @@ och_version_newer() {
 och_resolve_node() {
     local _c _v _dir _best="" _best_v="" _f _path_node=""
     local -a _cands=() _tried=()
+    _OCH_PROBE_BWRAP="$(resolve_bwrap_bin)" || exit 1
+    _OCH_PROBE_ENV="$(resolve_env_bin)" || exit 1
 
     if [[ -n "${BWOPENCHAMBER_NODE:-}" ]]; then
         _cands=("${BWOPENCHAMBER_NODE}")

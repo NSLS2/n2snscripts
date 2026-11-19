@@ -49,11 +49,6 @@ for _b in google-chrome chromium xdg-open firefox; do
     chmod 755 "${T}/bin/${_b}"
 done
 
-# xdg-mime: prints the default browser registered for http in the test, if any (the
-# file default-browser holds its name, https-only-browser the one for https only).
-printf '#!/bin/sh\n[ "$3" = x-scheme-handler/http ] && cat "%s/default-browser" 2>/dev/null\n' "${T}" > "${T}/bin/xdg-mime"
-chmod 755 "${T}/bin/xdg-mime"
-
 # run [VAR=VALUE ...] -- ARGS...: dry-run the launcher; sets OUT, ERR, RC.  A
 # desktop session is assumed (DISPLAY) unless the caller sets DISPLAY= ; the
 # harness looks for browsers only in the stub directory, as the test user, so
@@ -153,26 +148,13 @@ check 'WAYLAND_DISPLAY alone counts as a desktop session' contains "${ERR}" 'wil
 # ── --serve-open: no browser installed (a workstation without one) ──────
 
 # HARNESS_SERVE_OPEN_CANDIDATES= : none of the usual browsers is installed.  The
-# stub xdg-open is on PATH, as the real one is on a GNOME host, but no default
-# browser is registered: xdg-open would hand the link to the text editor.
-rm -f "${T}/default-browser"
+# stub xdg-open is in the browser directory, as the real one is on a GNOME host:
+# it is not used, the desktop's default browser is never started.
 run HARNESS_SERVE_OPEN_CANDIDATES= -- --serve --serve-open
-check 'no browser and no default browser: still a normal launch' rc_is 0
+check 'no browser installed: still a normal launch' rc_is 0
 check '... nothing will be opened, and why' contains "${ERR}" 'nothing will be opened (no web browser found'
-check '... xdg-open is not used' lacks "${ERR}" 'xdg-open'
+check '... xdg-open is not used' lacks "${ERR}" "${T}/bin/xdg-open"
 check '... and no browser ran' [ ! -e "${T}/ran-xdg-open" ]
-
-echo 'firefox.desktop' > "${T}/default-browser"
-run HARNESS_SERVE_OPEN_CANDIDATES= -- --serve --serve-open
-check 'a registered default browser is reached through xdg-open' contains "${ERR}" "${T}/bin/xdg-open http://127."
-check '... without --app' lacks "${ERR}" '--app='
-rm -f "${T}/default-browser"
-
-# A default browser for https only: the link is http, so it does not count.
-printf '#!/bin/sh\n[ "$3" = x-scheme-handler/https ] && echo firefox.desktop\n' > "${T}/bin/xdg-mime"
-run HARNESS_SERVE_OPEN_CANDIDATES= -- --serve --serve-open
-check 'a default browser for https only is not used for the http link' contains "${ERR}" 'nothing will be opened (no web browser found'
-printf '#!/bin/sh\n[ "$3" = x-scheme-handler/http ] && cat "%s/default-browser" 2>/dev/null\n' "${T}" > "${T}/bin/xdg-mime"
 
 run HARNESS_SERVE_OPEN_CANDIDATES=firefox -- --serve --serve-open
 check 'firefox is used when it is installed' contains "${ERR}" "${T}/bin/firefox http://127."
@@ -243,12 +225,6 @@ run HARNESS_SERVE_OPEN_CANDIDATES=linked-firefox -- --serve-open
 check 'a symlink to a file in a writable directory is not' contains "${ERR}" 'nothing will be opened (no web browser found'
 chmod 755 "${T}/real"
 rm -f "${T}/bin/linked-firefox"
-
-# 6. xdg-open and xdg-mime are found the same way.
-echo 'firefox.desktop' > "${T}/default-browser"
-run HARNESS_SERVE_OPEN_CANDIDATES= HARNESS_SERVE_OPEN_DIRS="${T}/sys" PATH="${T}/bin:${PATH}" -- --serve-open
-check 'xdg-mime and xdg-open on PATH only are not used' contains "${ERR}" 'nothing will be opened (no web browser found'
-rm -f "${T}/default-browser"
 
 # 7. The real rule.  The first two keep the stub directory (the test user's
 # stubs are not owned by root, so they are refused) so the host's own browsers

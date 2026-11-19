@@ -270,6 +270,21 @@ NODE="${T}/node/25.1.0" run --
 check 'Node 25 is accepted' rc_is 0
 NODE="${T}/node/24.14.0"
 
+# ── a node is never run on the host ──────────────────────────────────────
+
+# The node on PATH can be in a directory the sandbox can write to (~/.pixi/bin).
+# Its version probe runs in a sandbox of its own: read-only, no network, empty
+# environment.  This one tries to leave a file and to read the environment, and
+# then prints a good version, so it is still chosen.
+mkdir -p "${T}/evil-node"
+printf '#!/bin/sh\ntouch "%s/node-ran-on-host" 2>/dev/null\nenv > "%s/node-env" 2>/dev/null\necho "v24.14.0"\n' "${T}" "${T}" > "${T}/evil-node/node"
+chmod +x "${T}/evil-node/node"
+NODE="${T}/evil-node" run LD_PRELOAD= BASH_ENV="${T}/evil-node/bashrc" --
+check 'a node on PATH is still found and used' contains "${OUT}" "-- ${T}/evil-node/node "
+check '... but its version probe cannot write on the host' [ ! -e "${T}/node-ran-on-host" ]
+check '... nor anything else' [ ! -e "${T}/node-env" ]
+rm -f "${T}/node-ran-on-host" "${T}/node-env"
+
 # ── which Node is used ───────────────────────────────────────────────────
 
 # A side-by-side node-24 is found when PATH's node is too old (RHEL 10: nodejs 22 is

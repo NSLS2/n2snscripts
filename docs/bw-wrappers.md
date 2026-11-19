@@ -1334,7 +1334,7 @@ bwopencode2 --serve-open [--serve-port N]
   ```
 
   The helper decides after starting the browser: one that exits with an error
-  within 8 seconds (`xdg-open` with no handler, a browser that cannot start)
+  within 8 seconds (a browser that cannot start)
   counts as not opened, and one still running, or that exited 0 (Chrome handing
   the link to a window that is already open), counts as opened. A browser that
   fails later is not noticed. The fallback link is a **new** code, because a
@@ -1347,21 +1347,18 @@ bwopencode2 --serve-open [--serve-port N]
   described above, unchanged.
 - **Which browser.** The first of `google-chrome`, `google-chrome-stable`,
   `chromium`, `chromium-browser` found, started as `BROWSER
-  --app=LINK` (an app window); else `firefox LINK`; else `xdg-open LINK`, but
-  only when a default web browser is registered for `http`, the scheme of the
-  link (`xdg-mime query default x-scheme-handler/http` prints one). Without one `xdg-open` does not fail: on
-  GNOME it opens the link in the text editor, which shows "Could Not Open File,
-  HTTP Client Error: Unauthorized" and has used up the one-time link (seen on a
-  workstation with no browser installed, and the reason for this rule).
-  A browser whose name contains `chrom`, `edge` or `brave` gets `--app=`, any
-  other (`firefox`, `xdg-open`) gets the plain link. You cannot name another
-  browser: a path given by the caller would have to be checked up to the root
-  of the file system, and the choice is not worth that.
+  --app=LINK` (an app window); else `firefox LINK`. No other browser is ever
+  started, and neither is the desktop's default browser: `xdg-open` runs
+  whatever `~/.config/mimeapps.list` and a `.desktop` file name, which the
+  launcher cannot check (a handler you registered could point into a directory
+  the sandbox can write to). You cannot name another browser either: a path
+  given by the caller would have to be checked up to the root of the file
+  system. Without one of the five, the link is printed to open by hand.
 - **Where the browser may come from.** The browser starts on the host, outside
   the sandbox, so it is **never looked up on `PATH`**: that can include a
   directory the sandbox can write to (an activated project environment,
   `~/.pixi`), and a `chromium` planted there would run outside the sandbox.
-  Names (the list above, `xdg-open`, `xdg-mime`) are looked up in `/usr/bin`,
+  The names above are looked up in `/usr/bin`,
   `/usr/local/bin` and `/snap/bin`, in that order. A program is used only if
   it is owned by root and not writable by group or others, and so are the file
   it resolves to through symlinks (`/usr/bin/google-chrome` goes through
@@ -1377,7 +1374,7 @@ bwopencode2 --serve-open [--serve-port N]
   `DBUS_SESSION_BUS_ADDRESS`, whatever the launcher's environment holds. Your
   shell can point `LD_PRELOAD`, `LD_LIBRARY_PATH` (an activated project
   environment sets it), `BASH_ENV`, `ENV` (read by a shell script such as
-  Chrome's start-up script), `BROWSER` (read by `xdg-open`) or `XDG_DATA_DIRS`
+  Chrome's start-up script), `BROWSER` or `XDG_DATA_DIRS`
   into a directory the sandbox can write to, and a file there would run outside
   the sandbox. A browser that needs another variable does not get it: the
   window may open without your theme or proxy settings.
@@ -1479,6 +1476,11 @@ library is a follow-up.
   qualifies, the error lists what it found with versions and says what to do. To
   use a Node from elsewhere, for example pixi, set `BWOPENCHAMBER_NODE` to its
   path: `BWOPENCHAMBER_NODE=$(pixi exec -s nodejs=24 -- sh -c 'command -v node')`.
+  To read a candidate's version the launcher runs `node --version`, but never on
+  the host: the `node` on `PATH` can be in a directory the sandbox can write to
+  (`~/.pixi/bin`), so the probe runs in a sandbox of its own, with the whole file
+  system read-only, no network and an empty environment. A replaced `node` can
+  only print a version there; the one chosen then runs in the real sandbox.
 - **OpenChamber** in `/opt/nsls2/openchamber` (`node_modules/@openchamber/web`),
   mounted read-only. `BWOPENCHAMBER_DIR` names another install. The ansible base
   role does not install it yet.

@@ -89,7 +89,7 @@
 # --serve-open is --serve plus opening the signed-in web UI on the SAME host: a
 # helper on the host (outside the sandbox) waits for the server, asks it for
 # its own one-time sign-in link and starts google-chrome --app=LINK (or
-# chromium, else firefox or the registered default browser), found in the
+# chromium, else firefox), found in the
 # system directories only and only when root owns it (see serve_open_trusted).
 # Never started without the option; --serve on its own opens nothing.
 #
@@ -396,8 +396,8 @@ Wrapper options (consumed before opencode2 sees the command line):
                   --serve alone opens nothing).  The browser is started outside the sandbox
                   with a one-time link of its own: google-chrome --app=LINK (an
                   app window), else google-chrome-stable, chromium,
-                  chromium-browser, else firefox LINK, else xdg-open LINK but only
-                  when a default web browser is registered (xdg-mime).
+                  chromium-browser, else firefox LINK.  No other browser is used
+                  (not the desktop's default browser).
                   The browser is looked up in /usr/bin, /usr/local/bin and /snap/bin
                   only (never on PATH, which can hold a directory the sandbox can
                   write to) and must be owned by root and not writable by group or
@@ -1003,13 +1003,15 @@ serve_print_info() {
 # after 5 minutes, and the published address already accepts connections from
 # every local user, with the password as the only protection.
 
-# Browsers tried, in order; then the default browser through xdg-open (see
-# serve_open_default_browser).  There is no way to name another one: a path
-# given by the caller would have to be checked up to the root, and the choice is
-# not worth that.
+# Browsers tried, in order, and the only ones ever started.  There is no way to
+# name another one: a path given by the caller would have to be checked up to
+# the root.  The desktop's default browser (xdg-open) is not used either: it
+# runs whatever ~/.config/mimeapps.list and a .desktop file name, which this
+# launcher cannot check.  Without one of these, the link is printed to open by
+# hand.
 SERVE_OPEN_CANDIDATES=(google-chrome google-chrome-stable chromium chromium-browser firefox)
 
-# Where the browser (and xdg-open, xdg-mime) may come from.  The browser is
+# Where the browser may come from.  The browser is
 # started on the host, outside the sandbox, so it is never looked up on PATH:
 # that can include a directory the sandbox can write to (an activated project
 # environment, ~/.pixi), and a program planted there would run outside the
@@ -1059,17 +1061,6 @@ serve_open_find() {
     return 1
 }
 
-# True when a default web browser is registered for http, the scheme of the link
-# (it is on 127.H1.H2.1, without TLS).  Without one, xdg-open does not fail: it
-# hands the link to whatever opens a URL as a file (on GNOME, the text editor),
-# which would also use up the one-time link.
-serve_open_default_browser() {
-    local _h _x
-    _x="$(serve_open_find xdg-mime)" || return 1
-    _h="$("${_x}" query default x-scheme-handler/http 2> /dev/null)" || return 1
-    [[ -n "${_h}" ]]
-}
-
 # Choose the browser: sets SERVE_OPEN_BIN (empty when nothing will be opened,
 # with SERVE_OPEN_WHY saying why) and SERVE_OPEN_APP (1 for Chromium-based
 # browsers, which take --app=URL).  Only programs serve_open_find accepts.
@@ -1086,11 +1077,8 @@ serve_open_pick_browser() {
         _b="$(serve_open_find "${_cand}")" && break
         _b=""
     done
-    if [[ -z "${_b}" ]] && serve_open_default_browser; then
-        _b="$(serve_open_find xdg-open)" || _b=""
-    fi
     if [[ -z "${_b}" ]]; then
-        SERVE_OPEN_WHY="no web browser found: none of ${SERVE_OPEN_CANDIDATES[*]-} is installed in ${SERVE_OPEN_DIRS[*]-} (owned by root) and no default browser is registered"
+        SERVE_OPEN_WHY="no web browser found: none of ${SERVE_OPEN_CANDIDATES[*]-} is installed in ${SERVE_OPEN_DIRS[*]-} (owned by root)"
         return 0
     fi
     SERVE_OPEN_BIN="${_b}"
@@ -1114,7 +1102,7 @@ serve_request_code() {
 }
 
 # How long the helper waits for a browser it started: one that exits with an
-# error within this time (xdg-open with no handler, a browser that cannot start)
+# error within this time (a browser that cannot start)
 # counts as not opened.  One still running, or that exited 0 (Chrome handing the
 # link to a window that is already open), counts as opened.
 SERVE_OPEN_WAIT_SECONDS=8
@@ -1237,7 +1225,7 @@ serve_open_close_fds() {
 # the browser run outside the sandbox, and the launcher's environment can point
 # into a directory the sandbox can write to: LD_PRELOAD and LD_LIBRARY_PATH (an
 # activated project environment sets the second), BASH_ENV and ENV (read by a
-# shell script such as Chrome's start-up script), BROWSER (read by xdg-open),
+# shell script such as Chrome's start-up script), BROWSER,
 # XDG_*_DIRS and the like.  Only what a desktop program needs is passed on.
 serve_open_clean_env() {
     local -a _e=(PATH=/usr/bin:/bin)
