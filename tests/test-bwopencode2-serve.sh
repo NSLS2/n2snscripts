@@ -268,17 +268,27 @@ run HARNESS_SERVE_OPEN_CANDIDATES= HARNESS_SERVE_OPEN_DIRS="${T}/sys" PATH="${T}
 check 'xdg-mime and xdg-open on PATH only are not used' contains "${ERR}" 'nothing will be opened (no web browser found'
 rm -f "${T}/default-browser"
 
-# 7. The real rule: the test user's stubs are not owned by root, and the
-# system directories (not the stub directory) are searched.
-run HARNESS_SERVE_OPEN_DIRS= HARNESS_SERVE_OPEN_UID=0 -- --serve-open
+# 7. The real rule.  The first two keep the stub directory (the test user's
+# stubs are not owned by root, so they are refused) so the host's own browsers
+# do not change the result.
+run HARNESS_SERVE_OPEN_UID=0 -- --serve-open
 check 'files not owned by root are refused under the real rule' contains "${ERR}" 'nothing will be opened (no web browser found'
-check '... and the default directories are named' contains "${ERR}" '/usr/bin /usr/local/bin /snap/bin'
 run HARNESS_SERVE_OPEN_UID=0 BWOPENCODE2_SERVE_BROWSER=chromium -- --serve-open
 check 'a named browser not owned by root is refused' rc_is 1
-SYSBROWSER="$(command -v google-chrome chromium chromium-browser firefox 2> /dev/null | head -1)"
-if [[ "${SYSBROWSER}" == /usr/bin/* && "$(stat -c %u "$(readlink -f "${SYSBROWSER}")")" == 0 ]]; then
+# With the real directories and owner (the host's own browsers count, so this runs
+# only where one is installed): a root-owned one in a system directory is started.
+_have=0
+for _b in google-chrome google-chrome-stable chromium chromium-browser firefox; do
+    for _d in /usr/bin /usr/local/bin /snap/bin; do
+        [[ -x "${_d}/${_b}" ]] || continue
+        _t="$(readlink -f "${_d}/${_b}")"
+        [[ "$(stat -c %u "${_t}")" == 0 ]] && _have=1
+    done
+done
+if [[ "${_have}" -eq 1 ]]; then
     run HARNESS_SERVE_OPEN_DIRS= HARNESS_SERVE_OPEN_UID= -- --serve-open
-    check 'with the real directories and owner, a system browser is found' contains "${ERR}" "${SYSBROWSER}"
+    check 'with the real directories and owner, a system browser is found' \
+        grep -qE '(/usr/bin|/usr/local/bin|/snap/bin)/[a-z-]+ (--app=)?http://127\.' <<< "${ERR}"
 fi
 
 # ── nothing else changed ─────────────────────────────────────────────────
