@@ -1189,6 +1189,7 @@ reachable from a browser.
 ```text
 bwopencode2 --serve [--serve-port N]
 bwopencode2 --serve-open [--serve-port N]
+bwopencode2 --serve-headless --serve-port N
 bwopencode2 --serve-ssh-config
 ```
 
@@ -1443,14 +1444,46 @@ a backslash; a new code on Enter through a pseudo-terminal; no spinning at end
 of input; a failed pairing) and the host helper against a stub browser (the
 `--app=` link, the plain link, the login page when no link came, a launcher
 that has gone, a helper that survives the launcher's `exec`, nothing on
-`--dry-run`); `tests/test-bwopencode2-serve.sh` makes 57 checks through
-`--dry-run` (arguments, browser choice, no display). Not checked, because it
+`--dry-run`); `tests/test-bwopencode2-serve.sh` checks through
+`--dry-run` (arguments, browser choice, no display, `--serve-headless`). Not checked, because it
 needs a real launch and a browser: that Chrome opens an app window signed in,
 Enter at a terminal inside `bwrap --new-session`, and the helper's output on a
 terminal. A real launch on a workstation with no browser, with a stand-in
 browser script, showed the helper starting it once the server answered, with
 the link of its own; that the link redirects to `/` with the cookie was
 checked with `curl` against a throwaway server (see "Only a browser signs in").
+
+#### `--serve-headless`: the server for another program
+
+For a program on the same host that connects to the published port itself and
+signs in with a password it chose: the JupyterHub single-user server extension
+in NSLS2/n2snassistant, which puts the web UI behind the Hub through
+jupyter-server-proxy.
+
+```text
+BWOPENCODE2_SERVE_PASSWORD=... BWOPENCODE2_SERVE_PORTS=P-P bwopencode2 --serve-headless --serve-port P
+```
+
+- **The same server, no wrapper.** The sandbox runs `opencode2 serve` directly
+  on the published address and port, with the same mounts, network and
+  database guard as `--serve`. No pairing link is made, nothing is read from
+  the terminal, nothing is printed but one start line (no password in it).
+  The caller signs in with Basic auth (user `opencode`) on every request.
+- **The password must be given.** `BWOPENCODE2_SERVE_PASSWORD` is required
+  (same rules as for `--serve`): a random one would be known to nobody.
+- **Its own database.** The data directory is
+  `~/.local/share/opencode2/opencode-web` instead of
+  `~/.local/share/opencode2/opencode`, under the same
+  [database guard](#database-guard). OpenCode 2 runs SQLite in WAL mode, which
+  does not work across hosts over NFS, and the guard would otherwise refuse the
+  web server while a terminal session runs on another host (or the reverse).
+  Configuration, skills, agents and commands are shared; sessions, saved
+  sign-ins and project dotfiles are not.
+- **Port.** The caller usually pins one port (`BWOPENCODE2_SERVE_PORTS=P-P`
+  and `--serve-port P`), chosen free on the caller's side; the launcher checks
+  and claims it as for `--serve`. The ssh range and alias are not involved.
+- **Limits.** Not with `--serve-open` (nothing is opened for another program);
+  otherwise as `--serve`.
 
 ## `bwopenchamber`
 

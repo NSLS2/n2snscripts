@@ -93,6 +93,15 @@
 # system directories only and only when root owns it (see serve_open_trusted).
 # Never started without the option; --serve on its own opens nothing.
 #
+# --serve-headless is --serve for another program (a JupyterHub single-user
+# server through jupyter-server-proxy, see NSLS2/n2snassistant): the caller
+# gives the password (BWOPENCODE2_SERVE_PASSWORD, required) and usually pins
+# the port (BWOPENCODE2_SERVE_PORTS=P-P --serve-port P), `opencode2 serve` runs
+# directly (no sign-in links, no password printed, nothing read from stdin),
+# and the data directory is ~/.local/share/opencode2/opencode-web, under the
+# same database guard, so the web server never shares a SQLite database with
+# a terminal session on another host.
+#
 # Usage:
 #   bwopencode2 [bwopencode2-options] [opencode2 arguments...]
 #   bwopencode2 --help
@@ -113,6 +122,10 @@
 #                   first free one.
 #   --serve-open    Like --serve, and also open the web UI, already signed in, in a
 #                   browser on this host (see above).  --serve alone opens nothing.
+#   --serve-headless
+#                   Like --serve, for a program that connects to the published port
+#                   itself: fixed password from the environment, no output but one
+#                   start line, own data directory (see above).
 #   --serve-ssh-config
 #                   Print the ssh_config block that forwards the whole port range, then
 #                   exit.
@@ -196,6 +209,7 @@ OC2_CONFIG_BINDS=()
 # (see build_opencode2_env) and is never written to a file.
 SERVE=0
 SERVE_OPEN=0
+SERVE_HEADLESS=0
 SERVE_OPEN_BIN=""
 SERVE_OPEN_APP=0
 SERVE_OPEN_WHY=""
@@ -274,6 +288,11 @@ parse_wrapper_args() {
             --serve-open)
                 SERVE=1
                 SERVE_OPEN=1
+                shift
+                ;;
+            --serve-headless)
+                SERVE=1
+                SERVE_HEADLESS=1
                 shift
                 ;;
             --serve-port)
@@ -405,6 +424,17 @@ Wrapper options (consumed before opencode2 sees the command line):
                   and says so, when neither DISPLAY nor WAYLAND_DISPLAY is set or no
                   browser is found.  Not for use over ssh from another machine: use
                   the printed ssh command there.
+  --serve-headless
+                  The server for another program, which connects to the published
+                  port itself (a JupyterHub single-user server through
+                  jupyter-server-proxy): the same sandboxed `opencode2 serve` as
+                  --serve, but the password must come from BWOPENCODE2_SERVE_PASSWORD
+                  (nothing is printed, no sign-in link is made, nothing is read from
+                  the terminal), and the data directory is
+                  ~/.local/share/opencode2/opencode-web (its own database, under the
+                  same guard), so a terminal session elsewhere and the web server
+                  never share one.  Pin the port with BWOPENCODE2_SERVE_PORTS=P-P and
+                  --serve-port P.  Not with --serve-open.
   --serve-ssh-config
                   Print the ssh_config block (one alias, one LocalForward per port
                   of the range, to your address 127.H1.H2.1) for the machine your
@@ -595,6 +625,16 @@ serve_check_args() {
             exit 1
         fi
         SERVE_PORT_REQUEST=$((10#${SERVE_PORT_REQUEST}))
+    fi
+    if [[ "${SERVE_HEADLESS}" -eq 1 ]]; then
+        if [[ "${SERVE_OPEN}" -eq 1 ]]; then
+            echo "Error: --serve-headless cannot be combined with --serve-open (nothing is opened for another program)." >&2
+            exit 1
+        fi
+        if [[ -z "${BWOPENCODE2_SERVE_PASSWORD:-}" ]]; then
+            echo "Error: --serve-headless needs the password in BWOPENCODE2_SERVE_PASSWORD (nothing is printed, so a random one would be unknown)." >&2
+            exit 1
+        fi
     fi
     if [[ "${SERVE_OPEN}" -eq 1 ]]; then
         serve_open_pick_browser
@@ -936,6 +976,13 @@ serve_prepare() {
         # shellcheck disable=SC2034  # read by bwrap_sandbox_lib.sh
         NET_PUBLISH_ADDR_FIXED_BY="--serve"
     fi
+    if [[ "${SERVE_HEADLESS}" -eq 1 ]]; then
+        # Another program connects and signs in with the password it chose:
+        # the server itself, no wrapper, no link, nothing on stdin.
+        _TOOL_CMD=("${_TOOL_BIN}" serve --hostname "${SERVE_BIND}" --port "${SERVE_PORT}")
+        TOOL_ARGS=()
+        return 0
+    fi
     local _mode=full
     if [[ "${SERVE_OPEN}" -eq 1 ]]; then
         # The host helper opens the browser and reports; without one, the wrapper
@@ -956,6 +1003,12 @@ serve_print_info() {
     if [[ "${NET_SHARE}" -eq 0 && "${_NET_PUBLISH_ADDR_EFFECTIVE}" != "${_addr}" ]]; then
         echo "Error: --serve: the port was published on ${_NET_PUBLISH_ADDR_EFFECTIVE}, not ${_addr}." >&2
         exit 1
+    fi
+    if [[ "${SERVE_HEADLESS}" -eq 1 ]]; then
+        # One line, nothing secret: the caller knows the password and the port.
+        printf 'bwopencode2: starting the sandboxed OpenCode 2 web UI on %s:%s (headless, for another program on this host)\n' \
+            "${_addr}" "${SERVE_PORT}" >&2
+        return 0
     fi
     if [[ "${SERVE_OPEN}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
         # One line: the host helper reports whether the browser opened, and the
@@ -1403,6 +1456,13 @@ resolve_opencode2_paths() {
     # from OpenCode 1 on the host.
     OC2_CONFIG_SRC="${_HOME}/.config/opencode2/opencode"
     OC2_DATA_SRC="${_HOME}/.local/share/opencode2/opencode"
+    # The headless web server keeps its own database: OpenCode 2 runs SQLite in
+    # WAL mode, which breaks across hosts, and the guard would otherwise refuse
+    # the web server while a terminal session runs elsewhere (or the reverse).
+    # Configuration, skills and agents are shared; sessions are not.
+    if [[ "${SERVE_HEADLESS}" -eq 1 ]]; then
+        OC2_DATA_SRC="${_HOME}/.local/share/opencode2/opencode-web"
+    fi
     OC2_CACHE_SRC="${_HOME}/.cache/opencode2/opencode"
     OC2_TUI_STATE_SRC="${_HOME}/.local/state/opencode2/opencode/latest/tui"
 
@@ -1783,7 +1843,7 @@ build_opencode2_context() {
     )
     if [[ "${SERVE}" -eq 1 ]]; then
         SANDBOX_CONTEXT_NOTES+=(
-            "This session is a sandboxed \`opencode2 serve\` (the OpenCode web UI) on port ${SERVE_PORT}, started by \`bwopencode2 --serve\`; the user reaches it through the published port. Do not start or connect to any other OpenCode server."
+            "This session is a sandboxed \`opencode2 serve\` (the OpenCode web UI) on port ${SERVE_PORT}, started by \`bwopencode2 --serve$([[ "${SERVE_HEADLESS}" -eq 1 ]] && echo -headless)\`; the user reaches it through the published port. Do not start or connect to any other OpenCode server."
         )
     fi
     build_sandbox_context bwopencode2
