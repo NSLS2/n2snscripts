@@ -145,6 +145,33 @@ check '... and names no browser' lacks "${ERR}" '--app='
 run DISPLAY= WAYLAND_DISPLAY=wayland-0 -- --serve --serve-open
 check 'WAYLAND_DISPLAY alone counts as a desktop session' contains "${ERR}" 'will be started on this host'
 
+# ── --serve-headless: the server for another program ────────────────────
+
+run -- --serve-headless --serve-port 24703
+check '--serve-headless without a password is refused' rc_is 1
+check '... and says why' contains "${ERR}" 'needs the password in BWOPENCODE2_SERVE_PASSWORD'
+
+run BWOPENCODE2_SERVE_PASSWORD=a-fixed-password-123 BWOPENCODE2_SERVE_PORTS=24703-24703 -- --serve-headless --serve-port 24703
+check 'a headless launch with a fixed password and a pinned port succeeds' rc_is 0
+check '... says it is starting, headless, and where' contains "${ERR}" 'web UI on 127.'
+check '... and that it is for another program' contains "${ERR}" 'headless, for another program'
+check '... the sandbox command is the server itself, not the wrapper' lacks "${OUT}" 'bwopencode2-serve'
+check '... on the pinned port' contains "${OUT}" 'serve --hostname'
+check '... with the port' contains "${OUT}" '--port 24703'
+check '... the password reaches the server (hidden)' contains "${OUT}" "OPENCODE_PASSWORD='REDACTED'"
+check '... and is never printed' lacks "${OUT}${ERR}" 'a-fixed-password-123'
+check '... no sign-in details are promised' lacks "${ERR}" 'once the server is up'
+check '... the data directory is the web one' contains "${OUT}" '/.local/share/opencode2/opencode-web '
+check '... and not the terminal one' lacks "${OUT}" "/.local/share/opencode2/opencode ${T}"
+check 'no browser ran' [ ! -e "${T}/ran-google-chrome" ]
+
+run BWOPENCODE2_SERVE_PASSWORD=a-fixed-password-123 -- --serve-headless --serve-open
+check '--serve-headless with --serve-open is refused' rc_is 1
+check '... and says why' contains "${ERR}" 'cannot be combined with --serve-open'
+
+run BWOPENCODE2_SERVE_PASSWORD=a-fixed-password-123 -- --serve-headless --exec bash
+check '--serve-headless with --exec is refused (as --serve is)' rc_is 1
+
 # ── --serve-open: no browser installed (a workstation without one) ──────
 
 # HARNESS_SERVE_OPEN_CANDIDATES= : none of the usual browsers is installed.  The
