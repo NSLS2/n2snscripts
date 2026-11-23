@@ -175,8 +175,9 @@ git_config_value() {
 #   the minter renews the token during a session, and this file is readable
 #   by the model. The helper is inline because a helper script in $HOME would
 #   not be in the sandbox. The empty helper line first drops any helper the
-#   system config names for that URL. It answers only "get", and nothing when
-#   there is no token, so git fails rather than asks.
+#   system config names for that URL. It answers only "get". With no token it
+#   answers quit=true, which makes git fail at once: without it git would go
+#   on to ask for a username, and a push would wait at a prompt.
 #
 #   bla.caller, bla.agentDir and bla.profileCollection tell the agent whose
 #   session this is, where it may write and where the live profile collection
@@ -191,7 +192,7 @@ write_git_config() {
     [[ "${token_file}" != *[\'\"\\\$\`]* ]] ||
         die "the push token path '${token_file}' cannot be written into a git config"
     # Run by git with sh, so no bashisms.
-    helper="!f() { test \"\$1\" = get || exit 0; t=\$(cat '${token_file}' 2>/dev/null) || exit 0; test -n \"\$t\" || exit 0; echo username=x-access-token; echo \"password=\$t\"; }; f"
+    helper="!f() { test \"\$1\" = get || exit 0; t=\$(cat '${token_file}' 2>/dev/null); if test -n \"\$t\"; then echo username=x-access-token; echo \"password=\$t\"; else echo quit=true; fi; }; f"
 
     {
         printf '# %s\n[safe]\n' "written by ${PROGRAM_NAME}"

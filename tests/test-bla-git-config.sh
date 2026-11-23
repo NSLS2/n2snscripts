@@ -59,6 +59,20 @@ fill() {
     OUT="$(printf 'protocol=%s\nhost=%s\n\n' "${_proto}" "${_host}" | g credential fill 2> /dev/null)"
     RC=$?
 }
+# fill_asking URL: the same where git could ask: no GIT_TERMINAL_PROMPT=0, and
+# an askpass that records being called and would supply an answer.
+printf '#!/bin/sh\n: > "%s"\necho asked\n' "${T}/asked" > "${T}/askpass"
+chmod +x "${T}/askpass"
+fill_asking() {
+    local _proto="${1%%://*}" _host="${1#*://}"
+    rm -f "${T}/asked"
+    OUT="$(printf 'protocol=%s\nhost=%s\n\n' "${_proto}" "${_host}" |
+        env -i PATH="${PATH}" HOME="${T}/home" XDG_CONFIG_HOME="${T}/xdg" \
+            GIT_CONFIG_NOSYSTEM=1 GIT_ASKPASS="${T}/askpass" \
+            git credential fill 2> /dev/null)"
+    RC=$?
+}
+not_asked() { [[ ! -e "${T}/asked" ]]; }
 rc_is() { [[ "${RC}" -eq "$1" ]]; }
 # refuses COMMAND...: COMMAND ends with die (in a subshell, so the tests go on).
 refuses() { ! ("$@") 2> /dev/null; }
@@ -119,12 +133,21 @@ fi
 : > "${TOKEN}"
 fill https://github.com
 check 'an empty token gives no password' lacks "${OUT}" 'password='
-check '... and git fails rather than asks' rc_is 128
+check '... and git fails' rc_is 128
+fill_asking https://github.com
+check '... without asking, even where it could' not_asked
+check '... and still fails' rc_is 128
+check '... and gives no password' lacks "${OUT}" 'password='
 rm -f "${TOKEN}"
 fill https://github.com
 check 'a missing token gives no password' lacks "${OUT}" 'password='
-check 'a missing token gives no output from the helper' \
-    is "$(sh -c "${HELPER#!} get" < /dev/null 2>&1)" ''
+fill_asking https://github.com
+check '... and git fails without asking' not_asked
+check '... with the same status' rc_is 128
+check 'with no token the helper tells git to stop' \
+    is "$(sh -c "${HELPER#!} get" < /dev/null 2>&1)" 'quit=true'
+fill_asking https://example.com
+check 'the askpass fixture does get called for a host with no helper' test -e "${T}/asked"
 
 # ── without a profile collection ────────────────────────────────────────
 
