@@ -74,9 +74,15 @@ readonly AGENT_HOME_BASE=/run/nsls2/agent/home
 
 # The live profile collection, relative to the caller's home. $HOME is a tmpfs
 # in the sandbox, so the rest of the home stays hidden and this one directory
-# is mounted read-write: the agent edits and commits in the real repository,
-# and a person reviews and pushes afterwards. Not every host has one.
+# is mounted. The agent does not change it there: it works in a clone under
+# the agent directory and pushes, and a person pulls to make the change live.
+# Not every host has one.
 readonly PROFILE_COLLECTION=.ipython/profile_collection
+
+# The GitHub token the root minter keeps for this beamline's profile
+# collection repository (n2c_agent role), valid for an hour and renewed every
+# 15 minutes. Mounted with the other tokens by --n2c-token all.
+readonly GITHUB_PUSH_TOKEN="${AGENT_CREDS_DIR}/github-push/token"
 
 # The one directory the agent may write in, inside the caller's home.
 readonly AGENT_SUBDIR=agent
@@ -141,45 +147,118 @@ write_npm_config() {
         > "${agent_home}/.npmrc" || die "cannot write '${agent_home}/.npmrc'"
 }
 
-# write_git_config AGENT_HOME DIR...
-#   Mark DIRs safe. git refuses every command in a repository owned by someone
-#   else — which each of these is, belonging to the caller or to the beamline
-#   on shared storage — so without this the agent cannot even run git status.
+# git_config_value STRING
+#   STRING as a double-quoted git config value, so a "#", ";" or leading space
+#   in it is not read as a comment or dropped.
+git_config_value() {
+    local value="$1"
+
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    printf '"%s"' "${value}"
+}
+
+# write_git_config AGENT_HOME CALLER TOKEN_FILE PROFILE AGENT_DIR
+#   Written in $HOME; the wrappers mount ~/.gitconfig into the sandbox,
+#   read-only, and nothing else of $HOME that git reads.
 #
-#   No identity is set. The agent edits but does not commit, and leaving the
-#   identity out makes a commit fail with "please tell me who you are" rather
-#   than succeed quietly. A guard against a mistake, not a boundary: anyone
-#   can pass git -c user.name.
+#   safe.directory for PROFILE and AGENT_DIR. git refuses every command in a
+#   repository owned by someone else — which each of these is, belonging to
+#   the caller or to the beamline on shared storage — so without this the
+#   agent cannot even run git status.
 #
-#   Written in $HOME, which the wrappers mount into the sandbox.
+#   An identity that names the agent account and the caller, so a commit the
+#   agent pushes can be traced to the person who started the session.
+#
+#   A credential helper for https://github.com and nothing else, which reads
+#   TOKEN_FILE each time git asks. The path is written here, never the token:
+#   the minter renews the token during a session, and this file is readable
+#   by the model. The helper is inline because a helper script in $HOME would
+#   not be in the sandbox. The empty helper line first drops any helper the
+#   system config names for that URL. It answers only "get". With no token it
+#   answers quit=true, which makes git fail at once: without it git would go
+#   on to ask for a username, and a push would wait at a prompt.
+#
+#   bla.caller, bla.agentDir and bla.profileCollection tell the agent whose
+#   session this is, where it may write and where the live profile collection
+#   is mounted. $HOME in the sandbox is the session directory, so ~/agent is
+#   not the agent directory there, and the sandbox passes on a fixed list of
+#   environment variables: this file is what it mounts.
 write_git_config() {
-    local agent_home="$1" dir
-    shift
+    local agent_home="$1" caller="$2" token_file="$3" profile="$4" agent_dir="$5" dir helper
+
+    # The path sits inside single quotes in a shell function inside a
+    # double-quoted config value. It is a constant; this guards a change to it.
+    [[ "${token_file}" != *[\'\"\\\$\`]* ]] ||
+        die "the push token path '${token_file}' cannot be written into a git config"
+    # Run by git with sh, so no bashisms.
+    helper="!f() { test \"\$1\" = get || exit 0; t=\$(cat '${token_file}' 2>/dev/null); if test -n \"\$t\"; then echo username=x-access-token; echo \"password=\$t\"; else echo quit=true; fi; }; f"
+
     {
         printf '# %s\n[safe]\n' "written by ${PROGRAM_NAME}"
-        for dir in "$@"; do
+        for dir in "${profile}" "${agent_dir}"; do
             # continue, not &&: a false test on the last argument would be the
             # group's exit status and look like a write failure.
             [[ -n "${dir}" ]] || continue
             printf '\tdirectory = %s\n' "${dir}"
         done
+        printf '[user]\n\tname = %s\n\temail = %s\n' \
+            "$(git_config_value "${AGENT_ACCOUNT} (${PROGRAM_NAME} for ${caller})")" \
+            "$(git_config_value "${AGENT_ACCOUNT}@$(uname -n)")"
+        printf '[credential "https://github.com"]\n\thelper =\n\thelper = %s\n' \
+            "$(git_config_value "${helper}")"
+        printf '[bla]\n\tcaller = %s\n\tagentDir = %s\n' \
+            "$(git_config_value "${caller}")" "$(git_config_value "${agent_dir}")"
+        if [[ -n "${profile}" ]]; then
+            printf '\tprofileCollection = %s\n' "$(git_config_value "${profile}")"
+        fi
     } > "${agent_home}/.gitconfig" || die "cannot write '${agent_home}/.gitconfig'"
 }
 
-# say_how_to_publish [PROFILE]
-#   The agent edits but neither commits nor pushes: the sandbox has no git
-#   identity, no GitHub credentials and no SSH. Say so at the start, with the
-#   command to review afterwards, or the work looks lost.
+# profile_mount_option PROFILE
+#   How to mount the live profile collection: read-write where the agent
+#   account can write it, read-only where it cannot (shared storage, where
+#   ACLs do not work), so the mount matches what the account may do. Either
+#   way the agent changes its clone, not this directory.
+profile_mount_option() {
+    if [[ -w "$1" ]]; then
+        echo --rw-path
+    else
+        echo --ro-path
+    fi
+}
+
+# say_push_token_state TOKEN_FILE
+#   Whether the agent can push, said at the start so a refused push an hour
+#   into the work is not the first sign. Never fatal: without a token the
+#   agent still edits and commits, and a person pushes.
+say_push_token_state() {
+    local token_file="$1"
+
+    if [[ ! -r "${token_file}" || ! -s "${token_file}" ]]; then
+        echo "${PROGRAM_NAME}: no GitHub push token on this host; the agent can edit and commit but not push" >&2
+    elif [[ -n "$(find "${token_file}" -mmin +60 2> /dev/null || true)" ]]; then
+        echo "${PROGRAM_NAME}: the GitHub push token is over an hour old (see n2c-agent-mint in the journal); the agent can edit and commit but not push" >&2
+    else
+        echo "${PROGRAM_NAME}: the agent can push to this beamline's profile collection repository" >&2
+    fi
+}
+
+# say_how_to_publish PROFILE AGENT_DIR
+#   The agent changes a clone, not the live profile collection, and pushes
+#   from it. Say so at the start, with the command that makes a pushed change
+#   live, or the work looks lost.
 say_how_to_publish() {
-    local profile="$1"
+    local profile="$1" agent_dir="$2"
 
     [[ -n "${profile}" ]] || return 0
     cat >&2 << EOF
-${PROGRAM_NAME}: the profile collection is mounted read-write at
+${PROGRAM_NAME}: the live profile collection is at
   ${profile}
-The agent edits it but does not commit, and cannot push: the sandbox has no
-git identity and no GitHub credentials. Review and commit yourself afterwards:
-  cd ${profile} && git diff
+The agent does not change it there. It works in a clone under
+  ${agent_dir}
+and commits and pushes from the clone. To make a pushed change live:
+  cd ${profile} && git pull --ff-only
 EOF
 }
 
@@ -187,10 +266,10 @@ EOF
 #   The agent may only reach what the caller can reach.
 #
 #   The link is in the caller's home, so they choose where it points, and the
-#   sandbox mounts whatever it resolves to. The agent account is granted on
-#   every beamline's storage, so without this check a caller could aim the
-#   link at another beamline's profile collection and have the agent open it
-#   read-write on their behalf — access they do not have themselves.
+#   sandbox mounts whatever it resolves to. The agent account is not scoped to
+#   one beamline, so without this check a caller could aim the link at another
+#   beamline's profile collection and have the agent open it on their behalf
+#   — access they do not have themselves.
 #
 #   Run as the caller, so -w is their access, not the agent account's. This
 #   catches a mistake, not a determined caller: they own the link and can
@@ -246,7 +325,8 @@ Usage: ${PROGRAM_NAME} [agent]
 
 Start a beamline coding agent in its sandbox. It may write only in your agent
 directory, and reaches the AI gateway and the read-only NSLS-II APIs with the
-credentials this host keeps.
+credentials this host keeps. Where the host has a push token, it can also push
+to this beamline's profile collection repository on GitHub.
 
 Agents (${DEFAULT_AGENT} when none is named):
 $(printf '  %s\n' "${!AGENT_WRAPPERS[@]}" | sort)
@@ -366,16 +446,22 @@ main() {
         # Resolved, because on some hosts this is a symlink to shared storage:
         # the sandbox mounts the target, so the link path is not there inside.
         profile="$(readlink -f "${home}/${PROFILE_COLLECTION}")"
-        mounts+=(--rw-path "${profile}")
+        mounts+=("$(profile_mount_option "${profile}")" "${profile}")
     else
         echo "${PROGRAM_NAME}: no profile collection at '${home}/${PROFILE_COLLECTION}'; starting without it" >&2
     fi
 
-    write_git_config "${agent_home}" "${agent_dir}" "${profile}"
+    write_git_config "${agent_home}" "${user}" "${GITHUB_PUSH_TOKEN}" "${profile}" "${agent_dir}"
     write_npm_config "${agent_home}" "${caller_dir}/cache"
-    say_how_to_publish "${profile}"
+    say_how_to_publish "${profile}" "${agent_dir}"
+    if [[ -n "${profile}" ]]; then
+        say_push_token_state "${GITHUB_PUSH_TOKEN}"
+    fi
 
     exec "${SCRIPT_DIR}/${wrapper}" "${mounts[@]}"
 }
 
-main "$@"
+# Run only when executed, so the tests can source this file for its functions.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
