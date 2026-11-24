@@ -99,9 +99,12 @@ adds them is only read by a login shell.
     in the sandbox is the session directory, so `~/agent` is not the agent
     directory there; the agent reads these with `git config --get`.
 
-  The model can read the push token, as it can the other tokens. It is good
-  for at most an hour and for one repository, but it is renewed while the
-  session runs.
+  The agent uses the push token without reading it: git calls the helper
+  and sends the token to GitHub inside its own process, and a clone or a push
+  prints nothing of it, so it does not enter the model's context. The model
+  could still read the file, as it can the other tokens, because git runs as
+  the same account. That is why the token is good for at most an hour and for
+  one repository; it is renewed while the session runs.
 - **`HOME`.** A directory per session, `mktemp -d` under
   `/run/nsls2/agent/home/<caller>/`, which the `n2c_agent` role makes on the
   tmpfs next to the tokens. The wrappers create their authoring directories
