@@ -330,6 +330,7 @@ So sandboxes are isolated by default, with one explicit escape hatch.
 | | pasta | slirp4netns | `--share-net` |
 | --- | --- | --- | --- |
 | Address in the sandbox | the host's | `192.168.254.100` (IPv4 only) | the host's |
+| Interface name in the sandbox | `sbx0` | `tap0` | the host's |
 | Outbound traffic leaves from | the host's address | the host's address | the host |
 | DNS | `169.254.1.1`, forwarded to the host's resolver | `192.168.254.3`, forwarded to the host's resolver | the host's `resolv.conf` |
 | `--publish`, `--publish-addr` | yes | yes (at most 64 ports) | no |
@@ -346,6 +347,36 @@ backend forwards to the first nameserver in the host's `/etc/resolv.conf`
 nameservers are supported; the wrapper warns when the host has none. The host's
 search domains are not passed on, so use fully qualified names. `/etc/hosts` is
 the host's file.
+
+### Lustre clients
+
+On a host with Lustre networking (LNet) loaded, **pasta is not used**. The
+launcher does not even start it, because its test run creates the tap device.
+slirp4netns is used instead, and without it the launch stops (exit 3).
+`--net-backend pasta` is refused there too, and `--host-port` (pasta only)
+stops the launch. `--share-net` is not affected by the rule. A host is a Lustre
+client when `/sys/module/lnet` exists, which any user can read.
+
+Why: on NSLS-II Lustre clients (orion login nodes, a personal VM) starting a
+pasta sandbox marked the host's LNet interface `down`, and so did ending one in
+one observed case. It stays down, and every access to Lustre on the host
+hangs, until someone runs `lnetctl net del --net tcp` and `lnetctl net add
+--net tcp --if IFACE` (which evicts the client once). The cause, read from the
+Lustre 2.15 source and not yet proven by a test: its socket driver
+(`ksocklnd`) reacts to the network-device events of **every** network
+namespace, and recognises its own interface by index and name (and, in one
+handler, by address). pasta's tap device has the host's interface name and
+address, and often the same index. Upstream fixed this in Lustre 2.17
+(LU-18644); 2.15 and 2.16 do not have the fix. slirp4netns names its device
+`tap0` and has not caused it.
+
+The launcher also passes `-I sbx0` to pasta (when the installed pasta has
+`--ns-ifname`), so that the tap device has a name of its own on every host.
+That is the fix this rule waits for: once starting and ending sessions with it
+has been shown to leave LNet up on a Lustre client, the rule can go. Until
+then `BWRAP_PASTA_ON_LNET=1` in the launcher's environment lets pasta run on a
+Lustre client, **for that test only**. Even with it, a pasta without
+`--ns-ifname` is refused there.
 
 ### Opening ports
 
@@ -634,6 +665,10 @@ looked up.
   Whether pasta with bwrap 0.4.0 hits the same error has not been tried: the
   RHEL 8 hosts tested have bwrap 0.4.0 and no pasta. The launcher does not
   check for it.
+- `-I sbx0` names the tap device (pasta's default is the host's interface
+  name), when the installed pasta lists `--ns-ifname`. Nothing in the launcher
+  uses the interface name. See [Lustre clients](#lustre-clients) for why, and
+  `tests/test-net-lustre-guard.sh` for the checks of the backend choice.
 - pasta renames the host to `pasta-<name>`; bwrap's `--unshare-uts
   --hostname` restores the real name.
 - `--no-pidns` is passed when the installed pasta supports it (2026-09 and
