@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Tests for the choice of network backend on Lustre clients: pasta is neither
-# used nor started on a host with LNet loaded (its tap device takes the host's
-# Lustre network down), unless BWRAP_PASTA_ON_LNET=1; and when pasta is used
-# its tap device gets its own name (-I).  See "Lustre clients" in
-# lib/bwrap_sandbox_lib.sh.
+# Tests for pasta on Lustre clients: pasta's tap device gets its own name (-I
+# sbx0) so that it cannot take the host's LNet interface down, and on a host
+# with LNet loaded a pasta without --ns-ifname is not used.  See "Lustre
+# clients" in lib/bwrap_sandbox_lib.sh.
 #
 # Sources the library and calls detect_net_capabilities under --dry-run, with
 # a stub pasta that records every start, the fake slirp4netns of tests/fakes,
@@ -35,7 +34,6 @@ check() { # check DESCRIPTION CONDITION-COMMAND...
 contains() { grep -qF -- "$2" <<< "$1"; }
 lacks() { ! grep -qF -- "$2" <<< "$1"; }
 rc_is() { [[ "${RC}" -eq "$1" ]]; }
-pasta_never_started() { [[ ! -e "${T}/pasta.calls" ]]; }
 pasta_only_asked_for_help() { ! grep -qv -- '^--help$' "${T}/pasta.calls" 2> /dev/null; }
 
 # ── fixtures ────────────────────────────────────────────────────────────
@@ -117,46 +115,48 @@ check '... without -I' lacks "${OUT}" ' -I '
 detect -- - slirp MOD=none
 check 'no LNet, no pasta: slirp4netns' contains "${OUT}" 'backend=slirp4netns'
 
-# ── a Lustre client ──────────────────────────────────────────────────────
+# ── a Lustre client with a pasta that has --ns-ifname ────────────────────
 
 detect -- pasta slirp MOD=lnet
-check 'LNet: slirp4netns is used' contains "${OUT}" 'backend=slirp4netns'
-check '... and pasta was never started, not even for --help' pasta_never_started
-
-detect -- pasta - MOD=lnet
-check 'LNet, no slirp4netns: the launch stops (exit 3)' rc_is 3
-check '... and says why' contains "${ERR}" 'This host has Lustre networking loaded'
-check '... gives the pasta reason' contains "${ERR}" 'not used on a Lustre client'
-check '... does not suggest sharing the host network' lacks "${ERR}" '--share-net'
-check '... and pasta was never started' pasta_never_started
+check 'LNet: pasta is used' contains "${OUT}" 'backend=pasta'
+check '... with its tap device named sbx0' contains "${OUT}" ' -I sbx0'
 
 detect -- pasta slirp MOD=lnet FORCE=pasta
-check 'LNet, --net-backend pasta: the launch stops (exit 3)' rc_is 3
-check '... and pasta was never started' pasta_never_started
+check 'LNet, --net-backend pasta: pasta is used' contains "${OUT}" 'backend=pasta'
+check '... with -I sbx0' contains "${OUT}" ' -I sbx0'
 
 detect -- pasta slirp MOD=lnet FORCE=slirp4netns
 check 'LNet, --net-backend slirp4netns: slirp4netns' contains "${OUT}" 'backend=slirp4netns'
 
 detect -- pasta slirp MOD=lnet HOSTPORT=1
-check 'LNet, --host-port (pasta only): the launch stops (exit 3)' rc_is 3
-check '... and pasta was never started' pasta_never_started
+check 'LNet, --host-port (pasta only): pasta is used' contains "${OUT}" 'backend=pasta'
 
 detect -- pasta slirp MOD=lnet SHARE=1
 check 'LNet, --share-net: unchanged (no private network)' contains "${OUT}" 'backend=none'
-check '... and pasta was never started' pasta_never_started
 
-# ── BWRAP_PASTA_ON_LNET=1, to test the tap device name on a Lustre client ─
+# ── a Lustre client with a pasta that lacks --ns-ifname ──────────────────
 
-detect BWRAP_PASTA_ON_LNET=1 -- pasta slirp MOD=lnet
-check 'LNet with BWRAP_PASTA_ON_LNET=1: pasta is used' contains "${OUT}" 'backend=pasta'
-check '... with its tap device named sbx0' contains "${OUT}" ' -I sbx0'
-
-detect BWRAP_PASTA_ON_LNET=1 STUB_PASTA_NS_IFNAME=0 -- pasta slirp MOD=lnet
-check 'LNet with the override, pasta without --ns-ifname: slirp4netns' contains "${OUT}" 'backend=slirp4netns'
+detect STUB_PASTA_NS_IFNAME=0 -- pasta slirp MOD=lnet
+check 'LNet, pasta without --ns-ifname: slirp4netns' contains "${OUT}" 'backend=slirp4netns'
 check '... after pasta was asked for --help only' pasta_only_asked_for_help
 
-detect BWRAP_PASTA_ON_LNET=0 -- pasta slirp MOD=lnet
-check 'LNet with BWRAP_PASTA_ON_LNET=0: still slirp4netns' contains "${OUT}" 'backend=slirp4netns'
+detect STUB_PASTA_NS_IFNAME=0 -- pasta - MOD=lnet
+check 'LNet, pasta without --ns-ifname, no slirp4netns: the launch stops (exit 3)' rc_is 3
+check '... and says why' contains "${ERR}" 'This host has Lustre networking loaded'
+check '... names the missing option' contains "${ERR}" '--ns-ifname'
+check '... does not suggest sharing the host network' lacks "${ERR}" '--share-net'
+check '... and pasta was only asked for --help' pasta_only_asked_for_help
+
+detect STUB_PASTA_NS_IFNAME=0 -- pasta slirp MOD=lnet FORCE=pasta
+check 'LNet, --net-backend pasta without --ns-ifname: the launch stops (exit 3)' rc_is 3
+check '... and pasta was only asked for --help' pasta_only_asked_for_help
+
+detect STUB_PASTA_NS_IFNAME=0 -- pasta slirp MOD=lnet HOSTPORT=1
+check 'LNet, --host-port, pasta without --ns-ifname: the launch stops (exit 3)' rc_is 3
+
+detect -- - - MOD=lnet
+check 'LNet, no pasta and no slirp4netns: the launch stops (exit 3)' rc_is 3
+check '... with the usual message, not the Lustre one' lacks "${ERR}" 'This host has Lustre networking loaded'
 
 # ── the detection itself ─────────────────────────────────────────────────
 

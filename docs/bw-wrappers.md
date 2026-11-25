@@ -350,33 +350,31 @@ the host's file.
 
 ### Lustre clients
 
-On a host with Lustre networking (LNet) loaded, **pasta is not used**. The
-launcher does not even start it, because its test run creates the tap device.
-slirp4netns is used instead, and without it the launch stops (exit 3).
-`--net-backend pasta` is refused there too, and `--host-port` (pasta only)
-stops the launch. `--share-net` is not affected by the rule. A host is a Lustre
-client when `/sys/module/lnet` exists, which any user can read.
+pasta's tap device is named `sbx0` (`-I sbx0`, on every host whose pasta has
+`--ns-ifname`). On a host with Lustre networking (LNet) loaded, **a pasta
+without `--ns-ifname` is not used**: the launcher uses slirp4netns instead, and
+without it the launch stops (exit 3). A host is a Lustre client when
+`/sys/module/lnet` exists, which any user can read. `--share-net` is not
+affected by the rule.
 
-Why: on NSLS-II Lustre clients (orion login nodes, a personal VM) starting a
-pasta sandbox marked the host's LNet interface `down`, and so did ending one in
-one observed case. It stays down, and every access to Lustre on the host
-hangs, until someone runs `lnetctl net del --net tcp` and `lnetctl net add
---net tcp --if IFACE` (which evicts the client once). The cause, read from the
-Lustre 2.15 source and not yet proven by a test: its socket driver
-(`ksocklnd`) reacts to the network-device events of **every** network
-namespace, and recognises its own interface by index and name (and, in one
-handler, by address). pasta's tap device has the host's interface name and
-address, and often the same index. Upstream fixed this in Lustre 2.17
-(LU-18644); 2.15 and 2.16 do not have the fix. slirp4netns names its device
-`tap0` and has not caused it.
+Why: starting a pasta sandbox on NSLS-II Lustre clients (login nodes, a
+personal VM) marked the host's LNet interface `down`, and so did ending one. It
+stayed down, and every access to Lustre on the host hung, until someone ran
+`lnetctl net del --net tcp` and `lnetctl net add --net tcp --if IFACE` (which
+evicts the client once). The cause: Lustre 2.15's socket driver (`ksocklnd`)
+reacts to the network-device events of **every** network namespace, and
+recognises its own interface by index and name (and, in one handler, by
+address). pasta's tap device had the host's interface name and address, and the
+same index. Upstream fixed this in Lustre 2.17 (LU-18644); 2.15 and 2.16 do
+not have the fix. slirp4netns names its device `tap0` and does not trigger it.
 
-The launcher also passes `-I sbx0` to pasta (when the installed pasta has
-`--ns-ifname`), so that the tap device has a name of its own on every host.
-That is the fix this rule waits for: once starting and ending sessions with it
-has been shown to leave LNet up on a Lustre client, the rule can go. Until
-then `BWRAP_PASTA_ON_LNET=1` in the launcher's environment lets pasta run on a
-Lustre client, **for that test only**. Even with it, a pasta without
-`--ns-ifname` is refused there.
+Tested on a RHEL 9.8 login node (Lustre 2.15.7, passt 2025-12-10). Without
+`-I`, pasta's test run alone took LNet down, and so did the start and the end of
+a session. With `-I sbx0`, a test run, a 30 second session, ten sessions in a
+row and two at once (13 starts and ends), and launches through this library,
+left LNet up; Lustre received no event for the host's interface name. On a
+RHEL 8.10 VM (Lustre 2.15.6, slirp4netns only) the launcher's sessions left it
+up too.
 
 ### Opening ports
 
