@@ -8,7 +8,8 @@ interface address) and -T (namespace loopback -> host loopback) ports.  Like
 the real one (fwd_rule.c), -T and -U take no listening address: "-T ADDR/..."
 stops it with pasta's error.  With --dns-forward ADDR it answers DNS queries
 to ADDR:53 itself (every name is 192.0.2.10).  The namespace gets a dummy
-interface with 192.168.77.2 instead of a tap with the host's address.
+interface (named by -I, else eth0) with 192.168.77.2 instead of a tap with the
+host's address.
 
 With --debug (and no --log-file, as the launchers run it) its debug lines go
 to stderr in pasta's stderr format (log.c vlogmsg): "T: message", with
@@ -34,13 +35,14 @@ FAKE_DIR = os.environ.get("FAKE_NET_DIR", "/tmp/opencode/fakenet")
 args = sys.argv[1:]
 if args[:1] in (["--help"], ["-h"]):
     print("Usage: pasta [OPTION]... [COMMAND [ARG]...]")
+    print("  -I, --ns-ifname NAME\tnamespace interface name")
     print("  --no-pidns		Don't spawn command in a new PID namespace")
     sys.exit(0)
 if args[:1] == ["--version"]:
     print("pasta fake-2026_10_02")
     sys.exit(0)
 
-VALUE_OPTS = {"-t", "-u", "-T", "-U", "--dns-forward", "--search", "--log-file", "--log-size"}
+VALUE_OPTS = {"-t", "-u", "-T", "-U", "-I", "--dns-forward", "--search", "--log-file", "--log-size"}
 opts, fwd_t, fwd_T, cmd = {}, [], [], []
 i = 0
 while i < len(args):
@@ -66,6 +68,9 @@ for opt, specs in (("T", fwd_T), ("U", [opts.get("-U", "none")])):
     for spec in specs:
         if spec != "none" and "/" in spec:
             sys.exit("0.0012: ERROR:   Listening address not allowed for -%s %s" % (opt, spec))
+
+# -I NAME names the interface (pasta's default is the host's interface name).
+IFNAME = opts.get("-I", "eth0")
 
 os.closerange(3, 4096)
 
@@ -154,9 +159,9 @@ if child == 0:
     _s.sethostname("pasta-" + os.uname().nodename)
     setup = [
         ["ip", "link", "set", "lo", "up"],
-        ["ip", "link", "add", "eth0", "type", "dummy"],
-        ["ip", "addr", "add", NS_ADDR + "/24", "dev", "eth0"],
-        ["ip", "link", "set", "eth0", "up"],
+        ["ip", "link", "add", IFNAME, "type", "dummy"],
+        ["ip", "addr", "add", NS_ADDR + "/24", "dev", IFNAME],
+        ["ip", "link", "set", IFNAME, "up"],
     ]
     if "--dns-forward" in opts:
         setup.append(["ip", "addr", "add", opts["--dns-forward"] + "/32", "dev", "lo"])

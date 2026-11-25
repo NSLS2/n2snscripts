@@ -2289,8 +2289,30 @@ build_etc_mounts() {
 #     _NET_DNS_FORWARD_ADDR, which pasta forwards to the host's first
 #     nameserver; resolv.conf is generated to match.
 
+# Lustre clients (hosts with LNet loaded) and pasta.  Lustre 2.15's socket
+# driver (ksocklnd) acts on the network-device events of every network
+# namespace, not only its own, and recognises its interface by index and name
+# (and, in one handler, address).  pasta's tap device has the host's interface
+# name and address, and, being the first device after lo, often its index too,
+# so creating or removing it (a launch, the test run, the end of a session)
+# marked the host's LNet interface down.  It stayed down until someone ran
+# `lnetctl net del --net tcp` and `lnetctl net add`, and every access to
+# Lustre on the host hung meanwhile.  Fixed upstream in Lustre 2.17
+# (LU-18644).  -I gives the tap device a name of its own (_NET_PASTA_IFNAME),
+# so the events no longer match the host's interface.  Tested on a RHEL 9
+# login node (Lustre 2.15.7): without -I the test run alone took LNet down, as
+# did the start and the end of a session; with -I, 13 starts and ends and
+# launches through this library left it up.  A pasta without --ns-ifname is
+# therefore not used on a host with LNet loaded.  slirp4netns names its device
+# tap0 and is not affected.
 _PASTA_BIN=""
 _PASTA_HAS_NO_PIDNS=0
+_PASTA_HAS_NS_IFNAME=0
+_NET_PASTA_IFNAME="sbx0"
+# Set when pasta was refused for lacking --ns-ifname on a Lustre client.
+_NET_PASTA_REFUSED_LNET=0
+# Where the kernel lists the loaded modules (the tests point it elsewhere).
+_NET_SYSFS_MODULE_DIR="/sys/module"
 _NET_CONFIGURED=0
 # _NET_BACKEND is the backend that provides the private network namespace,
 # or none with --share-net; _NET_PRIVATE is 1 unless it is none.
@@ -2323,7 +2345,9 @@ _NET_HP_HI=()
 net_print_help() {
     cat << 'NET_HELP_EOF'
 Network: the sandbox has its own network namespace (pasta, package passt,
-or else slirp4netns).
+or else slirp4netns).  On a host with Lustre networking loaded pasta is used
+only if it has --ns-ifname (its tap device is then named sbx0, so that it
+cannot take the host's Lustre network down); otherwise slirp4netns is.
 Outbound connections work as on the host; services on the host's loopback
 (127.0.0.1) are NOT reachable, and nothing the agent listens on is reachable
 from the host, unless opened below.  If no private network namespace can be
@@ -2378,6 +2402,18 @@ _net_baseline_args() {
     if [[ "${_PASTA_HAS_NO_PIDNS}" -eq 1 ]]; then
         PASTA_ARGS+=(--no-pidns)
     fi
+    # Without -I pasta names the tap device after the host's interface (see
+    # "Lustre clients" above).
+    if [[ "${_PASTA_HAS_NS_IFNAME}" -eq 1 ]]; then
+        PASTA_ARGS+=(-I "${_NET_PASTA_IFNAME}")
+    fi
+}
+
+# _net_host_has_lnet
+#   Return 0 when Lustre networking (LNet) is loaded on this host.  A normal
+#   user can read /sys/module.
+_net_host_has_lnet() {
+    [[ -d "${_NET_SYSFS_MODULE_DIR}/lnet" ]]
 }
 
 # net_set_backend NAME
@@ -2419,6 +2455,7 @@ detect_net_capabilities() {
     _NET_PRIVATE=0
     _NET_BACKEND=none
     _NET_SHARED_REASON=""
+    _NET_PASTA_REFUSED_LNET=0
     _fwd="$(_net_forward_options)"
     if [[ "${NET_SHARE}" -eq 1 ]]; then
         if [[ -n "${_fwd}" ]]; then
@@ -2462,8 +2499,14 @@ detect_net_capabilities() {
     printf '       the host network unless asked to.\n' >&2
     printf '         pasta:       %s\n' "${_pasta_reason}" >&2
     printf '         slirp4netns: %s\n' "${_slirp_reason}" >&2
-    printf '       Install passt (RHEL 9 and later) or slirp4netns (RHEL 8), or run with --share-net\n' >&2
-    printf '       to share the host network (services on the host loopback are then reachable).\n' >&2
+    if [[ "${_NET_PASTA_REFUSED_LNET}" -eq 1 ]]; then
+        printf '       This host has Lustre networking loaded, and a pasta without --ns-ifname can take\n' >&2
+        printf '       the host'\''s Lustre network down.  Update passt, install a working slirp4netns,\n' >&2
+        printf '       or run the sandbox on a host without Lustre.\n' >&2
+    else
+        printf '       Install passt (RHEL 9 and later) or slirp4netns (RHEL 8), or run with --share-net\n' >&2
+        printf '       to share the host network (services on the host loopback are then reachable).\n' >&2
+    fi
     exit 3
 }
 
@@ -2484,12 +2527,20 @@ _net_try_pasta() {
     # adds a PID namespace, inside which bwrap nests its own.
     if _out="$(timeout --signal=TERM --kill-after=2s 5s "${_PASTA_BIN}" --help 2>&1)"; then
         [[ "${_out}" != *--no-pidns* ]] || _PASTA_HAS_NO_PIDNS=1
+        [[ "${_out}" != *--ns-ifname* ]] || _PASTA_HAS_NS_IFNAME=1
     else
         _rc=$?
         if [[ ${_rc} -eq 124 || ${_rc} -eq 137 ]]; then
             _NET_TRY_REASON="'pasta --help' timed out after 5 seconds"
             return 1
         fi
+    fi
+    # On a Lustre client the tap device needs a name of its own; this check
+    # comes before the test run below, which creates the device too.
+    if [[ "${_PASTA_HAS_NS_IFNAME}" -eq 0 ]] && _net_host_has_lnet; then
+        _NET_TRY_REASON="no --ns-ifname, so its tap device would take the host's interface name, which can take the Lustre network down (LNet is loaded)"
+        _NET_PASTA_REFUSED_LNET=1
+        return 1
     fi
     _net_baseline_args
     [[ "${DRY_RUN}" -eq 0 ]] || return 0
@@ -5897,7 +5948,7 @@ print_dry_run() {
     [[ "${_NET_BACKEND}" != pasta ]] || printf "  %s \\\\\n" "${_PASTA_BIN}"
     while [[ "${_NET_BACKEND}" == pasta && ${_p} -lt ${#PASTA_ARGS[@]} ]]; do
         case "${PASTA_ARGS[${_p}]}" in
-            -t | -u | -T | -U | --dns-forward | --search | --log-file)
+            -t | -u | -T | -U | -I | --dns-forward | --search | --log-file)
                 printf "    %s %q \\\\\n" "${PASTA_ARGS[${_p}]}" "${PASTA_ARGS[$((_p + 1))]}"
                 _p=$((_p + 2))
                 ;;
