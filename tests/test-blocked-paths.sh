@@ -30,15 +30,24 @@ check() { # check DESCRIPTION CONDITION-COMMAND...
     fi
 }
 # validate_extra_path exits on a refusal: the launchers call it in $(...), so
-# the tests do too.
-refused() { ! (validate_extra_path "${_HOME}/$1" "$2") > /dev/null 2>&1; }
+# the tests do too.  A refusal counts only when it says why: any other failure
+# (an unset variable, say) is not the blocked list at work.
+refused() {
+    local _out
+    _out="$( (validate_extra_path "${_HOME}/$1" "$2") 2>&1)" && return 1
+    [[ "${_out}" == *"is inside the blocked path"* ]]
+}
 allowed() { (validate_extra_path "${_HOME}/$1" "$2") > /dev/null 2>&1; }
 
 # A home directory whose ancestors nobody else can write to, so it is made
 # beside the repository's checkout, not in /tmp.
 _HOME="$(mktemp -d "${ROOT}/.blocked-test.XXXXXX")"
 trap 'rm -rf "${_HOME}"' EXIT
-export HOME="${_HOME}"
+# The blocked list is built from these, which resolve_common_paths sets in the
+# launchers, so give them values of their own: the test must not depend on the
+# caller's environment.
+export HOME="${_HOME}" XDG_CONFIG_HOME="${_HOME}/.config" \
+    XDG_DATA_HOME="${_HOME}/.local/share" XDG_RUNTIME_DIR="${_HOME}/run"
 mkdir -p "${_HOME}/.aws" "${_HOME}/.azure/sub" "${_HOME}/.config/gh" "${_HOME}/.ssh" \
     "${_HOME}/.docker" "${_HOME}/.azure-opencode-ro" "${_HOME}/Work"
 
