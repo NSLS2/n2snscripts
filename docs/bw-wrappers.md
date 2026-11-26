@@ -1814,10 +1814,10 @@ The drop-in is added only when the managed file exists, and only inside the
 sandbox: `claude` run outside `bwclaude` keeps the strict policy.
 
 The managed `sandbox.filesystem.denyRead` list (`~/.aws`, `~/.ssh`,
-`~/.config/gh`, `~/.azure`, `~/.docker/config.json`) is not enforced inside
-`bwclaude` any more. The sandbox never mounts the home directory, and refuses
-`--ro-path` and `--rw-path` for all of those except `~/.azure`, which is the one
-gap: `--ro-path ~/.azure` is allowed.
+`~/.config/gh`, `~/.azure`, `~/.docker/config.json`) is not enforced by Claude
+Code inside `bwclaude` any more, and does not need to be: the sandbox never
+mounts the home directory, and every `bw*` wrapper refuses `--ro-path` and
+`--rw-path` for all of those directories (`tests/test-blocked-paths.sh`).
 
 Additional options:
 

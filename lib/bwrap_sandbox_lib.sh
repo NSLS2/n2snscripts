@@ -1065,6 +1065,7 @@ _bwrap_load_blocked_prefixes() {
         "${_HOME}/.ssh"
         "${_HOME}/.gnupg"
         "${_HOME}/.aws"
+        "${_HOME}/.azure"
         "${_HOME}/.kube"
         "${_HOME}/.docker"
         # Package-manager credentials
@@ -1172,6 +1173,7 @@ _bwrap_path_blocked() {
 #         ~/.ssh/          private keys and known_hosts
 #         ~/.gnupg/        GPG private keys and keyrings
 #         ~/.aws/          AWS credentials and config
+#         ~/.azure/        Azure CLI sign-in and tokens
 #         ~/.kube/         Kubernetes cluster credentials (tokens, certs)
 #         ~/.docker/       Docker registry auth (config.json with tokens)
 #

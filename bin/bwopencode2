@@ -121,7 +121,7 @@
 #                   Off by default.  The refresh token is never mounted.
 #   --ro-path PATH  Mount PATH read-only into the sandbox.  May be repeated to
 #                   accumulate multiple paths.  Dangerous paths are blocked:
-#                   $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws, ~/.kube,
+#                   $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws, ~/.azure, ~/.kube,
 #                   ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler, ~/.yarnrc,
 #                   ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
 #                   $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
@@ -420,7 +420,7 @@ Wrapper options (consumed before opencode2 sees the command line):
   --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
                   May be repeated to accumulate multiple extra paths.
                   Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
-                  ~/.kube, ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler,
+                  ~/.azure, ~/.kube, ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler,
                   ~/.yarnrc, ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
                   $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
                   /etc/sudoers{,.d}.
