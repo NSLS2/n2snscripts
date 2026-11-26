@@ -32,6 +32,9 @@ check() { # check DESCRIPTION CONDITION-COMMAND...
 }
 contains() { grep -qF -- "$2" <<< "$1"; }
 lacks() { ! grep -qF -- "$2" <<< "$1"; }
+is_one() { [[ "$1" == 1 ]]; }
+is_empty() { [[ -z "$1" ]]; }
+cmd_line() { grep '^CMD' <<< "$1"; }
 
 readonly TOKEN=/run/user/1000/nsls2/creds/aifapim/token
 readonly KEY=not-a-real-key-AAAA
@@ -140,6 +143,83 @@ OUT="$(mount_env observability)"
 check 'observability only: key mode' contains "${OUT}" '--setenv CLAUDE_CODE_USE_FOUNDRY 1'
 unset N2SN_CREDS_DIR
 
+# ── the aifapim token without --n2c-token ───────────────────────────────
+# The automatic step adds it to whatever --n2c-token asked for, when its file
+# exists, unless N2C_GATEWAY=off.  A second credentials directory has no
+# aifapim file, as for someone without the gateway role.
+
+CREDS2="${CREDS%/creds}/creds2"
+mkdir -p "${CREDS2}/observability"
+chmod 700 "${CREDS2}" "${CREDS2}/observability"
+printf 'not-a-real-token\n' > "${CREDS2}/observability/token"
+chmod 600 "${CREDS2}/observability/token"
+
+# auto_env [NAME...]: --n2c-token NAME for each name, the automatic step, the
+# mounts, then build_claude_env.  Prints the mounted files first.
+auto_env() {
+    EXTRA_RO_PATHS=()
+    N2C_TOKEN_FILES=()
+    N2C_TOKENS=()
+    local _n
+    for _n in "$@"; do add_n2c_token "${_n}"; done
+    n2c_auto_gateway_token
+    build_n2c_token_mounts 2> /dev/null
+    printf 'FILES %s\n' "${N2C_TOKEN_FILES[*]-}"
+    run_env AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST="${HOST}"
+}
+# auto_err [NAME...]: what the mount step says on stderr
+auto_err() {
+    EXTRA_RO_PATHS=()
+    N2C_TOKEN_FILES=()
+    N2C_TOKENS=()
+    local _n
+    for _n in "$@"; do add_n2c_token "${_n}"; done
+    n2c_auto_gateway_token
+    build_n2c_token_mounts 2>&1
+}
+files_line() { grep '^FILES' <<< "$1"; }
+
+export N2SN_CREDS_DIR="${CREDS}"
+OUT="$(auto_env)"
+check 'automatic: no flag, token file exists: the token is mounted' \
+    contains "$(files_line "${OUT}")" "${CREDS}/aifapim/token"
+check '... and nothing else' lacks "$(files_line "${OUT}")" observability
+check '... and token mode is used' contains "$(cmd_line "${OUT}")" '--settings'
+
+OUT="$(auto_env observability)"
+check '--n2c-token observability: aifapim is added to it' \
+    contains "$(files_line "${OUT}")" "${CREDS}/aifapim/token"
+check '... and observability is mounted too' contains "$(files_line "${OUT}")" "${CREDS}/observability/token"
+check '... and token mode is used' contains "$(cmd_line "${OUT}")" '--settings'
+
+OUT="$(auto_env aifapim)"
+check '--n2c-token aifapim: used' contains "$(cmd_line "${OUT}")" '--settings'
+check '... and mounted once' \
+    is_one "$(grep -o "aifapim/token" <<< "$(files_line "${OUT}")" | wc -l | tr -d ' ')"
+
+OUT="$(N2C_GATEWAY=off auto_env)"
+check 'N2C_GATEWAY=off: nothing is mounted without a flag' \
+    lacks "$(files_line "${OUT}")" aifapim
+check '... and the key is used' contains "${OUT}" "ANTHROPIC_FOUNDRY_API_KEY=${KEY}"
+
+OUT="$(N2C_GATEWAY=off auto_env all)"
+check 'N2C_GATEWAY=off with --n2c-token all: aifapim is mounted (for skills)' \
+    contains "$(files_line "${OUT}")" "${CREDS}/aifapim/token"
+check '... but not used for the gateway' lacks "$(cmd_line "${OUT}")" '--settings'
+check '... and the key is used' contains "${OUT}" "ANTHROPIC_FOUNDRY_API_KEY=${KEY}"
+
+export N2SN_CREDS_DIR="${CREDS2}"
+OUT="$(auto_env observability)"
+check 'no aifapim file: only what was asked for is mounted' \
+    lacks "$(files_line "${OUT}")" aifapim
+check '... and the key is used' contains "${OUT}" "ANTHROPIC_FOUNDRY_API_KEY=${KEY}"
+check 'no aifapim file, observability asked for: nothing is said' is_empty "$(auto_err observability)"
+check 'no aifapim file, nothing asked for: nothing is said' is_empty "$(auto_err)"
+check '--n2c-token aifapim without a file still warns' contains "$(auto_err aifapim)" "no N2C token 'aifapim'"
+export N2SN_CREDS_DIR=/nonexistent/creds
+check 'no credentials directory, no flag: nothing is said' is_empty "$(auto_err)"
+unset N2SN_CREDS_DIR
+
 # A --ro-path is canonicalised and mounted at its target, so a path that only
 # looks like the token (a symlink, say) must not switch the token mode on.
 N2C_TOKEN_FILES=()
@@ -162,7 +242,7 @@ check 'key: no --settings' lacks "${OUT}" '--settings'
 
 OUT="$(run_env)"
 check 'no key and no token: stops' contains "${OUT}" 'exit=1'
-check '... and names --n2c-token aifapim' contains "${OUT}" 'bwclaude --n2c-token aifapim'
+check '... and says how to get the token' contains "${OUT}" 'n2c-token refresh aifapim'
 
 # ── Claude Code's own sandbox (managed settings) ────────────────────────
 

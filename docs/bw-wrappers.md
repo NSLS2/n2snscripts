@@ -131,7 +131,9 @@ NSLS2 N2C Entra app on the host and keeps a short-lived access token per
 NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
 `observability`, `docs` and `epics`. Skills read those files.
 
-- **Nothing is mounted by default.** `--n2c-token NAME` mounts
+- **Nothing is mounted by default**, except that `bwclaude` and `bwcodex` add
+  the `aifapim` token when its file exists (see [`bwclaude`](#bwclaude);
+  `N2C_GATEWAY=off` stops that). `--n2c-token NAME` mounts
   `creds/NAME/token` read-only at the same path; repeat it for several tokens.
   `--n2c-token all` mounts every token in the directory that you can enter.
   `all` together with names means all.
@@ -1749,12 +1751,17 @@ with a key.
 ### With your own token (no key)
 
 ```bash
-bwclaude --n2c-token aifapim
+bwclaude
 ```
 
 `n2c-token` keeps an access token for the gateway as the token named
 `aifapim` (see [N2C access tokens](#n2c-access-tokens)); it needs the gateway's
-user role (ask DSSI). When that token is mounted, `bwclaude`:
+user role (ask DSSI). `bwclaude` uses it with no option when its file exists.
+It adds `aifapim` to the tokens you ask for with `--n2c-token`, so
+`--n2c-token docs` mounts `docs` and `aifapim`. Without the file it adds
+nothing and says nothing, so someone without the role sees no warning.
+`--n2c-token aifapim` asks for it explicitly and warns when it is missing.
+When that token is mounted, `bwclaude`:
 
 - sets `ANTHROPIC_BASE_URL` to `https://${AIFAPIM_HOST}/anthropic`, with
   `hermes.nsls2.bnl.gov` when `AIFAPIM_HOST` is not set, so `AIFAPIM_HOST` is
@@ -1778,8 +1785,19 @@ helper too; `--exec` of any other command does not.
 
 The helper is given with `--settings` for this session only. It is never
 written to `settings.json`, which stays an ephemeral copy (see below). Run
-`n2c-token status aifapim` on the host to check the token; a missing token only
-warns, and without it `bwclaude` uses the key as below.
+`n2c-token status aifapim` on the host to check the token. Without the token,
+`bwclaude` uses the key as below.
+
+Set `N2C_GATEWAY=off` in the environment to use the key even when the token
+file exists: the token is then not used for the gateway (it is still mounted if
+you ask for it, for skills).
+
+Two limits of the automatic use. A token that has expired, because the
+`n2c-token` timer is not running, gets a `401` from the gateway: run
+`n2c-token refresh aifapim`, or set `N2C_GATEWAY=off`. And a credentials
+directory that holds an app-only token (a service account's, through
+`N2SN_CREDS_DIR`) is not suitable: the gateway refuses such a token on this
+route.
 
 ### With a key (legacy)
 
@@ -1895,12 +1913,15 @@ Three approved auth paths:
 ### Codex with your own token (no key)
 
 ```bash
-bwcodex --n2c-token aifapim
+bwcodex
 ```
 
 `n2c-token` keeps an access token for the gateway as the token named `aifapim`
 (see [N2C access tokens](#n2c-access-tokens)); it needs the gateway's
-user role (ask DSSI). When `--n2c-token` mounted that token, `bwcodex` passes
+user role (ask DSSI). `bwcodex` uses it with no option when its file exists,
+and adds it to the tokens you ask for with `--n2c-token`, as `bwclaude` does
+(see above, including `N2C_GATEWAY=off` and the two limits). When that token is
+mounted, `bwcodex` passes
 Codex a provider and the choice of it on the command line, for this session
 only. Nothing is written to `config.toml`:
 
@@ -1919,9 +1940,10 @@ only. Nothing is written to `config.toml`:
   refresh a ChatGPT login even when the provider does not use it, so an expired
   one would end the session with "your refresh token has expired".
 - `AIFAPIM_API_KEY` is not passed into the sandbox in this mode, and the
-  token is used even when the key is set. `--n2c-token all` also works. A
-  token that is missing (no gateway user role, say) only warns, and the key
-  route is used.
+  token is used even when the key is set (`N2C_GATEWAY=off` uses the key).
+  `--n2c-token all` also works. Without the token file (no gateway user role,
+  say) nothing is added and the key route is used; `--n2c-token aifapim` then
+  warns.
 
 The settings go right after the `codex` binary, so `--exec codex ...` gets them
 too (not any other `--exec` command), and a `--` among the arguments cannot

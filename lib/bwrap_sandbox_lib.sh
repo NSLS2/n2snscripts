@@ -1627,6 +1627,20 @@ add_n2c_token() {
     N2C_TOKENS+=("${name}")
 }
 
+# n2c_auto_gateway_token
+#   Ask for your own AI gateway token ("aifapim") without --n2c-token, when its
+#   file exists, unless N2C_GATEWAY=off.  Adds nothing and says nothing when
+#   the file is missing, so that someone without the gateway role sees no
+#   warning at every launch.  An explicit --n2c-token aifapim is not affected:
+#   it warns when the token is missing.  Call it before build_n2c_token_mounts.
+n2c_auto_gateway_token() {
+    [[ "${N2C_GATEWAY:-}" == off ]] && return 0
+    if [[ -f "$(_n2c_creds_root)/aifapim/token" ]]; then
+        N2C_TOKENS+=(aifapim)
+    fi
+    return 0
+}
+
 # The credentials are checked the way ssh checks a private key: a directory or
 # token that someone else could read or replace is refused.  The credentials
 # directory belongs to you (n2c-token keeps your own session tokens there) or

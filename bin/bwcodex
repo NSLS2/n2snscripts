@@ -5,7 +5,8 @@
 #   Binary masking is verified on RHEL 8.10 (bubblewrap-0.4.0-3.el8_10) and EL9 (0.6.3).
 #
 # Three approved auth paths are supported:
-#   - Your own gateway token, no key: --n2c-token aifapim.  A provider with an
+#   - Your own gateway token, no key: used when its file exists (or with
+#       --n2c-token aifapim), unless N2C_GATEWAY=off.  A provider with an
 #       auth command (cat of the token file) is passed with -c for the session;
 #       nothing is written to config.toml.
 #   - Hermes (AIFAPIM) routing — provider block points at
@@ -318,8 +319,8 @@ Wrapper options (consumed before codex sees the command line):
                   asked for.  Tokens are written on the host by `n2c-token`
                   (run `n2c-token login` first); the refresh token is never
                   mounted.  A missing token only warns.
-                  `--n2c-token aifapim` is also how codex signs in to the AI
-                  gateway with your own token and no key (see below).
+                  The `aifapim` token is added to whatever you ask for, when its
+                  file exists (see below).
   --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
                   May be repeated to accumulate multiple extra paths.
                   Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
@@ -350,13 +351,16 @@ All other arguments are passed through to codex unchanged.
 
 Authentication:
   Two paths are supported:
-    - Your own token:    bwcodex --n2c-token aifapim.  Codex then calls
+    - Your own token:    bwcodex, when its file exists (n2c-token keeps it);
+                         it is added to the tokens you ask for with
+                         --n2c-token.  Codex then calls
                          https://$AIFAPIM_HOST/openai/v1 (default
                          hermes.nsls2.bnl.gov) through a provider given on the
                          command line, whose auth command reads the token file
                          that n2c-token renews.  Needs the gateway's
                          user role (ask DSSI).  Used even when AIFAPIM_API_KEY
                          is set; ~/.codex/auth.json is not mounted then.
+                         N2C_GATEWAY=off uses the key instead.
     - Hermes (AIFAPIM):  set AIFAPIM_API_KEY (e.g. via `load_dotenv`) and
                          keep OPENAI_API_KEY=dummy.  See ~/.codex/config.toml
                          for the [model_providers.nsls2-hermes] block.
@@ -562,7 +566,7 @@ build_ssl_cert_file_mount() {
 codex_gateway_token() {
     local _p _found=""
     for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
-        if [[ "${_p}" == */aifapim/token ]]; then
+        if [[ "${_p}" == */aifapim/token && "${N2C_GATEWAY:-}" != off ]]; then
             _found="${_p}"
         fi
     done
@@ -733,6 +737,7 @@ main() {
     build_managed_skills
     build_home_tmpfs
     build_workdir_mount
+    n2c_auto_gateway_token
     build_n2c_token_mounts
     build_codex_home_mount
     build_codex_authoring_mounts

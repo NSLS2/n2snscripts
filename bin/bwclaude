@@ -290,8 +290,8 @@ Wrapper options (consumed before claude sees the command line):
                   asked for.  Tokens are written on the host by `n2c-token`
                   (run `n2c-token login` first); the refresh token is never
                   mounted.  A missing token only warns.
-                  `--n2c-token aifapim` is also how claude signs in to the AI
-                  gateway with your own token and no key (see below).
+                  The `aifapim` token is added to whatever you ask for, when its
+                  file exists (see below).
   --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
                   May be repeated to accumulate multiple extra paths.
                   Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
@@ -321,13 +321,17 @@ Wrapper options (consumed before claude sees the command line):
 All other arguments are passed through to claude unchanged.
 
 AI gateway:
-  With your own token (no key):
-    bwclaude --n2c-token aifapim
-  When that token is mounted, claude calls https://$AIFAPIM_HOST/anthropic
-  (default hermes.nsls2.bnl.gov) and gets the token from an apiKeyHelper passed
-  with --settings, which re-reads the file n2c-token renews.  Without it, the
-  legacy key mode needs AIFAPIM_API_KEY and AIFAPIM_HOST (or the ANTHROPIC_FOUNDRY_*
-  variables).  The token needs the gateway's user role (ask DSSI).
+  With your own token (no key), when its file exists (n2c-token keeps it):
+    bwclaude
+  The token is added to the ones you ask for with --n2c-token, so
+  `--n2c-token docs` mounts both.  claude then calls
+  https://$AIFAPIM_HOST/anthropic (default hermes.nsls2.bnl.gov) and gets the
+  token from an apiKeyHelper passed with --settings, which re-reads the file
+  n2c-token renews.  The token needs the gateway's user role (ask DSSI); without
+  the file nothing is added and nothing is said.  `--n2c-token aifapim` asks for
+  it explicitly and warns when it is missing.
+  With a key instead: N2C_GATEWAY=off, or no token file.  The key mode needs
+  AIFAPIM_API_KEY and AIFAPIM_HOST (or the ANTHROPIC_FOUNDRY_* variables).
 
 Authentication:
   By default, credentials created inside the sandbox are ephemeral — they work
@@ -528,16 +532,18 @@ build_claude_env() {
     # be used on a personal machine without modifying the gateway logic below.
     #
     # Two ways to authenticate to the gateway:
-    #   - your own Entra token, when --n2c-token mounted the "aifapim" token
-    #     (not a --ro-path that looks like it): no key.  Claude Code runs its apiKeyHelper
+    #   - your own Entra token, when the "aifapim" token is mounted (by
+    #     n2c_auto_gateway_token, or --n2c-token; not a --ro-path that looks like
+    #     it) and N2C_GATEWAY is not "off": no key.  Claude Code runs its apiKeyHelper
     #     (`cat` of the token file, which n2c-token renews in place) at the
     #     start, about every 5 minutes, after a 401 and when the token expires,
     #     and sends the result as x-api-key and as Authorization: Bearer; the
     #     gateway ignores the key header and checks the bearer token.
     #   - an AIFAPIM key (legacy), in Foundry mode.
     local _gw_token="" _p
+    # N2C_GATEWAY=off: the token may be mounted (for skills) but is not used.
     for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
-        if [[ "${_p}" == */aifapim/token ]]; then
+        if [[ "${_p}" == */aifapim/token && "${N2C_GATEWAY:-}" != off ]]; then
             _gw_token="${_p}"
         fi
     done
@@ -564,8 +570,9 @@ build_claude_env() {
         if [[ "${DRY_RUN}" -eq 0 ]] && [[ -z "${TEST_CMD}" ]]; then
             if [[ -z "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]] && [[ -z "${AIFAPIM_API_KEY:-}" ]]; then
                 echo "Error: bwclaude needs your gateway token or an API key." >&2
-                echo "Use your own token (no key):" >&2
-                echo "  bwclaude --n2c-token aifapim      # token kept by n2c-token" >&2
+                echo "Use your own token (no key): sign in on the host, then run bwclaude again:" >&2
+                echo "  n2c-token login                   # then n2c-token refresh aifapim" >&2
+                [[ "${N2C_GATEWAY:-}" != off ]] || echo "  (N2C_GATEWAY=off is set, so the token is not used)" >&2
                 echo "Or export a key (legacy):" >&2
                 echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
                 echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key" >&2
@@ -741,6 +748,7 @@ main() {
     build_nsls2_mount
     build_claude_bin_mount
     build_dynamic_tool_mounts
+    n2c_auto_gateway_token
     build_n2c_token_mounts
     build_extra_path_mounts
 
