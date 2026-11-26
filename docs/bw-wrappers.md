@@ -1743,8 +1743,40 @@ Launches the [Claude CLI](https://docs.claude.com/en/docs/claude-code/overview) 
 bwclaude [bwclaude-options] [claude arguments...]
 ```
 
-Routes through the NSLS-II Hermes (AIFAPIM) gateway in Azure AI Foundry
-mode. The wrapper forces `CLAUDE_CODE_USE_FOUNDRY=1` and plumbs:
+Routes through the NSLS-II Hermes (AIFAPIM) gateway, with your own token or
+with a key.
+
+### With your own token (no key)
+
+```bash
+bwclaude --n2c-token aifapim
+```
+
+`n2c-token` keeps an access token for the gateway as the token named
+`aifapim` (see [N2C access tokens](#n2c-access-tokens)); it needs the gateway's
+user role (ask DSSI). When that token is mounted, `bwclaude`:
+
+- sets `ANTHROPIC_BASE_URL` to `https://${AIFAPIM_HOST}/anthropic`, with
+  `hermes.nsls2.bnl.gov` when `AIFAPIM_HOST` is not set, so `AIFAPIM_HOST` is
+  only for another gateway (for example `hermes-dev.nsls2.bnl.gov`);
+- does not use Foundry mode (a host `CLAUDE_CODE_USE_FOUNDRY` is unset in the
+  sandbox), and ignores `AIFAPIM_API_KEY`;
+- passes `--settings '{"apiKeyHelper":"cat <token file>"}'` to `claude`.
+  Claude Code runs the helper at the start, about every 5 minutes, after a 401
+  or 403 and when the token has expired, so it picks up the file that
+  `n2c-token` renews in place. It sends the result as `Authorization: Bearer`
+  and, because it treats it as a key, as `x-api-key`; the gateway ignores
+  the second.
+
+The helper is given with `--settings` for this session only. It is never
+written to `settings.json`, which stays an ephemeral copy (see below). Run
+`n2c-token status aifapim` on the host to check the token; a missing token only
+warns, and without it `bwclaude` uses the key as below.
+
+### With a key (legacy)
+
+Without the `aifapim` token, the wrapper uses Azure AI Foundry mode. It forces
+`CLAUDE_CODE_USE_FOUNDRY=1` and plumbs:
 
 - **`ANTHROPIC_FOUNDRY_BASE_URL`** — if not set, constructed as
   `https://${AIFAPIM_HOST}/anthropic`; override by exporting

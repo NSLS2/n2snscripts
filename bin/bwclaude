@@ -121,7 +121,7 @@
 set -euo pipefail
 
 # Source the shared sandbox library.
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck source=../lib/bwrap_sandbox_lib.sh
 source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 
@@ -287,6 +287,8 @@ Wrapper options (consumed before claude sees the command line):
                   asked for.  Tokens are written on the host by `n2c-token`
                   (run `n2c-token login` first); the refresh token is never
                   mounted.  A missing token only warns.
+                  `--n2c-token aifapim` is also how claude signs in to the AI
+                  gateway with your own token and no key (see below).
   --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
                   May be repeated to accumulate multiple extra paths.
                   Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
@@ -314,6 +316,15 @@ Wrapper options (consumed before claude sees the command line):
                   Use --dry-run to see it.
 
 All other arguments are passed through to claude unchanged.
+
+AI gateway:
+  With your own token (no key):
+    bwclaude --n2c-token aifapim
+  When that token is mounted, claude calls https://$AIFAPIM_HOST/anthropic
+  (default hermes.nsls2.bnl.gov) and gets the token from an apiKeyHelper passed
+  with --settings, which re-reads the file n2c-token renews.  Without it, the
+  legacy key mode needs AIFAPIM_API_KEY and AIFAPIM_HOST (or the ANTHROPIC_FOUNDRY_*
+  variables).  The token needs the gateway's user role (ask DSSI).
 
 Authentication:
   By default, credentials created inside the sandbox are ephemeral — they work
@@ -497,53 +508,78 @@ build_managed_claude_paths() {
 
 # ── Claude env vars ──────────────────────────────────────────────
 build_claude_env() {
-    # NOTE: bwclaude is hard-wired for the NSLS-II AIFAPIM/foundry gateway.
-    # It cannot be used on a personal machine without modifying the foundry
-    # URL/key logic below to point at a different foundry instance.
+    # NOTE: bwclaude is hard-wired for the NSLS-II AIFAPIM gateway.  It cannot
+    # be used on a personal machine without modifying the gateway logic below.
+    #
+    # Two ways to authenticate to the gateway:
+    #   - your own Entra token, when the n2c-token "aifapim" token is mounted
+    #     (--n2c-token aifapim): no key.  Claude Code runs its apiKeyHelper
+    #     (`cat` of the token file, which n2c-token renews in place) at the
+    #     start, about every 5 minutes, after a 401 and when the token expires,
+    #     and sends the result as x-api-key and as Authorization: Bearer; the
+    #     gateway ignores the key header and checks the bearer token.
+    #   - an AIFAPIM key (legacy), in Foundry mode.
+    local _gw_token="" _p
+    for _p in ${EXTRA_RO_PATHS[@]+"${EXTRA_RO_PATHS[@]}"}; do
+        if [[ "${_p}" == */aifapim/token ]]; then
+            _gw_token="${_p}"
+        fi
+    done
 
-    # Foundry mode is forced on (see CLAUDE_CODE_USE_FOUNDRY below).
-    # In foundry mode, Claude Code uses ANTHROPIC_FOUNDRY_* env vars and
-    # ignores ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY, so we no longer set
-    # those defaults.
-
-    # Foundry mode requires an API key and a gateway.  Fail fast with a clear
-    # message rather than letting Claude Code fall through to the Azure SDK
-    # credential chain (az login, managed identity, etc.) and emit a wall of
-    # CredentialUnavailableError output.  Only checked when claude itself is
-    # launched: --dry-run inspects the sandbox and --exec runs another
-    # command, neither needs credentials.
-    if [[ "${DRY_RUN}" -eq 0 ]] && [[ -z "${TEST_CMD}" ]]; then
-        if [[ -z "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]] && [[ -z "${AIFAPIM_API_KEY:-}" ]]; then
-            echo "Error: bwclaude (foundry mode) requires an API key." >&2
-            echo "Export one of:" >&2
-            echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
-            echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key (preferred)" >&2
+    if [[ -n "${_gw_token}" ]]; then
+        # The path goes into a JSON string that claude runs with a shell.
+        if [[ ! "${_gw_token}" =~ ^[A-Za-z0-9/._-]+$ ]]; then
+            echo "Error: the aifapim token path '${_gw_token}' may only contain letters, digits and / . _ -" >&2
             exit 1
         fi
-        if [[ -z "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]] && [[ -z "${AIFAPIM_HOST:-}" ]]; then
-            echo "Error: bwclaude requires AIFAPIM_HOST (or ANTHROPIC_FOUNDRY_BASE_URL) to be set." >&2
-            echo "Export one of:" >&2
-            echo "  AIFAPIM_HOST=<gateway-hostname>          # NSLS-II AIFAPIM gateway hostname" >&2
-            echo "  ANTHROPIC_FOUNDRY_BASE_URL=https://...   # full Foundry base URL override" >&2
-            exit 1
+        BWRAP_ARGS+=(--setenv ANTHROPIC_BASE_URL "https://${AIFAPIM_HOST:-hermes.nsls2.bnl.gov}/anthropic")
+    else
+        # Foundry mode is forced on (see CLAUDE_CODE_USE_FOUNDRY below).
+        # In foundry mode, Claude Code uses ANTHROPIC_FOUNDRY_* env vars and
+        # ignores ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY, so we no longer set
+        # those defaults.
+
+        # Foundry mode requires an API key and a gateway.  Fail fast with a clear
+        # message rather than letting Claude Code fall through to the Azure SDK
+        # credential chain (az login, managed identity, etc.) and emit a wall of
+        # CredentialUnavailableError output.  Only checked when claude itself is
+        # launched: --dry-run inspects the sandbox and --exec runs another
+        # command, neither needs credentials.
+        if [[ "${DRY_RUN}" -eq 0 ]] && [[ -z "${TEST_CMD}" ]]; then
+            if [[ -z "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]] && [[ -z "${AIFAPIM_API_KEY:-}" ]]; then
+                echo "Error: bwclaude needs your gateway token or an API key." >&2
+                echo "Use your own token (no key):" >&2
+                echo "  bwclaude --n2c-token aifapim      # token kept by n2c-token" >&2
+                echo "Or export a key (legacy):" >&2
+                echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
+                echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key" >&2
+                exit 1
+            fi
+            if [[ -z "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]] && [[ -z "${AIFAPIM_HOST:-}" ]]; then
+                echo "Error: bwclaude requires AIFAPIM_HOST (or ANTHROPIC_FOUNDRY_BASE_URL) to be set." >&2
+                echo "Export one of:" >&2
+                echo "  AIFAPIM_HOST=<gateway-hostname>          # NSLS-II AIFAPIM gateway hostname" >&2
+                echo "  ANTHROPIC_FOUNDRY_BASE_URL=https://...   # full Foundry base URL override" >&2
+                exit 1
+            fi
         fi
-    fi
 
-    # Foundry API key: prefer host's ANTHROPIC_FOUNDRY_API_KEY; fall back to
-    # AIFAPIM_API_KEY (the existing NSLS-II convention).
-    if [[ -n "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]]; then
-        pass_through_if_set ANTHROPIC_FOUNDRY_API_KEY
-    elif [[ -n "${AIFAPIM_API_KEY:-}" ]]; then
-        # Through SANDBOX_ENV, not --setenv: keeps the key off bwrap's argv.
-        SANDBOX_ENV+=("ANTHROPIC_FOUNDRY_API_KEY=${AIFAPIM_API_KEY}")
-    fi
+        # Foundry API key: prefer host's ANTHROPIC_FOUNDRY_API_KEY; fall back to
+        # AIFAPIM_API_KEY (the existing NSLS-II convention).
+        if [[ -n "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]]; then
+            pass_through_if_set ANTHROPIC_FOUNDRY_API_KEY
+        elif [[ -n "${AIFAPIM_API_KEY:-}" ]]; then
+            # Through SANDBOX_ENV, not --setenv: keeps the key off bwrap's argv.
+            SANDBOX_ENV+=("ANTHROPIC_FOUNDRY_API_KEY=${AIFAPIM_API_KEY}")
+        fi
 
-    # Foundry base URL: prefer explicit ANTHROPIC_FOUNDRY_BASE_URL override;
-    # otherwise derive from AIFAPIM_HOST.
-    if [[ -n "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]]; then
-        pass_through_if_set ANTHROPIC_FOUNDRY_BASE_URL
-    elif [[ -n "${AIFAPIM_HOST:-}" ]]; then
-        BWRAP_ARGS+=(--setenv ANTHROPIC_FOUNDRY_BASE_URL "https://${AIFAPIM_HOST}/anthropic")
+        # Foundry base URL: prefer explicit ANTHROPIC_FOUNDRY_BASE_URL override;
+        # otherwise derive from AIFAPIM_HOST.
+        if [[ -n "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]]; then
+            pass_through_if_set ANTHROPIC_FOUNDRY_BASE_URL
+        elif [[ -n "${AIFAPIM_HOST:-}" ]]; then
+            BWRAP_ARGS+=(--setenv ANTHROPIC_FOUNDRY_BASE_URL "https://${AIFAPIM_HOST}/anthropic")
+        fi
     fi
 
     # Forward any host CLAUDE_* env vars (incl. user overrides for verbosity, etc.).
@@ -565,7 +601,18 @@ build_claude_env() {
 
     # Enforce after the loop so host env cannot override these.
     BWRAP_ARGS+=(--setenv CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS 1)
-    BWRAP_ARGS+=(--setenv CLAUDE_CODE_USE_FOUNDRY 1)
+    if [[ -n "${_gw_token}" ]]; then
+        # A CLAUDE_CODE_USE_FOUNDRY on the host was forwarded above; Foundry mode
+        # would ignore ANTHROPIC_BASE_URL and the apiKeyHelper.
+        BWRAP_ARGS+=(--unsetenv CLAUDE_CODE_USE_FOUNDRY)
+        # --settings, not settings.json: that file is an ephemeral copy here,
+        # and an apiKeyHelper must never be written to the host's settings.json.
+        if [[ -z "${TEST_CMD}" ]]; then
+            TOOL_ARGS=(--settings "{\"apiKeyHelper\":\"cat ${_gw_token}\"}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
+        fi
+    else
+        BWRAP_ARGS+=(--setenv CLAUDE_CODE_USE_FOUNDRY 1)
+    fi
 
     # In foundry mode the haiku model used for background tasks defaults to a
     # date-pinned ID that the foundry proxy may not recognise.  Override with
@@ -694,4 +741,7 @@ main() {
     fi
 }
 
-main "$@"
+# Run only when executed, so the tests can source this file for its functions.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
