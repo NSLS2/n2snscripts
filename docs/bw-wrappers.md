@@ -1768,6 +1768,10 @@ user role (ask DSSI). When that token is mounted, `bwclaude`:
   and, because it treats it as a key, as `x-api-key`; the gateway ignores
   the second.
 
+Only a token that `--n2c-token` mounted counts: a `--ro-path` that ends in
+`aifapim/token` does not switch the token mode on, because `--ro-path` mounts
+the resolved target of a symlink at its target.
+
 `--exec` of `claude` itself (`--exec /usr/local/bin/claude`, which a wrapper
 uses so that `bwclaude` does not run the wrapper it finds in `PATH`) gets the
 helper too; `--exec` of any other command does not.
@@ -1808,6 +1812,12 @@ confines the session, so `bwclaude` also binds a drop-in,
 the drop-in after the managed file, so every other managed key stays in force.
 The drop-in is added only when the managed file exists, and only inside the
 sandbox: `claude` run outside `bwclaude` keeps the strict policy.
+
+The managed `sandbox.filesystem.denyRead` list (`~/.aws`, `~/.ssh`,
+`~/.config/gh`, `~/.azure`, `~/.docker/config.json`) is not enforced inside
+`bwclaude` any more. The sandbox never mounts the home directory, and refuses
+`--ro-path` and `--rw-path` for all of those except `~/.azure`, which is the one
+gap: `--ro-path ~/.azure` is allowed.
 
 Additional options:
 

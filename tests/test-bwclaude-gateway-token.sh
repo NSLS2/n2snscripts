@@ -38,7 +38,7 @@ readonly KEY=not-a-real-key-AAAA
 readonly HOST=gateway.example.org
 
 # env_body [VAR=VALUE...]: build_claude_env with the given host environment;
-# prints what it added, then the exit code (the EXIT trap).  EXTRA_RO_PATHS is
+# prints what it added, then the exit code (the EXIT trap).  N2C_TOKEN_FILES is
 # set by the caller, as build_n2c_token_mounts would.  Run it in a subshell:
 # build_claude_env can exit.
 env_body() {
@@ -59,7 +59,7 @@ run_env() { (env_body "$@"); }
 
 # ── token mode ──────────────────────────────────────────────────────────
 
-EXTRA_RO_PATHS=("${TOKEN}")
+N2C_TOKEN_FILES=("${TOKEN}")
 OUT="$(run_env)"
 check 'token: base URL defaults to hermes' \
     contains "${OUT}" '--setenv ANTHROPIC_BASE_URL https://hermes.nsls2.bnl.gov/anthropic'
@@ -87,7 +87,7 @@ TEST_CMD="claude --version" OUT="$(run_env)"
 check 'token: --exec of claude with arguments gets --settings' contains "${OUT}" 'ARGS --settings'
 TEST_CMD=""
 
-EXTRA_RO_PATHS=('/run/user/1000/a b/aifapim/token')
+N2C_TOKEN_FILES=('/run/user/1000/a b/aifapim/token')
 OUT="$(run_env)"
 check 'token: a path that needs quoting is refused' contains "${OUT}" 'may only contain'
 check '... and stops the launch' contains "${OUT}" 'exit=1'
@@ -108,6 +108,7 @@ export N2SN_CREDS_DIR="${CREDS}"
 
 mount_env() { # mount_env TOKEN-NAME: --n2c-token NAME, then build_claude_env
     EXTRA_RO_PATHS=()
+    N2C_TOKEN_FILES=()
     N2C_TOKENS=()
     add_n2c_token "$1"
     build_n2c_token_mounts 2> /dev/null
@@ -122,9 +123,18 @@ OUT="$(mount_env observability)"
 check 'observability only: key mode' contains "${OUT}" '--setenv CLAUDE_CODE_USE_FOUNDRY 1'
 unset N2SN_CREDS_DIR
 
+# A --ro-path is canonicalised and mounted at its target, so a path that only
+# looks like the token (a symlink, say) must not switch the token mode on.
+N2C_TOKEN_FILES=()
+EXTRA_RO_PATHS=("${TOKEN}")
+OUT="$(run_env AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST="${HOST}")"
+check 'a --ro-path ending in aifapim/token is not the token' lacks "${OUT}" 'ARGS --settings'
+check '... and key mode is used' contains "${OUT}" '--setenv CLAUDE_CODE_USE_FOUNDRY 1'
+EXTRA_RO_PATHS=()
+
 # ── key mode (legacy) ───────────────────────────────────────────────────
 
-EXTRA_RO_PATHS=("/run/user/1000/nsls2/creds/observability/token")
+N2C_TOKEN_FILES=("/run/user/1000/nsls2/creds/observability/token")
 OUT="$(run_env AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST=aifapim.nsls2.bnl.gov)"
 check 'key: Foundry mode is on' contains "${OUT}" '--setenv CLAUDE_CODE_USE_FOUNDRY 1'
 check 'key: Foundry base URL from AIFAPIM_HOST' \

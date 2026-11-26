@@ -88,6 +88,9 @@ PASTA_ARGS=()
 # N2C access tokens requested with --n2c-token (names, or "all").
 # Populated by add_n2c_token; mounted by build_n2c_token_mounts.
 N2C_TOKENS=()
+# The token files build_n2c_token_mounts mounted (canonical paths).
+# shellcheck disable=SC2034  # read by the launchers (bwclaude)
+N2C_TOKEN_FILES=()
 
 # Sandbox context file (see "Sandbox context" below).  The launchers set
 # SANDBOX_CONTEXT_ENABLED=0 for --no-sandbox-context and fill
@@ -1840,6 +1843,7 @@ build_n2c_token_mounts() {
     fi
     for tfile in "${found[@]+"${found[@]}"}"; do
         EXTRA_RO_PATHS+=("${tfile}")
+        N2C_TOKEN_FILES+=("${tfile}")
     done
 
     # The sandbox environment is scrubbed (env -i), so tell consumers where the

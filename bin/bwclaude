@@ -528,15 +528,15 @@ build_claude_env() {
     # be used on a personal machine without modifying the gateway logic below.
     #
     # Two ways to authenticate to the gateway:
-    #   - your own Entra token, when the n2c-token "aifapim" token is mounted
-    #     (--n2c-token aifapim): no key.  Claude Code runs its apiKeyHelper
+    #   - your own Entra token, when --n2c-token mounted the "aifapim" token
+    #     (not a --ro-path that looks like it): no key.  Claude Code runs its apiKeyHelper
     #     (`cat` of the token file, which n2c-token renews in place) at the
     #     start, about every 5 minutes, after a 401 and when the token expires,
     #     and sends the result as x-api-key and as Authorization: Bearer; the
     #     gateway ignores the key header and checks the bearer token.
     #   - an AIFAPIM key (legacy), in Foundry mode.
     local _gw_token="" _p _cmd
-    for _p in ${EXTRA_RO_PATHS[@]+"${EXTRA_RO_PATHS[@]}"}; do
+    for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
         if [[ "${_p}" == */aifapim/token ]]; then
             _gw_token="${_p}"
         fi
