@@ -4,7 +4,10 @@
 # Requires: bwrap >= 0.4.0 (RHEL 8)
 #   Binary masking is verified on RHEL 8.10 (bubblewrap-0.4.0-3.el8_10) and EL9 (0.6.3).
 #
-# Two approved auth paths are supported (configured in ~/.codex/config.toml):
+# Three approved auth paths are supported:
+#   - Your own gateway token, no key: --n2c-token aifapim.  A provider with an
+#       auth command (cat of the token file) is passed with -c for the session;
+#       nothing is written to config.toml.
 #   - Hermes (AIFAPIM) routing — provider block points at
 #       https://${AIFAPIM_HOST}/openai/v1 with x-api-key header;
 #       wrapper plumbs AIFAPIM_HOST + AIFAPIM_API_KEY through.  Set
@@ -138,7 +141,7 @@
 set -euo pipefail
 
 # Source the shared sandbox library.
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck source=../lib/bwrap_sandbox_lib.sh
 source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 
@@ -315,6 +318,8 @@ Wrapper options (consumed before codex sees the command line):
                   asked for.  Tokens are written on the host by `n2c-token`
                   (run `n2c-token login` first); the refresh token is never
                   mounted.  A missing token only warns.
+                  `--n2c-token aifapim` is also how codex signs in to the AI
+                  gateway with your own token and no key (see below).
   --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
                   May be repeated to accumulate multiple extra paths.
                   Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
@@ -345,6 +350,13 @@ All other arguments are passed through to codex unchanged.
 
 Authentication:
   Two paths are supported:
+    - Your own token:    bwcodex --n2c-token aifapim.  Codex then calls
+                         https://$AIFAPIM_HOST/openai/v1 (default
+                         hermes.nsls2.bnl.gov) through a provider given on the
+                         command line, whose auth command reads the token file
+                         that n2c-token renews.  Needs the gateway's
+                         user role (ask DSSI).  Used even when AIFAPIM_API_KEY
+                         is set.
     - Hermes (AIFAPIM):  set AIFAPIM_API_KEY (e.g. via `load_dotenv`) and
                          keep OPENAI_API_KEY=dummy.  See ~/.codex/config.toml
                          for the [model_providers.nsls2-hermes] block.
@@ -542,9 +554,41 @@ build_ssl_cert_file_mount() {
 # is the x-api-key header sourced from AIFAPIM_API_KEY via the
 # provider's env_http_headers).
 build_codex_env() {
+    # The gateway token (n2c-token "aifapim"), when --n2c-token mounted it: your
+    # own Entra token and no key.  Codex runs auth.command (a `cat` of the
+    # token file, which n2c-token renews in place) when it starts, every 5
+    # minutes and after an authentication retry, and sends the result as
+    # Authorization: Bearer.  Not a key from the host.
+    local _gw_token="" _p _provider
+    for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
+        if [[ "${_p}" == */aifapim/token ]]; then
+            _gw_token="${_p}"
+        fi
+    done
+
     # AIFAPIM gateway config
     pass_through_if_set AIFAPIM_HOST
-    pass_through_if_set AIFAPIM_API_KEY
+    if [[ -n "${_gw_token}" ]]; then
+        # The path goes into a TOML string that Codex runs with its command.
+        if [[ ! "${_gw_token}" =~ ^[A-Za-z0-9/._-]+$ ]]; then
+            echo "Error: the aifapim token path '${_gw_token}' may only contain letters, digits and / . _ -" >&2
+            exit 1
+        fi
+        # A whole provider and the choice of it, on the command line for this
+        # session only (never written to config.toml).  It needs its own
+        # provider: an auth command cannot be combined with env_key.  Put it
+        # right after the binary, in the command the library runs: a later
+        # position could follow a "--".  AIFAPIM_API_KEY stays on the host.
+        if [[ "${_TOOL_CMD[0]:-}" == codex || "${_TOOL_CMD[0]:-}" == */codex ]]; then
+            _provider="{name=\"NSLS-II AI gateway (your token)\", base_url=\"https://${AIFAPIM_HOST:-hermes.nsls2.bnl.gov}/openai/v1\", wire_api=\"responses\", auth={command=\"cat\", args=[\"${_gw_token}\"]}}"
+            _TOOL_CMD=("${_TOOL_CMD[0]}"
+                -c 'model_provider="nsls2-hermes-token"'
+                -c "model_providers.nsls2-hermes-token=${_provider}"
+                "${_TOOL_CMD[@]:1}")
+        fi
+    else
+        pass_through_if_set AIFAPIM_API_KEY
+    fi
 
     # OPENAI_API_KEY is required by Codex's provider preflight.  Hermes
     # ignores the Authorization header (real auth is x-api-key), so a
@@ -710,4 +754,7 @@ main() {
     fi
 }
 
-main "$@"
+# Run only when executed, so the tests can source this file for its functions.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

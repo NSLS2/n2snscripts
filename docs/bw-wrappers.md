@@ -1881,14 +1881,50 @@ a bubblewrap sandbox.
 bwcodex [bwcodex-options] [codex arguments...]
 ```
 
-Two approved auth paths (configured in `~/.codex/config.toml`):
+Three approved auth paths:
 
-- **Hermes (AIFAPIM) routing** — provider block points at
+- **Your own gateway token (no key)** — `bwcodex --n2c-token aifapim`, see
+  below.
+- **Hermes (AIFAPIM) routing** (configured in `~/.codex/config.toml`) — provider block points at
   `https://${AIFAPIM_HOST}/openai/v1` with `x-api-key` header; the
   wrapper plumbs `AIFAPIM_HOST` and `AIFAPIM_API_KEY` through.
 - **BNL ITD ChatGPT subscription** — `codex login` OAuth flow persists
   tokens to `~/.codex/auth.json`. Run once with `--init-auth` to make
   that file persist across sandbox invocations.
+
+### Codex with your own token (no key)
+
+```bash
+bwcodex --n2c-token aifapim
+```
+
+`n2c-token` keeps an access token for the gateway as the token named `aifapim`
+(see [N2C access tokens](#n2c-access-tokens)); it needs the gateway's
+user role (ask DSSI). When `--n2c-token` mounted that token, `bwcodex` passes
+Codex a provider and the choice of it on the command line, for this session
+only. Nothing is written to `config.toml`:
+
+- The provider is `nsls2-hermes-token`, with `base_url`
+  `https://${AIFAPIM_HOST}/openai/v1` (`hermes.nsls2.bnl.gov` when
+  `AIFAPIM_HOST` is not set) and `wire_api = "responses"`.
+- Its `auth` command is `cat` of the token file. Codex runs it at the start,
+  every 5 minutes and after an authentication retry, so it picks up the file
+  that `n2c-token` renews in place, and sends the result as
+  `Authorization: Bearer`.
+- It has no `env_key`: Codex does not allow an `auth` command together with
+  one, so the key provider of `config.toml` cannot be reused. The model still
+  comes from `config.toml`.
+- `AIFAPIM_API_KEY` is not passed into the sandbox in this mode, and the
+  token is used even when the key is set. `--n2c-token all` also works. A
+  token that is missing (no gateway user role, say) only warns, and the key
+  route is used.
+
+The settings go right after the `codex` binary, so `--exec codex ...` gets them
+too (not any other `--exec` command), and a `--` among the arguments cannot
+come before them. Only a token that `--n2c-token` mounted counts, not a
+`--ro-path` that ends in `aifapim/token`. Codex's own inner sandbox is
+Landlock, which needs no extra tool, so unlike `bwclaude` nothing has to be
+switched off.
 
 The wrapper keeps `~/.codex/packages` in its ephemeral Codex home. When the
 daemon starts, Codex copies its package from the system CLI, which the wrapper
