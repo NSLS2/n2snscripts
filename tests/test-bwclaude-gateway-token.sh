@@ -80,7 +80,11 @@ check 'token: a host CLAUDE_CODE_USE_FOUNDRY is unset again' \
     contains "${OUT}" '--unsetenv CLAUDE_CODE_USE_FOUNDRY'
 
 TEST_CMD=bash OUT="$(run_env)"
-check 'token: --exec gets no --settings' lacks "${OUT}" 'ARGS --settings'
+check 'token: --exec bash gets no --settings' lacks "${OUT}" 'ARGS --settings'
+TEST_CMD=/usr/local/bin/claude OUT="$(run_env)"
+check 'token: --exec of claude gets --settings' contains "${OUT}" 'ARGS --settings'
+TEST_CMD="claude --version" OUT="$(run_env)"
+check 'token: --exec of claude with arguments gets --settings' contains "${OUT}" 'ARGS --settings'
 TEST_CMD=""
 
 EXTRA_RO_PATHS=('/run/user/1000/a b/aifapim/token')

@@ -1768,6 +1768,10 @@ user role (ask DSSI). When that token is mounted, `bwclaude`:
   and, because it treats it as a key, as `x-api-key`; the gateway ignores
   the second.
 
+`--exec` of `claude` itself (`--exec /usr/local/bin/claude`, which a wrapper
+uses so that `bwclaude` does not run the wrapper it finds in `PATH`) gets the
+helper too; `--exec` of any other command does not.
+
 The helper is given with `--settings` for this session only. It is never
 written to `settings.json`, which stays an ephemeral copy (see below). Run
 `n2c-token status aifapim` on the host to check the token; a missing token only

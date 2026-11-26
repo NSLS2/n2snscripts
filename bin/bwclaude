@@ -519,7 +519,7 @@ build_claude_env() {
     #     and sends the result as x-api-key and as Authorization: Bearer; the
     #     gateway ignores the key header and checks the bearer token.
     #   - an AIFAPIM key (legacy), in Foundry mode.
-    local _gw_token="" _p
+    local _gw_token="" _p _cmd
     for _p in ${EXTRA_RO_PATHS[@]+"${EXTRA_RO_PATHS[@]}"}; do
         if [[ "${_p}" == */aifapim/token ]]; then
             _gw_token="${_p}"
@@ -607,7 +607,10 @@ build_claude_env() {
         BWRAP_ARGS+=(--unsetenv CLAUDE_CODE_USE_FOUNDRY)
         # --settings, not settings.json: that file is an ephemeral copy here,
         # and an apiKeyHelper must never be written to the host's settings.json.
-        if [[ -z "${TEST_CMD}" ]]; then
+        # Also for --exec of claude itself (a wrapper that names the binary, so
+        # that it does not run the wrapper found in PATH), not for other commands.
+        _cmd="${TEST_CMD%% *}"
+        if [[ -z "${TEST_CMD}" || "${_cmd##*/}" == claude ]]; then
             TOOL_ARGS=(--settings "{\"apiKeyHelper\":\"cat ${_gw_token}\"}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
         fi
     else
