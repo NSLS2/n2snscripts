@@ -129,6 +129,9 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 # Tool-specific state
 # ═══════════════════════════════════════════════════════════════════
 
+# Where Claude Code looks for managed settings.  A plain assignment, not read
+# from the environment: the tests set it after sourcing this file.
+CLAUDE_MANAGED_DIR=/etc/claude-code
 INIT_AUTH=0
 DEBUG_MODE=0
 FORWARD_GH_TOKENS=0
@@ -491,18 +494,31 @@ build_claude_cache_mount() {
 # or /etc/claude-code.  The alias is resolved before binding so its deployed
 # target remains reachable in the sandbox.
 build_managed_claude_paths() {
-    if [[ -e /etc/claude-code/managed-settings.json ]]; then
-        BWRAP_ARGS+=(--dir /etc/claude-code)
+    if [[ -e "${CLAUDE_MANAGED_DIR}/managed-settings.json" ]]; then
+        BWRAP_ARGS+=(--dir "${CLAUDE_MANAGED_DIR}")
         build_managed_ro_bind \
-            /etc/claude-code/managed-settings.json \
-            /etc/claude-code/managed-settings.json
+            "${CLAUDE_MANAGED_DIR}/managed-settings.json" \
+            "${CLAUDE_MANAGED_DIR}/managed-settings.json"
+
+        # The managed settings turn on Claude Code's own sandbox and refuse to
+        # start without it (sandbox.failIfUnavailable), which needs bubblewrap
+        # and socat.  socat is masked in this sandbox, and bwrap already
+        # confines the session, so a drop-in turns the inner sandbox off.
+        # Claude Code merges managed-settings.d/*.json after the managed file,
+        # so every other managed key stays in force.
+        bwrap_fd_from_data "managed-settings drop-in that turns Claude Code's own sandbox off" \
+            '{"sandbox":{"enabled":false,"failIfUnavailable":false}}'
+        BWRAP_ARGS+=(
+            --dir "${CLAUDE_MANAGED_DIR}/managed-settings.d"
+            --ro-bind-data "${_BWRAP_FD}" "${CLAUDE_MANAGED_DIR}/managed-settings.d/99-bwclaude.json"
+        )
     fi
 
-    if [[ -d /etc/claude-code/.claude/skills && -r /etc/claude-code/.claude/skills ]]; then
-        BWRAP_ARGS+=(--dir /etc/claude-code --dir /etc/claude-code/.claude)
+    if [[ -d "${CLAUDE_MANAGED_DIR}/.claude/skills" && -r "${CLAUDE_MANAGED_DIR}/.claude/skills" ]]; then
+        BWRAP_ARGS+=(--dir "${CLAUDE_MANAGED_DIR}" --dir "${CLAUDE_MANAGED_DIR}/.claude")
         build_managed_ro_bind \
-            /etc/claude-code/.claude/skills \
-            /etc/claude-code/.claude/skills
+            "${CLAUDE_MANAGED_DIR}/.claude/skills" \
+            "${CLAUDE_MANAGED_DIR}/.claude/skills"
     fi
 }
 

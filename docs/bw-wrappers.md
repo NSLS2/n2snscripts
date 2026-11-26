@@ -1796,6 +1796,19 @@ Without the `aifapim` token, the wrapper uses Azure AI Foundry mode. It forces
 The legacy `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` env vars are *not*
 honored in foundry mode and the wrapper no longer sets them.
 
+### Claude Code's own sandbox
+
+Where the managed settings (`/etc/claude-code/managed-settings.json`, from the
+`compliance` role) turn on Claude Code's own sandbox with
+`sandbox.failIfUnavailable`, `claude` refuses to start unless `bubblewrap` and
+`socat` are installed. `socat` is masked inside `bwclaude`, and `bwrap` already
+confines the session, so `bwclaude` also binds a drop-in,
+`/etc/claude-code/managed-settings.d/99-bwclaude.json`, that sets
+`sandbox.enabled` and `sandbox.failIfUnavailable` to `false`. Claude Code merges
+the drop-in after the managed file, so every other managed key stays in force.
+The drop-in is added only when the managed file exists, and only inside the
+sandbox: `claude` run outside `bwclaude` keeps the strict policy.
+
 Additional options:
 
 | Option | Effect |

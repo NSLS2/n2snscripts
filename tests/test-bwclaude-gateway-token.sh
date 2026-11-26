@@ -137,5 +137,34 @@ OUT="$(run_env)"
 check 'no key and no token: stops' contains "${OUT}" 'exit=1'
 check '... and names --n2c-token aifapim' contains "${OUT}" 'bwclaude --n2c-token aifapim'
 
+# ── Claude Code's own sandbox (managed settings) ────────────────────────
+
+MANAGED="$(mktemp -d "${ROOT}/.managed-test.XXXXXX")"
+trap 'rm -rf "${CREDS%/creds}" "${MANAGED}"' EXIT
+CLAUDE_MANAGED_DIR="${MANAGED}"
+DROPIN="${MANAGED}/managed-settings.d/99-bwclaude.json"
+
+BWRAP_ARGS=()
+build_managed_claude_paths
+check 'no managed settings: no drop-in' lacks "${BWRAP_ARGS[*]-}" 'managed-settings.d'
+
+printf '{"sandbox":{"enabled":true,"failIfUnavailable":true}}\n' > "${MANAGED}/managed-settings.json"
+BWRAP_ARGS=()
+build_managed_claude_paths
+check 'managed settings are bound read-only' \
+    contains "${BWRAP_ARGS[*]}" "--ro-bind ${MANAGED}/managed-settings.json ${MANAGED}/managed-settings.json"
+check 'a drop-in is bound after them' \
+    contains "${BWRAP_ARGS[*]}" "${MANAGED}/managed-settings.d --ro-bind-data "
+check '... at 99-bwclaude.json' contains "${BWRAP_ARGS[*]}" "${DROPIN}"
+JOINED="${BWRAP_ARGS[*]}"
+FD="${JOINED#*--ro-bind-data }"
+FD="${FD%% *}"
+check 'the drop-in turns the inner sandbox off' \
+    contains "${_BWRAP_FD_DATA[${FD}]}" '"enabled":false,"failIfUnavailable":false'
+if command -v python3 > /dev/null; then
+    check 'the drop-in is valid JSON' \
+        python3 -c 'import json,sys; json.loads(sys.argv[1])' "${_BWRAP_FD_DATA[${FD}]}"
+fi
+
 printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
 [[ "${FAIL}" -eq 0 ]]
