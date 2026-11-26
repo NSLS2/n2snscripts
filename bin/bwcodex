@@ -356,7 +356,7 @@ Authentication:
                          command line, whose auth command reads the token file
                          that n2c-token renews.  Needs the gateway's
                          user role (ask DSSI).  Used even when AIFAPIM_API_KEY
-                         is set.
+                         is set; ~/.codex/auth.json is not mounted then.
     - Hermes (AIFAPIM):  set AIFAPIM_API_KEY (e.g. via `load_dotenv`) and
                          keep OPENAI_API_KEY=dummy.  See ~/.codex/config.toml
                          for the [model_providers.nsls2-hermes] block.
@@ -517,7 +517,11 @@ build_codex_home_mount() {
             echo "Created ${CODEX_AUTH_FILE} — auth tokens will persist after this session." >&2
         fi
     fi
-    if _persist_bind_wanted "${CODEX_AUTH_FILE}"; then
+    # Not with the gateway token: the session has no use for ChatGPT credentials,
+    # and Codex tries to refresh them even when the provider does not use them,
+    # so an expired login there fails with "your refresh token has expired".
+    # --init-auth asks for them on purpose.
+    if [[ "${INIT_AUTH}" -eq 1 || -z "$(codex_gateway_token)" ]] && _persist_bind_wanted "${CODEX_AUTH_FILE}"; then
         BWRAP_ARGS+=(--bind "${CODEX_AUTH_FILE}" "${CODEX_AUTH_FILE}")
     fi
 }
@@ -553,18 +557,24 @@ build_ssl_cert_file_mount() {
 # provider preflight passes for Hermes-routed setups (the real auth
 # is the x-api-key header sourced from AIFAPIM_API_KEY via the
 # provider's env_http_headers).
-build_codex_env() {
-    # The gateway token (n2c-token "aifapim"), when --n2c-token mounted it: your
-    # own Entra token and no key.  Codex runs auth.command (a `cat` of the
-    # token file, which n2c-token renews in place) when it starts, every 5
-    # minutes and after an authentication retry, and sends the result as
-    # Authorization: Bearer.  Not a key from the host.
-    local _gw_token="" _p _provider
+# The gateway token (n2c-token "aifapim") when --n2c-token mounted it, else
+# nothing: your own Entra token and no key.  Not a --ro-path that looks like it.
+codex_gateway_token() {
+    local _p _found=""
     for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
         if [[ "${_p}" == */aifapim/token ]]; then
-            _gw_token="${_p}"
+            _found="${_p}"
         fi
     done
+    printf '%s' "${_found}"
+}
+
+build_codex_env() {
+    # Codex runs auth.command (a `cat` of the token file, which n2c-token renews
+    # in place) when it starts, every 5 minutes and after an authentication
+    # retry, and sends the result as Authorization: Bearer.
+    local _gw_token _provider
+    _gw_token="$(codex_gateway_token)"
 
     # AIFAPIM gateway config
     pass_through_if_set AIFAPIM_HOST
@@ -723,6 +733,7 @@ main() {
     build_managed_skills
     build_home_tmpfs
     build_workdir_mount
+    build_n2c_token_mounts
     build_codex_home_mount
     build_codex_authoring_mounts
     build_git_mounts
@@ -734,7 +745,6 @@ main() {
     build_nsls2_mount
     build_codex_bin_mount
     build_dynamic_tool_mounts
-    build_n2c_token_mounts
     build_extra_path_mounts
 
     # Environment variables

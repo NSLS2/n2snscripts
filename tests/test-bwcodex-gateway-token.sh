@@ -156,6 +156,42 @@ check 'a --ro-path ending in aifapim/token is not the token' lacks "${OUT}" 'mod
 check '... and key mode is used' contains "${OUT}" "AIFAPIM_API_KEY=${KEY}"
 EXTRA_RO_PATHS=()
 
+# ── auth.json: not in token mode ────────────────────────────────────────
+# Codex tries to refresh a ChatGPT login even when the provider does not use
+# it, so an expired one there fails a gateway session.  The file is bound only
+# without the token, or when --init-auth asks for it.
+
+HOMEDIR="$(mktemp -d "${ROOT}/.codexhome-test.XXXXXX")"
+trap 'rm -rf "${CREDS%/creds}" "${HOMEDIR}"' EXIT
+CODEX_HOME_DIR="${HOMEDIR}/.codex"
+mkdir -p "${CODEX_HOME_DIR}"
+CODEX_CONFIG_FILE="${CODEX_HOME_DIR}/config.toml"
+CODEX_AGENTS_FILE="${CODEX_HOME_DIR}/AGENTS.md"
+CODEX_AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
+CODEX_HISTORY_FILE="${CODEX_HOME_DIR}/history.jsonl"
+CODEX_DAEMON_SETTINGS_FILE="${CODEX_HOME_DIR}/app-server-daemon/settings.json"
+SYSTEM_CODEX_CONFIG_FILE=/nonexistent
+SYSTEM_CODEX_REQUIREMENTS_FILE=/nonexistent
+printf '{}\n' > "${CODEX_AUTH_FILE}"
+DRY_RUN=1
+PERSIST_CONFIG=0
+
+# home_args TOKEN-FILES INIT-AUTH: the bwrap arguments for the Codex home
+home_args() {
+    BWRAP_ARGS=()
+    N2C_TOKEN_FILES=("${1:+${TOKEN}}")
+    [[ -n "${1}" ]] || N2C_TOKEN_FILES=()
+    INIT_AUTH="$2"
+    build_codex_home_mount > /dev/null 2>&1
+    printf '%s' "${BWRAP_ARGS[*]}"
+}
+AUTH_BIND="--bind ${CODEX_AUTH_FILE} ${CODEX_AUTH_FILE}"
+check 'no token: auth.json is bound' contains "$(home_args '' 0)" "${AUTH_BIND}"
+check 'token: auth.json is not bound' lacks "$(home_args yes 0)" "${AUTH_BIND}"
+check 'token with --init-auth: auth.json is bound' contains "$(home_args yes 1)" "${AUTH_BIND}"
+DRY_RUN=0
+INIT_AUTH=0
+
 # ── key mode ────────────────────────────────────────────────────────────
 
 OUT="$(run_env AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST="${HOST}")"

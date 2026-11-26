@@ -1914,6 +1914,10 @@ only. Nothing is written to `config.toml`:
 - It has no `env_key`: Codex does not allow an `auth` command together with
   one, so the key provider of `config.toml` cannot be reused. The model still
   comes from `config.toml`.
+- `~/.codex/auth.json` (a ChatGPT login) is not mounted in this mode, unless
+  you pass `--init-auth`. The session has no use for it, and Codex tries to
+  refresh a ChatGPT login even when the provider does not use it, so an expired
+  one would end the session with "your refresh token has expired".
 - `AIFAPIM_API_KEY` is not passed into the sandbox in this mode, and the
   token is used even when the key is set. `--n2c-token all` also works. A
   token that is missing (no gateway user role, say) only warns, and the key
