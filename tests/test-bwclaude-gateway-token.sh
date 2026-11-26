@@ -85,6 +85,12 @@ TEST_CMD=/usr/local/bin/claude OUT="$(run_env)"
 check 'token: --exec of claude gets --settings' contains "${OUT}" 'ARGS --settings'
 TEST_CMD="claude --version" OUT="$(run_env)"
 check 'token: --exec of claude with arguments gets --settings' contains "${OUT}" 'ARGS --settings'
+TEST_CMD="  /usr/local/bin/claude" OUT="$(run_env)"
+check 'token: --exec of claude after leading blanks gets --settings' contains "${OUT}" 'ARGS --settings'
+TEST_CMD=$'claude\t--version' OUT="$(run_env)"
+check 'token: --exec of claude with a tab-separated argument gets --settings' contains "${OUT}" 'ARGS --settings'
+TEST_CMD=$'bash\tclaude' OUT="$(run_env)"
+check 'token: --exec of bash with claude as an argument gets no --settings' lacks "${OUT}" 'ARGS --settings'
 TEST_CMD=""
 
 N2C_TOKEN_FILES=('/run/user/1000/a b/aifapim/token')

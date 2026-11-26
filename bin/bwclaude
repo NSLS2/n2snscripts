@@ -536,6 +536,7 @@ build_claude_env() {
     #     gateway ignores the key header and checks the bearer token.
     #   - an AIFAPIM key (legacy), in Foundry mode.
     local _gw_token="" _p _cmd
+    local -a _cmd_words=()
     for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
         if [[ "${_p}" == */aifapim/token ]]; then
             _gw_token="${_p}"
@@ -625,7 +626,10 @@ build_claude_env() {
         # and an apiKeyHelper must never be written to the host's settings.json.
         # Also for --exec of claude itself (a wrapper that names the binary, so
         # that it does not run the wrapper found in PATH), not for other commands.
-        _cmd="${TEST_CMD%% *}"
+        # Split as bwrap_resolve_tool does (read -ra), so that the word tested is
+        # the word that runs: leading blanks and tabs count as separators.
+        read -ra _cmd_words <<< "${TEST_CMD}"
+        _cmd="${_cmd_words[0]:-}"
         if [[ -z "${TEST_CMD}" || "${_cmd##*/}" == claude ]]; then
             TOOL_ARGS=(--settings "{\"apiKeyHelper\":\"cat ${_gw_token}\"}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
         fi
