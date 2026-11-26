@@ -535,8 +535,7 @@ build_claude_env() {
     #     and sends the result as x-api-key and as Authorization: Bearer; the
     #     gateway ignores the key header and checks the bearer token.
     #   - an AIFAPIM key (legacy), in Foundry mode.
-    local _gw_token="" _p _cmd
-    local -a _cmd_words=()
+    local _gw_token="" _p
     for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
         if [[ "${_p}" == */aifapim/token ]]; then
             _gw_token="${_p}"
@@ -626,12 +625,10 @@ build_claude_env() {
         # and an apiKeyHelper must never be written to the host's settings.json.
         # Also for --exec of claude itself (a wrapper that names the binary, so
         # that it does not run the wrapper found in PATH), not for other commands.
-        # Split as bwrap_resolve_tool does (read -ra), so that the word tested is
-        # the word that runs: leading blanks and tabs count as separators.
-        read -ra _cmd_words <<< "${TEST_CMD}"
-        _cmd="${_cmd_words[0]:-}"
-        if [[ -z "${TEST_CMD}" || "${_cmd##*/}" == claude ]]; then
-            TOOL_ARGS=(--settings "{\"apiKeyHelper\":\"cat ${_gw_token}\"}" ${TOOL_ARGS[@]+"${TOOL_ARGS[@]}"})
+        # Put it right after the binary, in the command the library will run: a
+        # later position could follow a "--" of the command or of the arguments.
+        if [[ "${_TOOL_CMD[0]:-}" == claude || "${_TOOL_CMD[0]:-}" == */claude ]]; then
+            _TOOL_CMD=("${_TOOL_CMD[0]}" --settings "{\"apiKeyHelper\":\"cat ${_gw_token}\"}" "${_TOOL_CMD[@]:1}")
         fi
     else
         BWRAP_ARGS+=(--setenv CLAUDE_CODE_USE_FOUNDRY 1)

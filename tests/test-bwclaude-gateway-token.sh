@@ -49,11 +49,19 @@ env_body() {
     BWRAP_ARGS=()
     SANDBOX_ENV=()
     TOOL_ARGS=(--resume)
+    # What bwrap_resolve_tool sets: the --exec command split into words, or the
+    # claude it found.
+    if [[ -n "${TEST_CMD}" ]]; then
+        read -ra _TOOL_CMD <<< "${TEST_CMD}"
+    else
+        _TOOL_CMD=(/usr/local/bin/claude)
+    fi
     trap 'printf "exit=%s\n" "$?"' EXIT
     build_claude_env 2>&1
     printf 'BWRAP %s\n' "${BWRAP_ARGS[*]-}"
     printf 'ENV %s\n' "${SANDBOX_ENV[*]-}"
     printf 'ARGS %s\n' "${TOOL_ARGS[*]-}"
+    printf 'CMD %s\n' "${_TOOL_CMD[*]-}"
 }
 run_env() { (env_body "$@"); }
 
@@ -64,7 +72,7 @@ OUT="$(run_env)"
 check 'token: base URL defaults to hermes' \
     contains "${OUT}" '--setenv ANTHROPIC_BASE_URL https://hermes.nsls2.bnl.gov/anthropic'
 check 'token: apiKeyHelper reads the token file' \
-    contains "${OUT}" "ARGS --settings {\"apiKeyHelper\":\"cat ${TOKEN}\"} --resume"
+    contains "${OUT}" "CMD /usr/local/bin/claude --settings {\"apiKeyHelper\":\"cat ${TOKEN}\"}"
 check 'token: Foundry mode is switched off' contains "${OUT}" '--unsetenv CLAUDE_CODE_USE_FOUNDRY'
 check 'token: Foundry mode is not switched on' lacks "${OUT}" 'CLAUDE_CODE_USE_FOUNDRY 1'
 check 'token: no key needed' contains "${OUT}" 'exit=0'
@@ -80,17 +88,20 @@ check 'token: a host CLAUDE_CODE_USE_FOUNDRY is unset again' \
     contains "${OUT}" '--unsetenv CLAUDE_CODE_USE_FOUNDRY'
 
 TEST_CMD=bash OUT="$(run_env)"
-check 'token: --exec bash gets no --settings' lacks "${OUT}" 'ARGS --settings'
+check 'token: --exec bash gets no --settings' lacks "${OUT}" '--settings'
 TEST_CMD=/usr/local/bin/claude OUT="$(run_env)"
-check 'token: --exec of claude gets --settings' contains "${OUT}" 'ARGS --settings'
+check 'token: --exec of claude gets --settings' contains "$(grep '^CMD' <<< "${OUT}")" '--settings'
 TEST_CMD="claude --version" OUT="$(run_env)"
-check 'token: --exec of claude with arguments gets --settings' contains "${OUT}" 'ARGS --settings'
+check 'token: --exec of claude with arguments gets --settings' contains "$(grep '^CMD' <<< "${OUT}")" '--settings'
 TEST_CMD="  /usr/local/bin/claude" OUT="$(run_env)"
-check 'token: --exec of claude after leading blanks gets --settings' contains "${OUT}" 'ARGS --settings'
+check 'token: --exec of claude after leading blanks gets --settings' contains "$(grep '^CMD' <<< "${OUT}")" '--settings'
 TEST_CMD=$'claude\t--version' OUT="$(run_env)"
-check 'token: --exec of claude with a tab-separated argument gets --settings' contains "${OUT}" 'ARGS --settings'
+check 'token: --exec of claude with a tab-separated argument gets --settings' contains "$(grep '^CMD' <<< "${OUT}")" '--settings'
 TEST_CMD=$'bash\tclaude' OUT="$(run_env)"
-check 'token: --exec of bash with claude as an argument gets no --settings' lacks "${OUT}" 'ARGS --settings'
+check 'token: --exec of bash with claude as an argument gets no --settings' lacks "${OUT}" '--settings'
+TEST_CMD='claude -- foo' OUT="$(run_env)"
+check 'token: --settings goes before a -- of the --exec command' \
+    contains "${OUT}" "CMD claude --settings {\"apiKeyHelper\":\"cat ${TOKEN}\"} -- foo"
 TEST_CMD=""
 
 N2C_TOKEN_FILES=('/run/user/1000/a b/aifapim/token')
@@ -134,7 +145,7 @@ unset N2SN_CREDS_DIR
 N2C_TOKEN_FILES=()
 EXTRA_RO_PATHS=("${TOKEN}")
 OUT="$(run_env AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST="${HOST}")"
-check 'a --ro-path ending in aifapim/token is not the token' lacks "${OUT}" 'ARGS --settings'
+check 'a --ro-path ending in aifapim/token is not the token' lacks "${OUT}" '--settings'
 check '... and key mode is used' contains "${OUT}" '--setenv CLAUDE_CODE_USE_FOUNDRY 1'
 EXTRA_RO_PATHS=()
 
@@ -147,7 +158,7 @@ check 'key: Foundry base URL from AIFAPIM_HOST' \
     contains "${OUT}" '--setenv ANTHROPIC_FOUNDRY_BASE_URL https://aifapim.nsls2.bnl.gov/anthropic'
 check 'key: the key goes through the environment' contains "${OUT}" "ENV ANTHROPIC_FOUNDRY_API_KEY=${KEY}"
 check 'key: the key is not on the bwrap command line' lacks "$(grep '^BWRAP' <<< "${OUT}")" "${KEY}"
-check 'key: no --settings' lacks "${OUT}" 'ARGS --settings'
+check 'key: no --settings' lacks "${OUT}" '--settings'
 
 OUT="$(run_env)"
 check 'no key and no token: stops' contains "${OUT}" 'exit=1'
