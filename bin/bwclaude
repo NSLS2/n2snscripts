@@ -330,8 +330,10 @@ AI gateway:
   n2c-token renews.  The token needs the gateway's user role (ask DSSI); without
   the file nothing is added and nothing is said.  `--n2c-token aifapim` asks for
   it explicitly and warns when it is missing.
-  With a key instead: N2C_GATEWAY=off, or no token file.  The key mode needs
-  AIFAPIM_API_KEY and AIFAPIM_HOST (or the ANTHROPIC_FOUNDRY_* variables).
+  With a personal key instead (deprecated, advanced use): N2C_GATEWAY=off, or no
+  token file.  The key mode needs AIFAPIM_API_KEY and AIFAPIM_HOST (or the
+  ANTHROPIC_FOUNDRY_* variables).  Keys for services and beamlines are not
+  deprecated.
 
 Authentication:
   By default, credentials created inside the sandbox are ephemeral — they work
@@ -539,7 +541,7 @@ build_claude_env() {
     #     start, about every 5 minutes, after a 401 and when the token expires,
     #     and sends the result as x-api-key and as Authorization: Bearer; the
     #     gateway ignores the key header and checks the bearer token.
-    #   - an AIFAPIM key (legacy), in Foundry mode.
+    #   - a personal AIFAPIM key (deprecated, advanced use), in Foundry mode.
     local _gw_token="" _p
     # N2C_GATEWAY=off: the token may be mounted (for skills) but is not used.
     for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
@@ -573,7 +575,7 @@ build_claude_env() {
                 echo "Use your own token (no key): sign in on the host, then run bwclaude again:" >&2
                 echo "  n2c-token login                   # then n2c-token refresh aifapim" >&2
                 [[ "${N2C_GATEWAY:-}" != off ]] || echo "  (N2C_GATEWAY=off is set, so the token is not used)" >&2
-                echo "Or export a key (legacy):" >&2
+                echo "Or export a personal key (deprecated, advanced use):" >&2
                 echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
                 echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key" >&2
                 exit 1

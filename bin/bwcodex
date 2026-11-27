@@ -9,7 +9,8 @@
 #       --n2c-token aifapim), unless N2C_GATEWAY=off.  A provider with an
 #       auth command (cat of the token file) is passed with -c for the session;
 #       nothing is written to config.toml.
-#   - Hermes (AIFAPIM) routing — provider block points at
+#   - Hermes (AIFAPIM) routing with a personal key (deprecated, advanced use):
+#       provider block points at
 #       https://${AIFAPIM_HOST}/openai/v1 with x-api-key header;
 #       wrapper plumbs AIFAPIM_HOST + AIFAPIM_API_KEY through.  Set
 #       OPENAI_API_KEY=dummy on the host or rely on the wrapper default.
@@ -361,9 +362,10 @@ Authentication:
                          user role (ask DSSI).  Used even when AIFAPIM_API_KEY
                          is set; ~/.codex/auth.json is not mounted then.
                          N2C_GATEWAY=off uses the key instead.
-    - Hermes (AIFAPIM):  set AIFAPIM_API_KEY (e.g. via `load_dotenv`) and
-                         keep OPENAI_API_KEY=dummy.  See ~/.codex/config.toml
-                         for the [model_providers.nsls2-hermes] block.
+    - Personal key:      deprecated, advanced use.  Set AIFAPIM_API_KEY (e.g.
+                         via `load_dotenv`) and keep OPENAI_API_KEY=dummy.  See
+                         ~/.codex/config.toml for the
+                         [model_providers.nsls2-hermes] block.
     - ChatGPT login:     run `bwcodex --init-auth` once, then `bwcodex` and
                          `codex login` to populate ~/.codex/auth.json.
 

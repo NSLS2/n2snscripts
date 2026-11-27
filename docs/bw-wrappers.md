@@ -956,6 +956,10 @@ options, `GH_TOKEN_*`).
 
 Launches [opencode](https://opencode.ai) inside a bubblewrap sandbox.
 
+**OpenCode 1 is no longer supported.** Use [`bwopencode2`](#bwopencode2), which
+signs you in with your BNL account and needs no key. `AIFAPIM_API_KEY`, which
+this wrapper forwards, is a deprecated personal key.
+
 ```text
 bwopencode [bwopencode-options] [opencode arguments...]
 ```
@@ -1799,7 +1803,10 @@ directory that holds an app-only token (a service account's, through
 `N2SN_CREDS_DIR`) is not suitable: the gateway refuses such a token on this
 route.
 
-### With a key (legacy)
+### With a personal key (deprecated, advanced use)
+
+A personal AIFAPIM key is deprecated: sign in with `n2c-token` instead (see
+above). Keys for services and beamlines are not deprecated.
 
 Without the `aifapim` token, the wrapper uses Azure AI Foundry mode. It forces
 `CLAUDE_CODE_USE_FOUNDRY=1` and plumbs:
@@ -1901,9 +1908,10 @@ bwcodex [bwcodex-options] [codex arguments...]
 
 Three approved auth paths:
 
-- **Your own gateway token (no key)** — `bwcodex --n2c-token aifapim`, see
-  below.
-- **Hermes (AIFAPIM) routing** (configured in `~/.codex/config.toml`) — provider block points at
+- **Your own gateway token (no key)** — plain `bwcodex`, when the `aifapim`
+  token file exists; see below.
+- **Hermes (AIFAPIM) routing with a personal key** (deprecated, advanced use;
+  configured in `~/.codex/config.toml`) — provider block points at
   `https://${AIFAPIM_HOST}/openai/v1` with `x-api-key` header; the
   wrapper plumbs `AIFAPIM_HOST` and `AIFAPIM_API_KEY` through.
 - **BNL ITD ChatGPT subscription** — `codex login` OAuth flow persists
