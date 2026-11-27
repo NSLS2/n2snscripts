@@ -131,7 +131,9 @@ NSLS2 N2C Entra app on the host and keeps a short-lived access token per
 NSLS-II API in `/run/user/<uid>/nsls2/creds/<name>/token`, for example
 `observability`, `docs` and `epics`. Skills read those files.
 
-- **Nothing is mounted by default.** `--n2c-token NAME` mounts
+- **Nothing is mounted by default**, except that `bwclaude` and `bwcodex` add
+  the `aifapim` token when its file exists (see [`bwclaude`](#bwclaude);
+  `N2C_GATEWAY=off` stops that). `--n2c-token NAME` mounts
   `creds/NAME/token` read-only at the same path; repeat it for several tokens.
   `--n2c-token all` mounts every token in the directory that you can enter.
   `all` together with names means all.
@@ -954,6 +956,10 @@ options, `GH_TOKEN_*`).
 
 Launches [opencode](https://opencode.ai) inside a bubblewrap sandbox.
 
+**OpenCode 1 is no longer supported.** Use [`bwopencode2`](#bwopencode2), which
+signs you in with your BNL account and needs no key. `AIFAPIM_API_KEY`, which
+this wrapper forwards, is a deprecated personal key.
+
 ```text
 bwopencode [bwopencode-options] [opencode arguments...]
 ```
@@ -1743,8 +1749,67 @@ Launches the [Claude CLI](https://docs.claude.com/en/docs/claude-code/overview) 
 bwclaude [bwclaude-options] [claude arguments...]
 ```
 
-Routes through the NSLS-II Hermes (AIFAPIM) gateway in Azure AI Foundry
-mode. The wrapper forces `CLAUDE_CODE_USE_FOUNDRY=1` and plumbs:
+Routes through the NSLS-II Hermes (AIFAPIM) gateway, with your own token or
+with a key.
+
+### With your own token (no key)
+
+```bash
+bwclaude
+```
+
+`n2c-token` keeps an access token for the gateway as the token named
+`aifapim` (see [N2C access tokens](#n2c-access-tokens)); it needs the gateway's
+user role (ask DSSI). `bwclaude` uses it with no option when its file exists.
+It adds `aifapim` to the tokens you ask for with `--n2c-token`, so
+`--n2c-token docs` mounts `docs` and `aifapim`. Without the file it adds
+nothing and says nothing, so someone without the role sees no warning.
+`--n2c-token aifapim` asks for it explicitly and warns when it is missing.
+When that token is mounted, `bwclaude`:
+
+- sets `ANTHROPIC_BASE_URL` to `https://${AIFAPIM_HOST}/anthropic`, with
+  `hermes.nsls2.bnl.gov` when `AIFAPIM_HOST` is not set, so `AIFAPIM_HOST` is
+  only for another gateway (for example `hermes-dev.nsls2.bnl.gov`);
+- does not use Foundry mode (a host `CLAUDE_CODE_USE_FOUNDRY` is unset in the
+  sandbox), and ignores `AIFAPIM_API_KEY`;
+- passes `--settings '{"apiKeyHelper":"cat <token file>"}'` to `claude`.
+  Claude Code runs the helper at the start, about every 5 minutes, after a 401
+  or 403 and when the token has expired, so it picks up the file that
+  `n2c-token` renews in place. It sends the result as `Authorization: Bearer`
+  and, because it treats it as a key, as `x-api-key`; the gateway ignores
+  the second.
+
+Only a token that `--n2c-token` mounted counts: a `--ro-path` that ends in
+`aifapim/token` does not switch the token mode on, because `--ro-path` mounts
+the resolved target of a symlink at its target.
+
+`--exec` of `claude` itself (`--exec /usr/local/bin/claude`, which a wrapper
+uses so that `bwclaude` does not run the wrapper it finds in `PATH`) gets the
+helper too; `--exec` of any other command does not.
+
+The helper is given with `--settings` for this session only. It is never
+written to `settings.json`, which stays an ephemeral copy (see below). Run
+`n2c-token status aifapim` on the host to check the token. Without the token,
+`bwclaude` uses the key as below.
+
+Set `N2C_GATEWAY=off` in the environment to use the key even when the token
+file exists: the token is then not used for the gateway (it is still mounted if
+you ask for it, for skills).
+
+Two limits of the automatic use. A token that has expired, because the
+`n2c-token` timer is not running, gets a `401` from the gateway: run
+`n2c-token refresh aifapim`, or set `N2C_GATEWAY=off`. And a credentials
+directory that holds an app-only token (a service account's, through
+`N2SN_CREDS_DIR`) is not suitable: the gateway refuses such a token on this
+route.
+
+### With a personal key (deprecated, advanced use)
+
+A personal AIFAPIM key is deprecated: sign in with `n2c-token` instead (see
+above). Keys for services and beamlines are not deprecated.
+
+Without the `aifapim` token, the wrapper uses Azure AI Foundry mode. It forces
+`CLAUDE_CODE_USE_FOUNDRY=1` and plumbs:
 
 - **`ANTHROPIC_FOUNDRY_BASE_URL`** — if not set, constructed as
   `https://${AIFAPIM_HOST}/anthropic`; override by exporting
@@ -1759,6 +1824,25 @@ mode. The wrapper forces `CLAUDE_CODE_USE_FOUNDRY=1` and plumbs:
 
 The legacy `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` env vars are *not*
 honored in foundry mode and the wrapper no longer sets them.
+
+### Claude Code's own sandbox
+
+Where the managed settings (`/etc/claude-code/managed-settings.json`, from the
+`compliance` role) turn on Claude Code's own sandbox with
+`sandbox.failIfUnavailable`, `claude` refuses to start unless `bubblewrap` and
+`socat` are installed. `socat` is masked inside `bwclaude`, and `bwrap` already
+confines the session, so `bwclaude` also binds a drop-in,
+`/etc/claude-code/managed-settings.d/99-bwclaude.json`, that sets
+`sandbox.enabled` and `sandbox.failIfUnavailable` to `false`. Claude Code merges
+the drop-in after the managed file, so every other managed key stays in force.
+The drop-in is added only when the managed file exists, and only inside the
+sandbox: `claude` run outside `bwclaude` keeps the strict policy.
+
+The managed `sandbox.filesystem.denyRead` list (`~/.aws`, `~/.ssh`,
+`~/.config/gh`, `~/.azure`, `~/.docker/config.json`) is not enforced by Claude
+Code inside `bwclaude` any more, and does not need to be: the sandbox never
+mounts the home directory, and every `bw*` wrapper refuses `--ro-path` and
+`--rw-path` for all of those directories (`tests/test-blocked-paths.sh`).
 
 Additional options:
 
@@ -1822,14 +1906,59 @@ a bubblewrap sandbox.
 bwcodex [bwcodex-options] [codex arguments...]
 ```
 
-Two approved auth paths (configured in `~/.codex/config.toml`):
+Three approved auth paths:
 
-- **Hermes (AIFAPIM) routing** — provider block points at
+- **Your own gateway token (no key)** — plain `bwcodex`, when the `aifapim`
+  token file exists; see below.
+- **Hermes (AIFAPIM) routing with a personal key** (deprecated, advanced use;
+  configured in `~/.codex/config.toml`) — provider block points at
   `https://${AIFAPIM_HOST}/openai/v1` with `x-api-key` header; the
   wrapper plumbs `AIFAPIM_HOST` and `AIFAPIM_API_KEY` through.
 - **BNL ITD ChatGPT subscription** — `codex login` OAuth flow persists
   tokens to `~/.codex/auth.json`. Run once with `--init-auth` to make
   that file persist across sandbox invocations.
+
+### Codex with your own token (no key)
+
+```bash
+bwcodex
+```
+
+`n2c-token` keeps an access token for the gateway as the token named `aifapim`
+(see [N2C access tokens](#n2c-access-tokens)); it needs the gateway's
+user role (ask DSSI). `bwcodex` uses it with no option when its file exists,
+and adds it to the tokens you ask for with `--n2c-token`, as `bwclaude` does
+(see above, including `N2C_GATEWAY=off` and the two limits). When that token is
+mounted, `bwcodex` passes
+Codex a provider and the choice of it on the command line, for this session
+only. Nothing is written to `config.toml`:
+
+- The provider is `nsls2-hermes-token`, with `base_url`
+  `https://${AIFAPIM_HOST}/openai/v1` (`hermes.nsls2.bnl.gov` when
+  `AIFAPIM_HOST` is not set) and `wire_api = "responses"`.
+- Its `auth` command is `cat` of the token file. Codex runs it at the start,
+  every 5 minutes and after an authentication retry, so it picks up the file
+  that `n2c-token` renews in place, and sends the result as
+  `Authorization: Bearer`.
+- It has no `env_key`: Codex does not allow an `auth` command together with
+  one, so the key provider of `config.toml` cannot be reused. The model still
+  comes from `config.toml`.
+- `~/.codex/auth.json` (a ChatGPT login) is not mounted in this mode, unless
+  you pass `--init-auth`. The session has no use for it, and Codex tries to
+  refresh a ChatGPT login even when the provider does not use it, so an expired
+  one would end the session with "your refresh token has expired".
+- `AIFAPIM_API_KEY` is not passed into the sandbox in this mode, and the
+  token is used even when the key is set (`N2C_GATEWAY=off` uses the key).
+  `--n2c-token all` also works. Without the token file (no gateway user role,
+  say) nothing is added and the key route is used; `--n2c-token aifapim` then
+  warns.
+
+The settings go right after the `codex` binary, so `--exec codex ...` gets them
+too (not any other `--exec` command), and a `--` among the arguments cannot
+come before them. Only a token that `--n2c-token` mounted counts, not a
+`--ro-path` that ends in `aifapim/token`. Codex's own inner sandbox is
+Landlock, which needs no extra tool, so unlike `bwclaude` nothing has to be
+switched off.
 
 The wrapper keeps `~/.codex/packages` in its ephemeral Codex home. When the
 daemon starts, Codex copies its package from the system CLI, which the wrapper

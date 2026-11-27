@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Tests for how bwclaude reaches the AI gateway: with the n2c-token "aifapim"
+# token (your own Entra token, an apiKeyHelper, no key) when it is mounted, and
+# with a key in Foundry mode otherwise.
+#
+# Sources bin/bwclaude for build_claude_env (main is not run), so it needs no
+# sandbox, no bwrap and no claude.  Needs bash 4 or newer.
+# Run on any host:  tests/test-bwclaude-gateway-token.sh
+
+# shellcheck disable=SC2016,SC2034  # patterns are single quoted on purpose; globals are read by the sourced script
+set -uo pipefail
+
+ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# shellcheck source=../bin/bwclaude
+source "${ROOT}/bin/bwclaude"
+# bwclaude turns these on for itself; a failing check must not end the tests.
+set +o errexit
+
+PASS=0
+FAIL=0
+check() { # check DESCRIPTION CONDITION-COMMAND...
+    local _desc="$1"
+    shift
+    if "$@"; then
+        PASS=$((PASS + 1))
+        printf 'ok    %s\n' "${_desc}"
+    else
+        FAIL=$((FAIL + 1))
+        printf 'FAIL  %s\n' "${_desc}"
+    fi
+}
+contains() { grep -qF -- "$2" <<< "$1"; }
+lacks() { ! grep -qF -- "$2" <<< "$1"; }
+is_one() { [[ "$1" == 1 ]]; }
+is_empty() { [[ -z "$1" ]]; }
+cmd_line() { grep '^CMD' <<< "$1"; }
+
+readonly TOKEN=/run/user/1000/nsls2/creds/aifapim/token
+readonly KEY=not-a-real-key-AAAA
+readonly HOST=gateway.example.org
+
+# env_body [VAR=VALUE...]: build_claude_env with the given host environment;
+# prints what it added, then the exit code (the EXIT trap).  N2C_TOKEN_FILES is
+# set by the caller, as build_n2c_token_mounts would.  Run it in a subshell:
+# build_claude_env can exit.
+env_body() {
+    unset AIFAPIM_HOST AIFAPIM_API_KEY ANTHROPIC_FOUNDRY_API_KEY \
+        ANTHROPIC_FOUNDRY_BASE_URL CLAUDE_CODE_USE_FOUNDRY
+    local _kv
+    for _kv in "$@"; do export "${_kv?}"; done
+    BWRAP_ARGS=()
+    SANDBOX_ENV=()
+    TOOL_ARGS=(--resume)
+    # What bwrap_resolve_tool sets: the --exec command split into words, or the
+    # claude it found.
+    if [[ -n "${TEST_CMD}" ]]; then
+        read -ra _TOOL_CMD <<< "${TEST_CMD}"
+    else
+        _TOOL_CMD=(/usr/local/bin/claude)
+    fi
+    trap 'printf "exit=%s\n" "$?"' EXIT
+    build_claude_env 2>&1
+    printf 'BWRAP %s\n' "${BWRAP_ARGS[*]-}"
+    printf 'ENV %s\n' "${SANDBOX_ENV[*]-}"
+    printf 'ARGS %s\n' "${TOOL_ARGS[*]-}"
+    printf 'CMD %s\n' "${_TOOL_CMD[*]-}"
+}
+run_env() { (env_body "$@"); }
+
+# ── token mode ──────────────────────────────────────────────────────────
+
+N2C_TOKEN_FILES=("${TOKEN}")
+OUT="$(run_env)"
+check 'token: base URL defaults to hermes' \
+    contains "${OUT}" '--setenv ANTHROPIC_BASE_URL https://hermes.nsls2.bnl.gov/anthropic'
+check 'token: apiKeyHelper reads the token file' \
+    contains "${OUT}" "CMD /usr/local/bin/claude --settings {\"apiKeyHelper\":\"cat ${TOKEN}\"}"
+check 'token: Foundry mode is switched off' contains "${OUT}" '--unsetenv CLAUDE_CODE_USE_FOUNDRY'
+check 'token: Foundry mode is not switched on' lacks "${OUT}" 'CLAUDE_CODE_USE_FOUNDRY 1'
+check 'token: no key needed' contains "${OUT}" 'exit=0'
+check 'token: no Foundry variables' lacks "${OUT}" 'ANTHROPIC_FOUNDRY'
+
+OUT="$(run_env AIFAPIM_HOST=hermes-dev.nsls2.bnl.gov)"
+check 'token: AIFAPIM_HOST picks the gateway' \
+    contains "${OUT}" '--setenv ANTHROPIC_BASE_URL https://hermes-dev.nsls2.bnl.gov/anthropic'
+
+OUT="$(run_env AIFAPIM_API_KEY="${KEY}" CLAUDE_CODE_USE_FOUNDRY=1)"
+check 'token: a key on the host is not used' lacks "${OUT}" "${KEY}"
+check 'token: a host CLAUDE_CODE_USE_FOUNDRY is unset again' \
+    contains "${OUT}" '--unsetenv CLAUDE_CODE_USE_FOUNDRY'
+
+TEST_CMD=bash OUT="$(run_env)"
+check 'token: --exec bash gets no --settings' lacks "${OUT}" '--settings'
+TEST_CMD=/usr/local/bin/claude OUT="$(run_env)"
+check 'token: --exec of claude gets --settings' contains "$(grep '^CMD' <<< "${OUT}")" '--settings'
+TEST_CMD="claude --version" OUT="$(run_env)"
+check 'token: --exec of claude with arguments gets --settings' contains "$(grep '^CMD' <<< "${OUT}")" '--settings'
+TEST_CMD="  /usr/local/bin/claude" OUT="$(run_env)"
+check 'token: --exec of claude after leading blanks gets --settings' contains "$(grep '^CMD' <<< "${OUT}")" '--settings'
+TEST_CMD=$'claude\t--version' OUT="$(run_env)"
+check 'token: --exec of claude with a tab-separated argument gets --settings' contains "$(grep '^CMD' <<< "${OUT}")" '--settings'
+TEST_CMD=$'bash\tclaude' OUT="$(run_env)"
+check 'token: --exec of bash with claude as an argument gets no --settings' lacks "${OUT}" '--settings'
+TEST_CMD='claude -- foo' OUT="$(run_env)"
+check 'token: --settings goes before a -- of the --exec command' \
+    contains "${OUT}" "CMD claude --settings {\"apiKeyHelper\":\"cat ${TOKEN}\"} -- foo"
+TEST_CMD=""
+
+N2C_TOKEN_FILES=('/run/user/1000/a b/aifapim/token')
+OUT="$(run_env)"
+check 'token: a path that needs quoting is refused' contains "${OUT}" 'may only contain'
+check '... and stops the launch' contains "${OUT}" 'exit=1'
+
+# ── --n2c-token all, through the real mount function ────────────────────
+# The creds directory needs ancestors that nobody else can write to, so it is
+# made beside the repository's checkout, not in /tmp.
+
+CREDS="$(mktemp -d "${ROOT}/.n2c-all-test.XXXXXX")/creds"
+trap 'rm -rf "${CREDS%/creds}"' EXIT
+mkdir -p "${CREDS}/aifapim" "${CREDS}/observability"
+chmod 700 "${CREDS}" "${CREDS}/aifapim" "${CREDS}/observability"
+for _n in aifapim observability; do
+    printf 'not-a-real-token\n' > "${CREDS}/${_n}/token"
+    chmod 600 "${CREDS}/${_n}/token"
+done
+export N2SN_CREDS_DIR="${CREDS}"
+
+mount_env() { # mount_env TOKEN-NAME: --n2c-token NAME, then build_claude_env
+    EXTRA_RO_PATHS=()
+    N2C_TOKEN_FILES=()
+    N2C_TOKENS=()
+    add_n2c_token "$1"
+    build_n2c_token_mounts 2> /dev/null
+    env_body AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST="${HOST}"
+}
+OUT="$(mount_env all)"
+check 'all: the aifapim token is found and used' \
+    contains "${OUT}" "{\"apiKeyHelper\":\"cat ${CREDS}/aifapim/token\"}"
+OUT="$(mount_env aifapim)"
+check 'aifapim: used' contains "${OUT}" "cat ${CREDS}/aifapim/token"
+OUT="$(mount_env observability)"
+check 'observability only: key mode' contains "${OUT}" '--setenv CLAUDE_CODE_USE_FOUNDRY 1'
+unset N2SN_CREDS_DIR
+
+# ── the aifapim token without --n2c-token ───────────────────────────────
+# The automatic step adds it to whatever --n2c-token asked for, when its file
+# exists, unless N2C_GATEWAY=off.  A second credentials directory has no
+# aifapim file, as for someone without the gateway role.
+
+CREDS2="${CREDS%/creds}/creds2"
+mkdir -p "${CREDS2}/observability"
+chmod 700 "${CREDS2}" "${CREDS2}/observability"
+printf 'not-a-real-token\n' > "${CREDS2}/observability/token"
+chmod 600 "${CREDS2}/observability/token"
+
+# auto_env [NAME...]: --n2c-token NAME for each name, the automatic step, the
+# mounts, then build_claude_env.  Prints the mounted files first.
+auto_env() {
+    EXTRA_RO_PATHS=()
+    N2C_TOKEN_FILES=()
+    N2C_TOKENS=()
+    local _n
+    for _n in "$@"; do add_n2c_token "${_n}"; done
+    n2c_auto_gateway_token
+    build_n2c_token_mounts 2> /dev/null
+    printf 'FILES %s\n' "${N2C_TOKEN_FILES[*]-}"
+    run_env AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST="${HOST}"
+}
+# auto_err [NAME...]: what the mount step says on stderr
+auto_err() {
+    EXTRA_RO_PATHS=()
+    N2C_TOKEN_FILES=()
+    N2C_TOKENS=()
+    local _n
+    for _n in "$@"; do add_n2c_token "${_n}"; done
+    n2c_auto_gateway_token
+    build_n2c_token_mounts 2>&1
+}
+files_line() { grep '^FILES' <<< "$1"; }
+
+export N2SN_CREDS_DIR="${CREDS}"
+OUT="$(auto_env)"
+check 'automatic: no flag, token file exists: the token is mounted' \
+    contains "$(files_line "${OUT}")" "${CREDS}/aifapim/token"
+check '... and nothing else' lacks "$(files_line "${OUT}")" observability
+check '... and token mode is used' contains "$(cmd_line "${OUT}")" '--settings'
+
+OUT="$(auto_env observability)"
+check '--n2c-token observability: aifapim is added to it' \
+    contains "$(files_line "${OUT}")" "${CREDS}/aifapim/token"
+check '... and observability is mounted too' contains "$(files_line "${OUT}")" "${CREDS}/observability/token"
+check '... and token mode is used' contains "$(cmd_line "${OUT}")" '--settings'
+
+OUT="$(auto_env aifapim)"
+check '--n2c-token aifapim: used' contains "$(cmd_line "${OUT}")" '--settings'
+check '... and mounted once' \
+    is_one "$(grep -o "aifapim/token" <<< "$(files_line "${OUT}")" | wc -l | tr -d ' ')"
+
+OUT="$(N2C_GATEWAY=off auto_env)"
+check 'N2C_GATEWAY=off: nothing is mounted without a flag' \
+    lacks "$(files_line "${OUT}")" aifapim
+check '... and the key is used' contains "${OUT}" "ANTHROPIC_FOUNDRY_API_KEY=${KEY}"
+
+OUT="$(N2C_GATEWAY=off auto_env all)"
+check 'N2C_GATEWAY=off with --n2c-token all: aifapim is mounted (for skills)' \
+    contains "$(files_line "${OUT}")" "${CREDS}/aifapim/token"
+check '... but not used for the gateway' lacks "$(cmd_line "${OUT}")" '--settings'
+check '... and the key is used' contains "${OUT}" "ANTHROPIC_FOUNDRY_API_KEY=${KEY}"
+
+export N2SN_CREDS_DIR="${CREDS2}"
+OUT="$(auto_env observability)"
+check 'no aifapim file: only what was asked for is mounted' \
+    lacks "$(files_line "${OUT}")" aifapim
+check '... and the key is used' contains "${OUT}" "ANTHROPIC_FOUNDRY_API_KEY=${KEY}"
+check 'no aifapim file, observability asked for: nothing is said' is_empty "$(auto_err observability)"
+check 'no aifapim file, nothing asked for: nothing is said' is_empty "$(auto_err)"
+check '--n2c-token aifapim without a file still warns' contains "$(auto_err aifapim)" "no N2C token 'aifapim'"
+export N2SN_CREDS_DIR=/nonexistent/creds
+check 'no credentials directory, no flag: nothing is said' is_empty "$(auto_err)"
+unset N2SN_CREDS_DIR
+
+# A --ro-path is canonicalised and mounted at its target, so a path that only
+# looks like the token (a symlink, say) must not switch the token mode on.
+N2C_TOKEN_FILES=()
+EXTRA_RO_PATHS=("${TOKEN}")
+OUT="$(run_env AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST="${HOST}")"
+check 'a --ro-path ending in aifapim/token is not the token' lacks "${OUT}" '--settings'
+check '... and key mode is used' contains "${OUT}" '--setenv CLAUDE_CODE_USE_FOUNDRY 1'
+EXTRA_RO_PATHS=()
+
+# ── key mode (legacy) ───────────────────────────────────────────────────
+
+N2C_TOKEN_FILES=("/run/user/1000/nsls2/creds/observability/token")
+OUT="$(run_env AIFAPIM_API_KEY="${KEY}" AIFAPIM_HOST=aifapim.nsls2.bnl.gov)"
+check 'key: Foundry mode is on' contains "${OUT}" '--setenv CLAUDE_CODE_USE_FOUNDRY 1'
+check 'key: Foundry base URL from AIFAPIM_HOST' \
+    contains "${OUT}" '--setenv ANTHROPIC_FOUNDRY_BASE_URL https://aifapim.nsls2.bnl.gov/anthropic'
+check 'key: the key goes through the environment' contains "${OUT}" "ENV ANTHROPIC_FOUNDRY_API_KEY=${KEY}"
+check 'key: the key is not on the bwrap command line' lacks "$(grep '^BWRAP' <<< "${OUT}")" "${KEY}"
+check 'key: no --settings' lacks "${OUT}" '--settings'
+
+OUT="$(run_env)"
+check 'no key and no token: stops' contains "${OUT}" 'exit=1'
+check '... and says how to get the token' contains "${OUT}" 'n2c-token refresh aifapim'
+
+# ── Claude Code's own sandbox (managed settings) ────────────────────────
+
+MANAGED="$(mktemp -d "${ROOT}/.managed-test.XXXXXX")"
+trap 'rm -rf "${CREDS%/creds}" "${MANAGED}"' EXIT
+CLAUDE_MANAGED_DIR="${MANAGED}"
+DROPIN="${MANAGED}/managed-settings.d/99-bwclaude.json"
+
+BWRAP_ARGS=()
+build_managed_claude_paths
+check 'no managed settings: no drop-in' lacks "${BWRAP_ARGS[*]-}" 'managed-settings.d'
+
+printf '{"sandbox":{"enabled":true,"failIfUnavailable":true}}\n' > "${MANAGED}/managed-settings.json"
+BWRAP_ARGS=()
+build_managed_claude_paths
+check 'managed settings are bound read-only' \
+    contains "${BWRAP_ARGS[*]}" "--ro-bind ${MANAGED}/managed-settings.json ${MANAGED}/managed-settings.json"
+check 'a drop-in is bound after them' \
+    contains "${BWRAP_ARGS[*]}" "${MANAGED}/managed-settings.d --ro-bind-data "
+check '... at 99-bwclaude.json' contains "${BWRAP_ARGS[*]}" "${DROPIN}"
+JOINED="${BWRAP_ARGS[*]}"
+FD="${JOINED#*--ro-bind-data }"
+FD="${FD%% *}"
+check 'the drop-in turns the inner sandbox off' \
+    contains "${_BWRAP_FD_DATA[${FD}]}" '"enabled":false,"failIfUnavailable":false'
+if command -v python3 > /dev/null; then
+    check 'the drop-in is valid JSON' \
+        python3 -c 'import json,sys; json.loads(sys.argv[1])' "${_BWRAP_FD_DATA[${FD}]}"
+fi
+
+printf '\n%d passed, %d failed\n' "${PASS}" "${FAIL}"
+[[ "${FAIL}" -eq 0 ]]

@@ -74,7 +74,7 @@
 #                   Off by default.  The refresh token is never mounted.
 #   --ro-path PATH  Mount PATH read-only into the sandbox.  May be repeated to
 #                   accumulate multiple paths.  Dangerous paths are blocked:
-#                   $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws, ~/.kube,
+#                   $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws, ~/.azure, ~/.kube,
 #                   ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler, ~/.yarnrc,
 #                   ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
 #                   $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
@@ -121,7 +121,7 @@
 set -euo pipefail
 
 # Source the shared sandbox library.
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 # shellcheck source=../lib/bwrap_sandbox_lib.sh
 source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 
@@ -129,6 +129,9 @@ source "${SCRIPT_DIR}/../lib/bwrap_sandbox_lib.sh"
 # Tool-specific state
 # ═══════════════════════════════════════════════════════════════════
 
+# Where Claude Code looks for managed settings.  A plain assignment, not read
+# from the environment: the tests set it after sourcing this file.
+CLAUDE_MANAGED_DIR=/etc/claude-code
 INIT_AUTH=0
 DEBUG_MODE=0
 FORWARD_GH_TOKENS=0
@@ -287,10 +290,12 @@ Wrapper options (consumed before claude sees the command line):
                   asked for.  Tokens are written on the host by `n2c-token`
                   (run `n2c-token login` first); the refresh token is never
                   mounted.  A missing token only warns.
+                  The `aifapim` token is added to whatever you ask for, when its
+                  file exists (see below).
   --ro-path PATH  Mount PATH (file or directory) read-only into the sandbox.
                   May be repeated to accumulate multiple extra paths.
                   Blocked: $HOME and ancestors, ~/.ssh, ~/.gnupg, ~/.aws,
-                  ~/.kube, ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler,
+                  ~/.azure, ~/.kube, ~/.docker, ~/.netrc, ~/.pypirc, ~/.rattler,
                   ~/.yarnrc, ~/.yarnrc.yml, ~/.yarn, ~/.config/gh,
                   $XDG_DATA_HOME/uv/credentials, /root, /etc/shadow,
                   /etc/sudoers{,.d}.
@@ -314,6 +319,21 @@ Wrapper options (consumed before claude sees the command line):
                   Use --dry-run to see it.
 
 All other arguments are passed through to claude unchanged.
+
+AI gateway:
+  With your own token (no key), when its file exists (n2c-token keeps it):
+    bwclaude
+  The token is added to the ones you ask for with --n2c-token, so
+  `--n2c-token docs` mounts both.  claude then calls
+  https://$AIFAPIM_HOST/anthropic (default hermes.nsls2.bnl.gov) and gets the
+  token from an apiKeyHelper passed with --settings, which re-reads the file
+  n2c-token renews.  The token needs the gateway's user role (ask DSSI); without
+  the file nothing is added and nothing is said.  `--n2c-token aifapim` asks for
+  it explicitly and warns when it is missing.
+  With a personal key instead (deprecated, advanced use): N2C_GATEWAY=off, or no
+  token file.  The key mode needs AIFAPIM_API_KEY and AIFAPIM_HOST (or the
+  ANTHROPIC_FOUNDRY_* variables).  Keys for services and beamlines are not
+  deprecated.
 
 Authentication:
   By default, credentials created inside the sandbox are ephemeral — they work
@@ -480,70 +500,111 @@ build_claude_cache_mount() {
 # or /etc/claude-code.  The alias is resolved before binding so its deployed
 # target remains reachable in the sandbox.
 build_managed_claude_paths() {
-    if [[ -e /etc/claude-code/managed-settings.json ]]; then
-        BWRAP_ARGS+=(--dir /etc/claude-code)
+    if [[ -e "${CLAUDE_MANAGED_DIR}/managed-settings.json" ]]; then
+        BWRAP_ARGS+=(--dir "${CLAUDE_MANAGED_DIR}")
         build_managed_ro_bind \
-            /etc/claude-code/managed-settings.json \
-            /etc/claude-code/managed-settings.json
+            "${CLAUDE_MANAGED_DIR}/managed-settings.json" \
+            "${CLAUDE_MANAGED_DIR}/managed-settings.json"
+
+        # The managed settings turn on Claude Code's own sandbox and refuse to
+        # start without it (sandbox.failIfUnavailable), which needs bubblewrap
+        # and socat.  socat is masked in this sandbox, and bwrap already
+        # confines the session, so a drop-in turns the inner sandbox off.
+        # Claude Code merges managed-settings.d/*.json after the managed file,
+        # so every other managed key stays in force.
+        bwrap_fd_from_data "managed-settings drop-in that turns Claude Code's own sandbox off" \
+            '{"sandbox":{"enabled":false,"failIfUnavailable":false}}'
+        BWRAP_ARGS+=(
+            --dir "${CLAUDE_MANAGED_DIR}/managed-settings.d"
+            --ro-bind-data "${_BWRAP_FD}" "${CLAUDE_MANAGED_DIR}/managed-settings.d/99-bwclaude.json"
+        )
     fi
 
-    if [[ -d /etc/claude-code/.claude/skills && -r /etc/claude-code/.claude/skills ]]; then
-        BWRAP_ARGS+=(--dir /etc/claude-code --dir /etc/claude-code/.claude)
+    if [[ -d "${CLAUDE_MANAGED_DIR}/.claude/skills" && -r "${CLAUDE_MANAGED_DIR}/.claude/skills" ]]; then
+        BWRAP_ARGS+=(--dir "${CLAUDE_MANAGED_DIR}" --dir "${CLAUDE_MANAGED_DIR}/.claude")
         build_managed_ro_bind \
-            /etc/claude-code/.claude/skills \
-            /etc/claude-code/.claude/skills
+            "${CLAUDE_MANAGED_DIR}/.claude/skills" \
+            "${CLAUDE_MANAGED_DIR}/.claude/skills"
     fi
 }
 
 # ── Claude env vars ──────────────────────────────────────────────
 build_claude_env() {
-    # NOTE: bwclaude is hard-wired for the NSLS-II AIFAPIM/foundry gateway.
-    # It cannot be used on a personal machine without modifying the foundry
-    # URL/key logic below to point at a different foundry instance.
+    # NOTE: bwclaude is hard-wired for the NSLS-II AIFAPIM gateway.  It cannot
+    # be used on a personal machine without modifying the gateway logic below.
+    #
+    # Two ways to authenticate to the gateway:
+    #   - your own Entra token, when the "aifapim" token is mounted (by
+    #     n2c_auto_gateway_token, or --n2c-token; not a --ro-path that looks like
+    #     it) and N2C_GATEWAY is not "off": no key.  Claude Code runs its apiKeyHelper
+    #     (`cat` of the token file, which n2c-token renews in place) at the
+    #     start, about every 5 minutes, after a 401 and when the token expires,
+    #     and sends the result as x-api-key and as Authorization: Bearer; the
+    #     gateway ignores the key header and checks the bearer token.
+    #   - a personal AIFAPIM key (deprecated, advanced use), in Foundry mode.
+    local _gw_token="" _p
+    # N2C_GATEWAY=off: the token may be mounted (for skills) but is not used.
+    for _p in ${N2C_TOKEN_FILES[@]+"${N2C_TOKEN_FILES[@]}"}; do
+        if [[ "${_p}" == */aifapim/token && "${N2C_GATEWAY:-}" != off ]]; then
+            _gw_token="${_p}"
+        fi
+    done
 
-    # Foundry mode is forced on (see CLAUDE_CODE_USE_FOUNDRY below).
-    # In foundry mode, Claude Code uses ANTHROPIC_FOUNDRY_* env vars and
-    # ignores ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY, so we no longer set
-    # those defaults.
-
-    # Foundry mode requires an API key and a gateway.  Fail fast with a clear
-    # message rather than letting Claude Code fall through to the Azure SDK
-    # credential chain (az login, managed identity, etc.) and emit a wall of
-    # CredentialUnavailableError output.  Only checked when claude itself is
-    # launched: --dry-run inspects the sandbox and --exec runs another
-    # command, neither needs credentials.
-    if [[ "${DRY_RUN}" -eq 0 ]] && [[ -z "${TEST_CMD}" ]]; then
-        if [[ -z "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]] && [[ -z "${AIFAPIM_API_KEY:-}" ]]; then
-            echo "Error: bwclaude (foundry mode) requires an API key." >&2
-            echo "Export one of:" >&2
-            echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
-            echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key (preferred)" >&2
+    if [[ -n "${_gw_token}" ]]; then
+        # The path goes into a JSON string that claude runs with a shell.
+        if [[ ! "${_gw_token}" =~ ^[A-Za-z0-9/._-]+$ ]]; then
+            echo "Error: the aifapim token path '${_gw_token}' may only contain letters, digits and / . _ -" >&2
             exit 1
         fi
-        if [[ -z "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]] && [[ -z "${AIFAPIM_HOST:-}" ]]; then
-            echo "Error: bwclaude requires AIFAPIM_HOST (or ANTHROPIC_FOUNDRY_BASE_URL) to be set." >&2
-            echo "Export one of:" >&2
-            echo "  AIFAPIM_HOST=<gateway-hostname>          # NSLS-II AIFAPIM gateway hostname" >&2
-            echo "  ANTHROPIC_FOUNDRY_BASE_URL=https://...   # full Foundry base URL override" >&2
-            exit 1
+        BWRAP_ARGS+=(--setenv ANTHROPIC_BASE_URL "https://${AIFAPIM_HOST:-hermes.nsls2.bnl.gov}/anthropic")
+    else
+        # Foundry mode is forced on (see CLAUDE_CODE_USE_FOUNDRY below).
+        # In foundry mode, Claude Code uses ANTHROPIC_FOUNDRY_* env vars and
+        # ignores ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY, so we no longer set
+        # those defaults.
+
+        # Foundry mode requires an API key and a gateway.  Fail fast with a clear
+        # message rather than letting Claude Code fall through to the Azure SDK
+        # credential chain (az login, managed identity, etc.) and emit a wall of
+        # CredentialUnavailableError output.  Only checked when claude itself is
+        # launched: --dry-run inspects the sandbox and --exec runs another
+        # command, neither needs credentials.
+        if [[ "${DRY_RUN}" -eq 0 ]] && [[ -z "${TEST_CMD}" ]]; then
+            if [[ -z "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]] && [[ -z "${AIFAPIM_API_KEY:-}" ]]; then
+                echo "Error: bwclaude needs your gateway token or an API key." >&2
+                echo "Use your own token (no key): sign in on the host, then run bwclaude again:" >&2
+                echo "  n2c-token login                   # then n2c-token refresh aifapim" >&2
+                [[ "${N2C_GATEWAY:-}" != off ]] || echo "  (N2C_GATEWAY=off is set, so the token is not used)" >&2
+                echo "Or export a personal key (deprecated, advanced use):" >&2
+                echo "  ANTHROPIC_FOUNDRY_API_KEY=<key>   # direct foundry key" >&2
+                echo "  AIFAPIM_API_KEY=<key>             # NSLS-II AIFAPIM key" >&2
+                exit 1
+            fi
+            if [[ -z "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]] && [[ -z "${AIFAPIM_HOST:-}" ]]; then
+                echo "Error: bwclaude requires AIFAPIM_HOST (or ANTHROPIC_FOUNDRY_BASE_URL) to be set." >&2
+                echo "Export one of:" >&2
+                echo "  AIFAPIM_HOST=<gateway-hostname>          # NSLS-II AIFAPIM gateway hostname" >&2
+                echo "  ANTHROPIC_FOUNDRY_BASE_URL=https://...   # full Foundry base URL override" >&2
+                exit 1
+            fi
         fi
-    fi
 
-    # Foundry API key: prefer host's ANTHROPIC_FOUNDRY_API_KEY; fall back to
-    # AIFAPIM_API_KEY (the existing NSLS-II convention).
-    if [[ -n "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]]; then
-        pass_through_if_set ANTHROPIC_FOUNDRY_API_KEY
-    elif [[ -n "${AIFAPIM_API_KEY:-}" ]]; then
-        # Through SANDBOX_ENV, not --setenv: keeps the key off bwrap's argv.
-        SANDBOX_ENV+=("ANTHROPIC_FOUNDRY_API_KEY=${AIFAPIM_API_KEY}")
-    fi
+        # Foundry API key: prefer host's ANTHROPIC_FOUNDRY_API_KEY; fall back to
+        # AIFAPIM_API_KEY (the existing NSLS-II convention).
+        if [[ -n "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]]; then
+            pass_through_if_set ANTHROPIC_FOUNDRY_API_KEY
+        elif [[ -n "${AIFAPIM_API_KEY:-}" ]]; then
+            # Through SANDBOX_ENV, not --setenv: keeps the key off bwrap's argv.
+            SANDBOX_ENV+=("ANTHROPIC_FOUNDRY_API_KEY=${AIFAPIM_API_KEY}")
+        fi
 
-    # Foundry base URL: prefer explicit ANTHROPIC_FOUNDRY_BASE_URL override;
-    # otherwise derive from AIFAPIM_HOST.
-    if [[ -n "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]]; then
-        pass_through_if_set ANTHROPIC_FOUNDRY_BASE_URL
-    elif [[ -n "${AIFAPIM_HOST:-}" ]]; then
-        BWRAP_ARGS+=(--setenv ANTHROPIC_FOUNDRY_BASE_URL "https://${AIFAPIM_HOST}/anthropic")
+        # Foundry base URL: prefer explicit ANTHROPIC_FOUNDRY_BASE_URL override;
+        # otherwise derive from AIFAPIM_HOST.
+        if [[ -n "${ANTHROPIC_FOUNDRY_BASE_URL:-}" ]]; then
+            pass_through_if_set ANTHROPIC_FOUNDRY_BASE_URL
+        elif [[ -n "${AIFAPIM_HOST:-}" ]]; then
+            BWRAP_ARGS+=(--setenv ANTHROPIC_FOUNDRY_BASE_URL "https://${AIFAPIM_HOST}/anthropic")
+        fi
     fi
 
     # Forward any host CLAUDE_* env vars (incl. user overrides for verbosity, etc.).
@@ -565,7 +626,22 @@ build_claude_env() {
 
     # Enforce after the loop so host env cannot override these.
     BWRAP_ARGS+=(--setenv CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS 1)
-    BWRAP_ARGS+=(--setenv CLAUDE_CODE_USE_FOUNDRY 1)
+    if [[ -n "${_gw_token}" ]]; then
+        # A CLAUDE_CODE_USE_FOUNDRY on the host was forwarded above; Foundry mode
+        # would ignore ANTHROPIC_BASE_URL and the apiKeyHelper.
+        BWRAP_ARGS+=(--unsetenv CLAUDE_CODE_USE_FOUNDRY)
+        # --settings, not settings.json: that file is an ephemeral copy here,
+        # and an apiKeyHelper must never be written to the host's settings.json.
+        # Also for --exec of claude itself (a wrapper that names the binary, so
+        # that it does not run the wrapper found in PATH), not for other commands.
+        # Put it right after the binary, in the command the library will run: a
+        # later position could follow a "--" of the command or of the arguments.
+        if [[ "${_TOOL_CMD[0]:-}" == claude || "${_TOOL_CMD[0]:-}" == */claude ]]; then
+            _TOOL_CMD=("${_TOOL_CMD[0]}" --settings "{\"apiKeyHelper\":\"cat ${_gw_token}\"}" "${_TOOL_CMD[@]:1}")
+        fi
+    else
+        BWRAP_ARGS+=(--setenv CLAUDE_CODE_USE_FOUNDRY 1)
+    fi
 
     # In foundry mode the haiku model used for background tasks defaults to a
     # date-pinned ID that the foundry proxy may not recognise.  Override with
@@ -674,6 +750,7 @@ main() {
     build_nsls2_mount
     build_claude_bin_mount
     build_dynamic_tool_mounts
+    n2c_auto_gateway_token
     build_n2c_token_mounts
     build_extra_path_mounts
 
@@ -694,4 +771,7 @@ main() {
     fi
 }
 
-main "$@"
+# Run only when executed, so the tests can source this file for its functions.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

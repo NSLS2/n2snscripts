@@ -88,6 +88,9 @@ PASTA_ARGS=()
 # N2C access tokens requested with --n2c-token (names, or "all").
 # Populated by add_n2c_token; mounted by build_n2c_token_mounts.
 N2C_TOKENS=()
+# The token files build_n2c_token_mounts mounted (canonical paths).
+# shellcheck disable=SC2034  # read by the launchers (bwclaude)
+N2C_TOKEN_FILES=()
 
 # Sandbox context file (see "Sandbox context" below).  The launchers set
 # SANDBOX_CONTEXT_ENABLED=0 for --no-sandbox-context and fill
@@ -1062,6 +1065,7 @@ _bwrap_load_blocked_prefixes() {
         "${_HOME}/.ssh"
         "${_HOME}/.gnupg"
         "${_HOME}/.aws"
+        "${_HOME}/.azure"
         "${_HOME}/.kube"
         "${_HOME}/.docker"
         # Package-manager credentials
@@ -1169,6 +1173,7 @@ _bwrap_path_blocked() {
 #         ~/.ssh/          private keys and known_hosts
 #         ~/.gnupg/        GPG private keys and keyrings
 #         ~/.aws/          AWS credentials and config
+#         ~/.azure/        Azure CLI sign-in and tokens
 #         ~/.kube/         Kubernetes cluster credentials (tokens, certs)
 #         ~/.docker/       Docker registry auth (config.json with tokens)
 #
@@ -1622,6 +1627,20 @@ add_n2c_token() {
     N2C_TOKENS+=("${name}")
 }
 
+# n2c_auto_gateway_token
+#   Ask for your own AI gateway token ("aifapim") without --n2c-token, when its
+#   file exists, unless N2C_GATEWAY=off.  Adds nothing and says nothing when
+#   the file is missing, so that someone without the gateway role sees no
+#   warning at every launch.  An explicit --n2c-token aifapim is not affected:
+#   it warns when the token is missing.  Call it before build_n2c_token_mounts.
+n2c_auto_gateway_token() {
+    [[ "${N2C_GATEWAY:-}" == off ]] && return 0
+    if [[ -f "$(_n2c_creds_root)/aifapim/token" ]]; then
+        N2C_TOKENS+=(aifapim)
+    fi
+    return 0
+}
+
 # The credentials are checked the way ssh checks a private key: a directory or
 # token that someone else could read or replace is refused.  The credentials
 # directory belongs to you (n2c-token keeps your own session tokens there) or
@@ -1840,6 +1859,7 @@ build_n2c_token_mounts() {
     fi
     for tfile in "${found[@]+"${found[@]}"}"; do
         EXTRA_RO_PATHS+=("${tfile}")
+        N2C_TOKEN_FILES+=("${tfile}")
     done
 
     # The sandbox environment is scrubbed (env -i), so tell consumers where the
